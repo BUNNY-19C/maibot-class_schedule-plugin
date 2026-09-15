@@ -6,7 +6,7 @@
 
 目录结构（位于插件 data 目录下）::
 
-    data/plugins/local.class-schedule/
+    data/plugins/github.BUNNY-19C.class-schedule/
     ├── state.json          # 提醒目标、提前量覆盖、已提醒记录
     └── ics/
         ├── 2026秋-教务处.ics

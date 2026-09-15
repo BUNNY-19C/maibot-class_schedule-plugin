@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any
 
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
-PLUGIN_ID = "local.class-schedule"
+PLUGIN_ID = "github.BUNNY-19C.class-schedule"
 EXPECTED_COMMANDS = {
     "schedule_holiday",
     "schedule_import",

@@ -37,7 +37,7 @@
 ## 数据文件
 
 ```
-data/plugins/local.class-schedule/
+data/plugins/github.BUNNY-19C.class-schedule/
 ├── state.json      # 提醒会话(含各自提前量)、已提醒记录
 ├── holidays/       # 法定节假日数据缓存(按年)
 │   ├── 2026.json

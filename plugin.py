@@ -198,7 +198,7 @@ class ClassSchedulePlugin(MaiBotPlugin):
 
     def _state_path(self) -> Path:
         """状态文件路径（提醒会话、各会话提前量、已提醒记录）。"""
-        base = self._data_dir or Path("data") / "plugins" / "local.class-schedule"
+        base = self._data_dir or Path("data") / "plugins" / "github.BUNNY-19C.class-schedule"
         return base / STATE_FILENAME
 
     def _ics_dir_name(self) -> str:
@@ -1620,7 +1620,7 @@ class ClassSchedulePlugin(MaiBotPlugin):
 
     def _holiday_dir(self) -> Path:
         """节假日缓存目录。"""
-        base = self._data_dir or Path("data") / "plugins" / "local.class-schedule"
+        base = self._data_dir or Path("data") / "plugins" / "github.BUNNY-19C.class-schedule"
         return base / HOLIDAY_DIR
 
     def _reload_holiday_cache(self) -> HolidayCalendar:

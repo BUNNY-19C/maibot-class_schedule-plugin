@@ -3,7 +3,7 @@
 课表永远以 **`.ics` 文件**为唯一数据源,所有导入方式最终都落到同一个目录:
 
 ```
-data/plugins/local.class-schedule/ics/
+data/plugins/github.BUNNY-19C.class-schedule/ics/
 ```
 
 好处是你随时能直接看到、替换、删除文件,不需要维护「文件 + 数据库」两份状态。
@@ -62,7 +62,7 @@ data/plugins/local.class-schedule/ics/
 把 `.ics` 文件直接放进课表目录:
 
 ```
-data/plugins/local.class-schedule/ics/我的课表.ics
+data/plugins/github.BUNNY-19C.class-schedule/ics/我的课表.ics
 ```
 
 放进去后最多等 `source.scan_interval_seconds`(默认 300 秒)自动识别,
