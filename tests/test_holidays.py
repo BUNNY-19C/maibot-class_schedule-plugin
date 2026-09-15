@@ -325,6 +325,73 @@ class TestEntryQueries(unittest.TestCase):
         self.assertEqual(calendar.extra_count, 2)
 
 
+class TestExtraDateConsistency(unittest.TestCase):
+    """回归：自定假日与"调休上班"不能同时成立。
+
+    README 明确建议"补班日不上课就把那天加进 extra_dates"，
+    照做之后以前会出现 off=True 且 makeup=True，展示成
+    「自定假日（调休上班）」，与 /课表本周 的「放假」标记互相打架。
+    """
+
+    def _calendar(self) -> HolidayCalendar:
+        calendar = HolidayCalendar()
+        calendar.load_payload(PAYLOAD_2026)
+        return calendar
+
+    def test_user_extra_is_detected(self):
+        calendar = self._calendar()
+        calendar.add_extra_dates(["2026-01-04"])  # 数据源里那天是调休上班
+        self.assertTrue(calendar.is_user_extra(date(2026, 1, 4)))
+        self.assertFalse(calendar.is_user_extra(date(2026, 1, 5)))
+
+    def test_extra_overrides_makeup_workday(self):
+        calendar = self._calendar()
+        calendar.add_extra_dates(["2026-01-04"])
+        target = date(2026, 1, 4)
+        self.assertTrue(calendar.is_off_day(target))
+        self.assertFalse(calendar.is_makeup_workday(target))
+
+    def test_off_day_and_makeup_are_never_both_true(self):
+        calendar = self._calendar()
+        calendar.add_extra_dates(["2026-01-04", "2026-01-01", "2026-09-20"])
+        for day in (
+            date(2026, 1, 1),   # 数据源：放假
+            date(2026, 1, 4),   # 数据源：调休上班 + 用户自定假日
+            date(2026, 9, 20),  # 数据源：调休上班 + 用户自定假日
+            date(2026, 10, 1),  # 数据源：放假
+            date(2026, 3, 10),  # 平常日子
+        ):
+            with self.subTest(day=day):
+                self.assertFalse(
+                    calendar.is_off_day(day) and calendar.is_makeup_workday(day)
+                )
+
+    def test_label_is_not_contradictory(self):
+        calendar = self._calendar()
+        calendar.add_extra_dates(["2026-01-04"])
+        label = calendar.label_of(date(2026, 1, 4))
+        self.assertNotIn("调休上班", label)
+        self.assertIn("放假", label)
+
+    def test_excluded_beats_extra(self):
+        """显式排除（exclude_dates）优先于自定假日。"""
+        calendar = self._calendar()
+        calendar.add_extra_dates(["2026-11-15"])
+        calendar.add_excluded_dates(["2026-11-15"])
+        target = date(2026, 11, 15)
+        self.assertTrue(calendar.is_excluded(target))
+        self.assertFalse(calendar.is_off_day(target))
+        self.assertFalse(calendar.is_makeup_workday(target))
+
+    def test_makeup_day_still_reported_when_not_extra(self):
+        """没有自定假日的调休上班日照旧识别（别把正常功能一起关掉）。"""
+        calendar = self._calendar()
+        target = date(2026, 1, 4)
+        self.assertTrue(calendar.is_makeup_workday(target))
+        self.assertFalse(calendar.is_off_day(target))
+        self.assertIn("调休上班", calendar.label_of(target))
+
+
 class TestCache(unittest.TestCase):
     def test_write_then_load(self):
         with TemporaryDirectory() as tmp:

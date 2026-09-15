@@ -620,14 +620,25 @@ class ClassSchedulePlugin(MaiBotPlugin):
             self._warned_all_filtered = True
 
     def _maybe_prune(self, now: datetime) -> None:
-        """定期清理过期的已提醒记录。"""
+        """定期清理过期的已提醒记录，以及没人再用的"等待课表文件"标记。"""
         if self._last_prune is not None:
             if (now - self._last_prune).total_seconds() < PRUNE_INTERVAL_SECONDS:
                 return
         removed = self._state.prune_fired(now)
+        # 等待标记只在"那个会话下一条消息"时才回收，所以任何发过 /课程解析
+        # 却没发文件的会话都会留下一条永不清理的记录；这里按截止时间一起扫掉
+        stale = [
+            stream_id
+            for stream_id, deadline in self._awaiting_ics.items()
+            if deadline <= now
+        ]
+        for stream_id in stale:
+            self._awaiting_ics.pop(stream_id, None)
         self._last_prune = now
         if removed:
             logger.debug(f"{LOG_PREFIX} 清理已提醒记录 {removed} 条")
+        if stale:
+            logger.debug(f"{LOG_PREFIX} 清理过期的等待课表标记 {len(stale)} 条")
 
     def _maybe_refresh_holidays(self, now: datetime | None = None) -> None:
         """按 ``holiday.refresh_hours`` 定期检查节假日数据是否过期。
@@ -1757,26 +1768,32 @@ class ClassSchedulePlugin(MaiBotPlugin):
         """该日是否因为放假而不提醒。
 
         没有该年份数据时返回 ``False``（照常提醒）——fail-open，见模块文档。
+
+        ``holiday.skip_off_days`` 只管**法定节假日**；``extra_dates`` 是用户逐条写下的
+        名单（寒暑假、校历假日），始终生效——否则配了 extra_dates 却因为主开关是关的
+        而静默失效，状态页还照旧显示"自定假日 N 条"，只有比对文案才发现没生效。
         """
-        conf = self._conf()
-        if not conf.holiday.skip_off_days:
-            return False
         calendar = self._holidays
         if calendar is None or calendar.is_empty():
+            return False
+        if calendar.is_excluded(day):
+            return False  # 用户显式声明这天要上课，优先于自定假日
+        if calendar.is_user_extra(day):
+            return True
+        if not self._conf().holiday.skip_off_days:
             return False
         return calendar.is_off_day(day)
 
     def _holiday_marks(self, day: date) -> str:
         """课表列表里的假日标记，例如 `` 🎉元旦（放假）``。"""
         conf = self._conf()
-        if not conf.holiday.skip_off_days:
-            return ""
         calendar = self._holidays
         if calendar is None or calendar.is_empty():
             return ""
-        if calendar.is_off_day(day):
+        if self._should_skip_off_day(day):
             return f" 🎉{calendar.name_of(day)}放假"
-        if calendar.is_makeup_workday(day):
+        # 调休上班日只来自数据源，所以只在用数据源（skip_off_days）时才标
+        if conf.holiday.skip_off_days and calendar.is_makeup_workday(day):
             return f" 🔁{calendar.name_of(day)}调休上班"
         return ""
 
@@ -1930,7 +1947,9 @@ class ClassSchedulePlugin(MaiBotPlugin):
         if not candidates:
             return
 
-        schedule_files = [item for item in candidates if is_schedule_filename(item.name)]
+        schedule_files = [
+            item for item in candidates if is_schedule_filename(item.name, item.mime_type)
+        ]
         if not schedule_files:
             # 只在"用户刚发过 /课程解析 正等着文件"时才出声：那种情况下发错文件
             # 是明确可纠正的，静默忽略会让人以为插件坏了；平时则保持安静不打扰
@@ -2062,7 +2081,7 @@ class ClassSchedulePlugin(MaiBotPlugin):
 
         try:
             result = await asyncio.to_thread(
-                repo.save_ics, text, chat_import_filename(candidate.name, text)
+                repo.save_ics, text, chat_import_filename(candidate.name)
             )
         except ValueError as exc:
             self.ctx.logger.warning(f"{LOG_PREFIX} 聊天文件不是有效课表：{exc}")

@@ -189,6 +189,38 @@ class TestSaveIcs(unittest.TestCase):
                 repo.save_ics("这不是课表", "bad.ics")
             self.assertEqual(list((Path(tmp) / "ics").iterdir()), [])
 
+    def test_warnings_do_not_include_other_files_errors(self):
+        """回归：一次导入曾把**整个目录**的错误当成这次导入的警告。
+
+        目录里另有一个坏文件时，用户会以为刚导入的课表有问题。
+        """
+        with TemporaryDirectory() as tmp:
+            repo = CourseRepository(Path(tmp) / "ics")
+            repo.ensure_dir()
+            (Path(tmp) / "ics" / "broken.ics").write_text("这不是课表", encoding="utf-8")
+
+            result = repo.save_ics(ics_text(), "good.ics")
+
+            self.assertEqual(result.event_count, 1)
+            self.assertEqual(result.warnings, [])
+            # 目录级的错误依然记录着，只是不算在这次导入头上
+            self.assertTrue(any("broken.ics" in item for item in repo.errors))
+
+    def test_warnings_report_skipped_lines_of_this_file(self):
+        """这份文件里有几行没读进去，要能在回执里告诉用户。"""
+        with TemporaryDirectory() as tmp:
+            repo = CourseRepository(Path(tmp) / "ics")
+            text = (
+                "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:c1\nSUMMARY:高等数学\n"
+                "DTSTART:20260901T080000\nDTEND:20260901T094000\n"
+                "这一行不是合法的 ICS 属性\n"
+                "END:VEVENT\nEND:VCALENDAR\n"
+            )
+            result = repo.save_ics(text, "partial.ics")
+
+            self.assertEqual(result.event_count, 1)
+            self.assertTrue(any("1 处内容无法解析" in item for item in result.warnings))
+
     def test_same_name_replaces_and_reports(self):
         """同名导入是"更新"语义，不保留旧课表。"""
         with TemporaryDirectory() as tmp:

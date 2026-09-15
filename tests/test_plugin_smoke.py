@@ -675,6 +675,89 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
             await plugin._tick()
             self.assertEqual(len(plugin.ctx.send.texts), 1)  # type: ignore[attr-defined]
 
+    async def test_extra_dates_apply_even_when_skip_off_days_off(self):
+        """回归：extra_dates 曾经在主开关关闭时静默失效。
+
+        自定假日（寒暑假、校历假日）是用户逐条写下的名单，与"法定节假日是否
+        跳过"是两件事——以前配了 extra_dates 却一天都不生效，状态页还照旧
+        显示"自定假日 N 条"，只有比对文案才发现。
+        """
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            today = datetime.now().strftime("%Y-%m-%d")
+            plugin = self.prepare(
+                data_dir,
+                offset_minutes=20,
+                config=build_config(
+                    holiday={"skip_off_days": False, "extra_dates": [today]}
+                ),
+            )
+            plugin._reload_holiday_cache()
+
+            self.assertTrue(plugin._should_skip_off_day(datetime.now().date()))
+            await plugin._tick()
+            self.assertEqual(plugin.ctx.send.texts, [])  # type: ignore[attr-defined]
+
+    async def test_extra_dates_marked_even_when_skip_off_days_off(self):
+        """标记也要跟上，否则列表里看不出这天为什么不提醒。"""
+        with TemporaryDirectory() as tmp:
+            today = datetime.now().strftime("%Y-%m-%d")
+            plugin = self.prepare(
+                Path(tmp),
+                offset_minutes=20,
+                config=build_config(
+                    holiday={"skip_off_days": False, "extra_dates": [today]}
+                ),
+            )
+            plugin._reload_holiday_cache()
+
+            self.assertIn("放假", plugin._holiday_marks(datetime.now().date()))
+
+    async def test_exclude_dates_beat_extra_dates(self):
+        """同一天既在 extra 又在 exclude 时，以"这天要上课"为准。"""
+        with TemporaryDirectory() as tmp:
+            today = datetime.now().strftime("%Y-%m-%d")
+            plugin = self.prepare(
+                Path(tmp),
+                offset_minutes=20,
+                config=build_config(
+                    holiday={"extra_dates": [today], "exclude_dates": [today]}
+                ),
+            )
+            plugin._reload_holiday_cache()
+
+            self.assertFalse(plugin._should_skip_off_day(datetime.now().date()))
+            await plugin._tick()
+            self.assertEqual(len(plugin.ctx.send.texts), 1)  # type: ignore[attr-defined]
+
+    async def test_statutory_holiday_still_respects_main_switch(self):
+        """主开关仍然管法定节假日：关掉了就照常提醒。"""
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            now = datetime.now()
+            plugin = self.prepare(
+                data_dir,
+                offset_minutes=20,
+                config=build_config(holiday={"skip_off_days": False}),
+            )
+            self._install_holiday_data(data_dir, dates={now.strftime("%Y-%m-%d"): True})
+            plugin._reload_holiday_cache()
+
+            self.assertFalse(plugin._should_skip_off_day(now.date()))
+
+    async def test_prune_clears_expired_awaiting_ics(self):
+        """回归：等待课表文件的标记以前只在该会话下次说话时才回收。"""
+        with TemporaryDirectory() as tmp:
+            plugin = self.prepare_bare(Path(tmp), targets=())
+            plugin._awaiting_ics["ghost"] = datetime.now() - timedelta(minutes=1)
+            plugin._awaiting_ics["alive"] = datetime.now() + timedelta(minutes=10)
+            plugin._last_prune = None  # 让这一轮真的执行清理
+
+            plugin._maybe_prune(datetime.now())
+
+            self.assertNotIn("ghost", plugin._awaiting_ics)
+            self.assertIn("alive", plugin._awaiting_ics)
+
     async def test_missing_data_does_not_skip(self):
         """拿不到数据时必须照常提醒（fail-open）——漏掉上课日比假期多提醒更糟。"""
         with TemporaryDirectory() as tmp:

@@ -320,6 +320,14 @@ class HolidayCalendar:
         """是否被用户显式声明为"这天要上课"（压过假日判定）。"""
         return day in self._excluded or (day.month, day.day) in self._excluded_yearly
 
+    def is_user_extra(self, day: date) -> bool:
+        """是否是用户自定假日（``extra_dates``，如寒暑假、校历假日）。
+
+        与数据源里的法定节假日分开，因为两者的开关不同：法定节假日受
+        ``holiday.skip_off_days`` 控制，而自定假日是用户逐条写下的名单，始终生效。
+        """
+        return day in self._extra or (day.month, day.day) in self._extra_yearly
+
     def is_off_day(self, day: date) -> bool:
         """是否放假（法定节假日或用户自定假日）。
 
@@ -327,14 +335,18 @@ class HolidayCalendar:
         """
         if self.is_excluded(day):
             return False
-        if day in self._extra or (day.month, day.day) in self._extra_yearly:
+        if self.is_user_extra(day):
             return True
         entry = self._days.get(day)
         return bool(entry is not None and entry.is_off_day)
 
     def is_makeup_workday(self, day: date) -> bool:
-        """是否是调休上班日（周末补班，**不是**假日）。"""
-        if self.is_excluded(day):
+        """是否是调休上班日（周末补班，**不是**假日）。
+
+        自定假日优先：用户把某天列进 ``extra_dates`` 就是在说"这天不上课"，
+        再同时把它报成"调休上班"会自相矛盾（展示成「自定假日（调休上班）」）。
+        """
+        if self.is_excluded(day) or self.is_user_extra(day):
             return False
         entry = self._days.get(day)
         return bool(entry is not None and not entry.is_off_day)
@@ -356,6 +368,11 @@ class HolidayCalendar:
         if self.is_excluded(day):
             return ""
         name = self.name_of(day)
+        # 自定假日优先：同一天在数据源里可能被标成"调休上班"，
+        # 但用户把它列进 extra_dates 就是在说"这天不上课"，
+        # 否则会展示成「自定假日（调休上班）」自相矛盾
+        if self.is_user_extra(day):
+            return f"{name}（放假）"
         entry = self._days.get(day)
         if entry is not None:
             return f"{name}（{entry.kind_label}）"

@@ -54,6 +54,9 @@ _SIZE_KEYS = ("size", "file_size")
 _URL_KEYS = ("url", "file_url", "download_url")
 _ID_KEYS = ("file_id", "id", "fid")
 _BASE64_KEYS = ("base64", "base64_data", "data_base64")
+#: 麦麦的 FileComponent 带 mime_type（见 message_component_data_model.py），
+#: 有它就能认出"文件名不叫 .ics 但类型是日历"的文件
+_MIME_KEYS = ("mime_type", "mime", "content_type")
 
 
 class FileIntakeError(RuntimeError):
@@ -69,6 +72,7 @@ class FileCandidate:
     url: str = ""
     file_id: str = ""
     base64_data: str = ""
+    mime_type: str = ""
     message_id: str = ""
 
     @property
@@ -92,13 +96,15 @@ def is_schedule_filename(name: str, mime_type: str = "") -> bool:
     return text.endswith(_ICS_SUFFIXES)
 
 
-def chat_import_filename(name: str, text: str) -> str:
+def chat_import_filename(name: str) -> str:
     """由聊天文件生成落盘名：同名重发即更新，不堆垃圾。
 
     刻意**不带内容哈希**：用户重新导出同名课表再发一次，就应该替换掉旧的，
     否则调课后的旧时间还会继续提醒。
     """
-    stem = Path(str(name or "").strip()).stem or "chat"
+    # 前缀 "chat-" 是安全边界：聊天导入的文件绝不能盖掉用户自己放进目录的文件。
+    # 名字被清理成空时退回 "schedule"，而不是让前缀重复成 "chat-chat"
+    stem = Path(str(name or "").strip()).stem
     cleaned = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff._-]+", "_", stem).strip("._")
     return f"chat-{cleaned or 'schedule'}.ics"
 
@@ -133,6 +139,7 @@ def _candidate_from_payload(
         url=_first_text(data, _URL_KEYS),
         file_id=_first_text(data, _ID_KEYS),
         base64_data=_first_text(data, _BASE64_KEYS),
+        mime_type=_first_text(data, _MIME_KEYS),
         message_id=message_id,
     )
 
@@ -199,11 +206,18 @@ def extract_file_candidates(message: Any) -> list[FileCandidate]:
     for root in roots:
         _walk_segments(root, found, message_id=message_id, depth=0)
 
-    # 同一条消息里重复出现的同一文件只留一个
+    # 同一条消息里重复出现的同一文件只留一个。
+    # 键里带上内容片段：适配器对多文件消息可能复用同一个文件名，
+    # 只按 (name, url, file_id) 去重会把第二份课表静默丢掉（用户以为都导入了）
     unique: list[FileCandidate] = []
-    seen: set[tuple[str, str, str]] = set()
+    seen: set[tuple[str, str, str, str]] = set()
     for item in found:
-        key = (item.name, item.url, item.file_id)
+        key = (
+            item.name,
+            item.url,
+            item.file_id,
+            f"{len(item.base64_data)}:{item.base64_data[:32]}",
+        )
         if key in seen:
             continue
         seen.add(key)

@@ -1,15 +1,18 @@
 """ICS 解析测试：折行、转义、时间口径、RRULE/EXDATE、调课覆盖。"""
 
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import _bootstrap  # noqa: F401  —— 注册插件包，必须在导入插件模块之前
 
+from class_schedule import ics_parser
 from class_schedule.ics_parser import (
+    MAX_OCCURRENCES_PER_WINDOW,
     IcsParseError,
     expand_occurrences,
     parse_ics,
     parse_ics_many,
+    parse_ics_with_warnings,
 )
 
 
@@ -381,6 +384,203 @@ class TestParseMany(unittest.TestCase):
         self.assertEqual([event.uid for event in events], ["course-1"])
         self.assertEqual(len(errors), 2)
         self.assertTrue(any("bad.ics" in item for item in errors))
+
+
+class TestNestedComponents(unittest.TestCase):
+    """回归：VEVENT 里的子组件（VALARM）不能覆盖外层属性。
+
+    Google / Apple / Outlook 导出的日历都带 VALARM，而 VALARM 自己也有
+    SUMMARY、DESCRIPTION。以前这些行会被当成课程属性、把课程名整个换掉
+    （实测课程名变成 "Alarm summary"）。
+    """
+
+    def test_valarm_properties_do_not_override_event(self):
+        text = (
+            "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:alarm-1\n"
+            "SUMMARY:高等数学\nDESCRIPTION:教师-张三\n"
+            "DTSTART:20260901T080000\nDTEND:20260901T094000\n"
+            "LOCATION:教三-201\n"
+            "BEGIN:VALARM\nACTION:EMAIL\nTRIGGER:-PT20M\n"
+            "SUMMARY:Alarm summary\nDESCRIPTION:This is an event reminder\n"
+            "END:VALARM\n"
+            "END:VEVENT\nEND:VCALENDAR\n"
+        )
+        event = parse_ics(text)[0]
+        self.assertEqual(event.summary, "高等数学")
+        self.assertEqual(event.description, "教师-张三")
+        self.assertEqual(event.location, "教三-201")
+        self.assertEqual(event.start, datetime(2026, 9, 1, 8, 0))
+
+    def test_alarm_inside_recurring_event_keeps_rule(self):
+        """子组件的 END 不能把事件提前结掉，否则 RRULE 会丢。"""
+        text = (
+            "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:alarm-2\n"
+            "SUMMARY:线性代数\nDTSTART:20260901T080000\nDTEND:20260901T094000\n"
+            "RRULE:FREQ=WEEKLY;BYDAY=TU\n"
+            "BEGIN:VALARM\nACTION:DISPLAY\nTRIGGER:-PT10M\n"
+            "DESCRIPTION:提醒\nEND:VALARM\n"
+            "END:VEVENT\nEND:VCALENDAR\n"
+        )
+        event = parse_ics(text)[0]
+        self.assertEqual(event.rrule, "FREQ=WEEKLY;BYDAY=TU")
+        occurrences = expand_occurrences(
+            event, datetime(2026, 9, 6), datetime(2026, 9, 20)
+        )
+        self.assertEqual(
+            [item.start.strftime("%m-%d") for item in occurrences], ["09-08", "09-15"]
+        )
+
+    def test_multiple_alarms_do_not_leak(self):
+        text = (
+            "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:alarm-3\n"
+            "SUMMARY:大学物理\nDTSTART:20260901T080000\nDTEND:20260901T094000\n"
+            "BEGIN:VALARM\nTRIGGER:-PT30M\nSUMMARY:提前半小时\nEND:VALARM\n"
+            "BEGIN:VALARM\nTRIGGER:-PT5M\nSUMMARY:提前五分钟\nEND:VALARM\n"
+            "END:VEVENT\nEND:VCALENDAR\n"
+        )
+        self.assertEqual(parse_ics(text)[0].summary, "大学物理")
+
+
+class TestDateOnlyExdate(unittest.TestCase):
+    """回归：``EXDATE;VALUE=DATE`` 对定时重复事件要能排掉那次课。
+
+    教务系统常用日期型 EXDATE 标注停课，解析出来是当天 00:00，
+    与 08:00 的那次课精确比较永远匹配不上，于是照旧提醒。
+    """
+
+    def _weekly(self, exdate_line: str) -> str:
+        return (
+            "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:ex-1\nSUMMARY:线性代数\n"
+            "DTSTART:20260901T080000\nDTEND:20260901T094000\n"
+            "RRULE:FREQ=WEEKLY;BYDAY=TU\n"
+            f"{exdate_line}\n"
+            "END:VEVENT\nEND:VCALENDAR\n"
+        )
+
+    def _occurrences(self, text: str, start: datetime, days: int) -> list[str]:
+        event = parse_ics(text)[0]
+        return [
+            item.start.strftime("%m-%d")
+            for item in expand_occurrences(event, start, start + timedelta(days=days))
+        ]
+
+    def test_value_date_excludes_that_occurrence(self):
+        text = self._weekly("EXDATE;VALUE=DATE:20260915")
+        self.assertEqual(self._occurrences(text, datetime(2026, 9, 14), 4), [])
+
+    def test_bare_eight_digit_exdate_also_excludes(self):
+        """裸 8 位数字写法（很多教务系统这么导）同样按日期处理。"""
+        text = self._weekly("EXDATE:20260915")
+        self.assertEqual(self._occurrences(text, datetime(2026, 9, 14), 4), [])
+
+    def test_timed_exdate_still_works(self):
+        text = self._weekly("EXDATE:20260915T080000")
+        self.assertEqual(self._occurrences(text, datetime(2026, 9, 14), 4), [])
+
+    def test_other_weeks_still_remind(self):
+        """只排掉被排除的那一次，别误伤后面几周。"""
+        text = self._weekly("EXDATE;VALUE=DATE:20260915")
+        self.assertEqual(
+            self._occurrences(text, datetime(2026, 9, 20), 15), ["09-22", "09-29"]
+        )
+
+    def test_multiple_date_exdates(self):
+        text = self._weekly("EXDATE;VALUE=DATE:20260915,20260922")
+        self.assertEqual(self._occurrences(text, datetime(2026, 9, 14), 12), [])
+
+    def test_date_only_exdate_recorded_separately(self):
+        event = parse_ics(self._weekly("EXDATE;VALUE=DATE:20260915"))[0]
+        self.assertEqual(list(event.exdate_days), [date(2026, 9, 15)])
+        # 精确时间型不该进 date 列表，免得把当天别的课也一起排掉
+        timed = parse_ics(self._weekly("EXDATE:20260915T080000"))[0]
+        self.assertEqual(timed.exdate_days, [])
+
+
+class TestPathologicalRules(unittest.TestCase):
+    """回归：不可信文件里的重复规则不能拖垮同步路径。
+
+    ``FREQ=SECONDLY`` 在 7 天窗口能展开出 60 万次（实测 1.8 秒、数百 MB），
+    而展开跑在提醒循环和规划器注入的同步路径上。
+    """
+
+    def setUp(self) -> None:
+        # 告警去重是模块级状态（生产上正是要"只提醒一次"），
+        # 测试之间必须清掉，否则后面的用例会因为前一个用例报过而什么都收不到
+        ics_parser._WARNED_KEYS.clear()
+
+    def _event(self, rule: str):
+        return parse_ics(
+            "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:path-1\nSUMMARY:病态\n"
+            "DTSTART:20260901T000000\nDTEND:20260901T000100\n"
+            f"RRULE:{rule}\n"
+            "END:VEVENT\nEND:VCALENDAR\n"
+        )[0]
+
+    def test_per_second_rule_degrades_to_single_event(self):
+        event = self._event("FREQ=SECONDLY")
+        with self.assertLogs("class_schedule.ics_parser", level="WARNING") as captured:
+            occurrences = expand_occurrences(
+                event, datetime(2026, 9, 1), datetime(2026, 9, 8)
+            )
+        self.assertEqual(len(occurrences), 1)
+        self.assertTrue(any("过密" in line for line in captured.output))
+
+    def test_dense_rule_is_capped(self):
+        event = self._event("FREQ=MINUTELY")
+        with self.assertLogs("class_schedule.ics_parser", level="WARNING") as captured:
+            occurrences = expand_occurrences(
+                event, datetime(2026, 9, 1), datetime(2026, 9, 8)
+            )
+        self.assertEqual(len(occurrences), MAX_OCCURRENCES_PER_WINDOW)
+        self.assertTrue(any("过密" in line for line in captured.output))
+
+    def test_normal_weekly_rule_is_not_capped(self):
+        event = self._event("FREQ=WEEKLY;BYDAY=TU")
+        self.assertLess(
+            len(expand_occurrences(event, datetime(2026, 9, 1), datetime(2026, 10, 1))),
+            MAX_OCCURRENCES_PER_WINDOW,
+        )
+
+    def test_unparseable_rule_is_reported_not_silent(self):
+        """回归：坏规则以前静默退化成单次课，重复课会无声消失。"""
+        event = self._event("FREQ=WEEKLY;BYDAY=XX")
+        with self.assertLogs("class_schedule.ics_parser", level="WARNING") as captured:
+            occurrences = expand_occurrences(
+                event, datetime(2026, 9, 1), datetime(2026, 9, 8)
+            )
+        self.assertEqual(len(occurrences), 1)
+        self.assertTrue(any("无法解析" in line for line in captured.output))
+
+    def test_same_bad_rule_warns_only_once(self):
+        """坏规则每轮 tick 都会展开一次，不能每分钟刷一行日志。"""
+        event = self._event("FREQ=WEEKLY;BYDAY=XX")
+        with self.assertLogs("class_schedule.ics_parser", level="WARNING") as captured:
+            for _ in range(5):
+                expand_occurrences(event, datetime(2026, 9, 1), datetime(2026, 9, 8))
+        self.assertEqual(len(captured.output), 1)
+
+
+class TestParseWithWarnings(unittest.TestCase):
+    def test_skipped_lines_are_reported(self):
+        """有几行没读进去要能告诉用户，不能只写日志。"""
+        text = wrap(
+            "UID:warn-1",
+            "SUMMARY:高等数学",
+            "DTSTART:20260901T080000",
+            "这一行不是合法的 ICS 属性",
+        )
+        events, warnings = parse_ics_with_warnings(text, source="warn.ics")
+        self.assertEqual(len(events), 1)
+        self.assertTrue(any("1 处内容无法解析" in item for item in warnings))
+
+    def test_clean_file_has_no_warnings(self):
+        events, warnings = parse_ics_with_warnings(BASIC, source="ok.ics")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(warnings, [])
+
+    def test_parse_ics_still_returns_events_only(self):
+        events = parse_ics(BASIC, source="ok.ics")
+        self.assertEqual([event.uid for event in events], ["course-1"])
 
 
 if __name__ == "__main__":

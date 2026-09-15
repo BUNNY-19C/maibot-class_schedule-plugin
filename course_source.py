@@ -24,7 +24,13 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .ics_parser import CourseEvent, decode_ics_bytes, parse_ics, parse_ics_many
+from .ics_parser import (
+    CourseEvent,
+    decode_ics_bytes,
+    parse_ics,
+    parse_ics_many,
+    parse_ics_with_warnings,
+)
 
 __all__ = [
     "CourseRepository",
@@ -194,14 +200,20 @@ class CourseRepository:
         """
         self.ensure_dir()
         name = safe_filename(filename)
-        events = parse_ics(text, source=name)
+        # 校验能解析出事件再落盘；顺带拿到"有几行被跳过"这类非致命问题
+        events, warnings = parse_ics_with_warnings(text, source=name)
 
         with self._lock:
             target = self.ics_dir / name
             replaced = target.exists()
             _write_atomic(target, text)
             self._refresh_locked(force=True)
-            return ImportResult(target, len(events), self.errors, replaced=replaced)
+            # 只报**这份文件**的问题：整个目录的错误列表里可能有别的坏文件，
+            # 归到这次导入头上会让用户以为刚导入的课表有问题
+            for item in self._errors:
+                if item.startswith(f"{name}:"):
+                    warnings.append(item)
+            return ImportResult(target, len(events), warnings, replaced=replaced)
 
     def delete_ics(self, filename: str) -> bool:
         """删除一个 ics 文件，返回是否删除成功。"""

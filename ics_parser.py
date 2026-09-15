@@ -21,13 +21,47 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from dateutil.rrule import rrulestr
 
 from .constants import LOG_PREFIX
 
 logger = logging.getLogger(__name__)
+
+#: 单个事件在一个窗口内最多展开多少次。
+#: 重复规则来自**不可信文件**，`FREQ=SECONDLY` 这类在 7 天窗口能展开出 60 万次
+#: （实测 1.8 秒、数百 MB），而展开是在提醒循环与规划器注入的同步路径上跑的。
+#: 正常课表一个窗口撑死几百次，2000 足够宽松。
+MAX_OCCURRENCES_PER_WINDOW = 2000
+
+#: 已告警过的键（有上限，避免"每次 tick 都刷一条"与无界增长）
+_WARNED_KEYS: dict[str, None] = {}
+_MAX_WARNED_KEYS = 200
+
+
+def _warn_once(key: str, message: str, *args: object) -> None:
+    """同一个键只告警一次。
+
+    ``expand_occurrences`` 每轮 tick 都会对每个事件调用一次，
+    一条坏规则若不限制就会每分钟刷一行日志。
+    """
+    if key in _WARNED_KEYS:
+        return
+    _WARNED_KEYS[key] = None
+    while len(_WARNED_KEYS) > _MAX_WARNED_KEYS:
+        _WARNED_KEYS.pop(next(iter(_WARNED_KEYS)))
+    logger.warning(message, *args)
+
+
+#: 比分钟更细的重复频率。课表不会有这种规则，出现即视为坏数据/恶意构造
+_ABSURD_FREQ_RE = re.compile(r"FREQ=(SECONDLY|SECOND|MILLISECONDLY|MICROSECONDLY)\b", re.I)
+
+
+def _is_absurd_rule(normalized_rule: str) -> bool:
+    """重复频率是否细到不合常理（按秒/毫秒重复）。"""
+    return bool(_ABSURD_FREQ_RE.search(str(normalized_rule or "")))
+
 
 __all__ = [
     "CourseEvent",
@@ -36,6 +70,7 @@ __all__ = [
     "expand_occurrences",
     "parse_ics",
     "parse_ics_many",
+    "parse_ics_with_warnings",
 ]
 
 
@@ -227,6 +262,8 @@ class CourseEvent:
     all_day: bool = False
     rrule: str = ""
     exdates: list[datetime] = field(default_factory=list)
+    #: 日期型 EXDATE（``VALUE=DATE``）：只精确到天，按"日"匹配（见 expand_occurrences）
+    exdate_days: list[date] = field(default_factory=list)
     recurrence_id: datetime | None = None
     source: str = ""
     #: 被 RECURRENCE-ID 覆盖的单次课（原开始时间 → 覆盖事件）
@@ -275,6 +312,7 @@ def _make_event(props: dict[str, tuple[dict[str, str], str]], source: str) -> Co
     rrule = rrule_raw[1].strip() if rrule_raw else ""
 
     exdates: list[datetime] = []
+    exdate_days: list[date] = []
     exdate_raw = props.get("EXDATE")
     if exdate_raw is not None:
         params, value = exdate_raw
@@ -283,10 +321,14 @@ def _make_event(props: dict[str, tuple[dict[str, str], str]], source: str) -> Co
             if not piece:
                 continue
             try:
-                exdate, _ = parse_datetime(piece, params)
+                exdate, date_only = parse_datetime(piece, params)
             except IcsParseError:
                 continue
             exdates.append(exdate)
+            # 只精确到天的那种（VALUE=DATE 或裸 8 位数字）单独记一份，
+            # 定时课上要按"日"匹配才排得掉（见 expand_occurrences）
+            if date_only:
+                exdate_days.append(exdate.date())
 
     recurrence_id: datetime | None = None
     rid_raw = props.get("RECURRENCE-ID")
@@ -306,6 +348,7 @@ def _make_event(props: dict[str, tuple[dict[str, str], str]], source: str) -> Co
         all_day=all_day,
         rrule=rrule,
         exdates=exdates,
+        exdate_days=exdate_days,
         recurrence_id=recurrence_id,
         source=source,
     )
@@ -343,12 +386,23 @@ def _group_events(raw_events: list[CourseEvent]) -> list[CourseEvent]:
 
 def parse_ics(text: str, source: str = "") -> list[CourseEvent]:
     """解析一份 ICS 文本，返回合并后的课程事件列表。"""
+    return _parse_ics_impl(text, source)[0]
+
+
+def _parse_ics_impl(
+    text: str, source: str
+) -> tuple[list[CourseEvent], list[str]]:
+    """真正的解析实现，返回 ``(事件列表, 非致命问题列表)``。"""
     if not text or "BEGIN:VEVENT" not in text.upper():
         raise IcsParseError("内容中找不到 VEVENT，可能不是 iCalendar 文件")
 
     raw_events: list[CourseEvent] = []
     skipped = 0
     current: dict[str, tuple[dict[str, str], str]] | None = None
+    # 嵌套组件深度：VEVENT 之内还可能有 VALARM / VTODO 等子组件，
+    # 它们自己的 SUMMARY/DESCRIPTION 会覆盖外层同名属性（Google/Outlook 导出的
+    # 闹钟就是这样），所以深度 > 0 时一律丢弃属性行
+    nested_depth = 0
 
     for line in _unfold(text):
         try:
@@ -359,20 +413,29 @@ def parse_ics(text: str, source: str = "") -> list[CourseEvent]:
             continue
 
         if name == "BEGIN":
-            if value.strip().upper() == "VEVENT":
+            component = value.strip().upper()
+            if component == "VEVENT":
                 current = {}
+                nested_depth = 0
+            elif current is not None:
+                nested_depth += 1
             continue
         if name == "END":
-            if value.strip().upper() == "VEVENT":
-                if current is not None:
+            component = value.strip().upper()
+            if component == "VEVENT":
+                # 只在最外层收尾：子组件的 END 不该把整个事件结掉
+                if nested_depth == 0 and current is not None:
                     try:
                         raw_events.append(_make_event(current, source))
                     except IcsParseError:
                         # 单条事件缺关键字段时跳过，不让整份课表导入失败
                         skipped += 1
-                current = None
+                    current = None
+            elif current is not None and nested_depth > 0:
+                nested_depth -= 1
             continue
-        if current is None:
+        if current is None or nested_depth > 0:
+            # 子组件（如 VALARM）里的属性不属于这节课，忽略
             continue
 
         # EXDATE 可能重复出现，用列表语义承载
@@ -386,6 +449,7 @@ def parse_ics(text: str, source: str = "") -> list[CourseEvent]:
     if not raw_events:
         raise IcsParseError("没有解析出任何有效课程事件")
 
+    warnings: list[str] = []
     if skipped:
         # 用模块级 logger：SDK 说明非 plugin. 前缀的 logger 也会被转发到主进程
         logger.warning(
@@ -394,8 +458,21 @@ def parse_ics(text: str, source: str = "") -> list[CourseEvent]:
             skipped,
             source or "<未知来源>",
         )
+        # 一并回给调用方：导入回执里要能告诉用户"有几行没读进去"，
+        # 只写日志的话用户不知道自己的课表被啃掉了一部分
+        warnings.append(f"{skipped} 处内容无法解析已跳过")
 
-    return _group_events(raw_events)
+    return _group_events(raw_events), warnings
+
+
+def parse_ics_with_warnings(
+    text: str, source: str = ""
+) -> tuple[list[CourseEvent], list[str]]:
+    """同 :func:`parse_ics`，但把"有问题但没致命"的信息一并返回。
+
+    目前只有一处：文件里有多少行因为格式问题被跳过。
+    """
+    return _parse_ics_impl(text, source)
 
 
 def parse_ics_many(sources: dict[str, str]) -> tuple[list[CourseEvent], list[str]]:
@@ -434,24 +511,90 @@ def expand_occurrences(
             return [_materialize(event, event.start)]
         return []
 
-    try:
-        rule = rrulestr(_normalize_rrule(event.rrule), dtstart=event.start)
-    except (ValueError, TypeError):
-        # 规则无法解析时退化为单次事件，避免整节课丢失
+    normalized = _normalize_rrule(event.rrule)
+    if _is_absurd_rule(normalized):
+        # 课表不可能按秒/按分钟重复。这类规则要么是坏数据，要么是刻意构造的，
+        # 一律按"单次课"处理并告警——比让它把同步路径算死要好
+        _warn_once(
+            f"absurd:{event.uid}:{event.rrule}",
+            "%s 课程的重复规则过密（按秒/分钟重复），已按单次课处理：规则=%r；来源=%s",
+            LOG_PREFIX,
+            event.rrule,
+            event.source or "<未知来源>",
+        )
         if window_start <= event.start <= window_end:
             return [_materialize(event, event.start)]
         return []
 
     try:
-        occurrences = rule.between(window_start, window_end, inc=True)
-    except (ValueError, TypeError):
+        rule = rrulestr(normalized, dtstart=event.start)
+    except (ValueError, TypeError) as exc:
+        # 规则无法解析时退化为单次事件（避免整节课丢失），但**必须留痕**：
+        # 静默退化会让一门每周重复的课只剩第一次，用户以为插件不再提醒了
+        _warn_once(
+            f"rrule:{event.uid}:{event.rrule}",
+            "%s 课程的重复规则无法解析，已按单次课处理（只有这一次会提醒）："
+            "%s；规则=%r；来源=%s",
+            LOG_PREFIX,
+            exc,
+            event.rrule,
+            event.source or "<未知来源>",
+        )
+        if window_start <= event.start <= window_end:
+            return [_materialize(event, event.start)]
+        return []
+
+    # 用惰性的 xafter 而不是 between：between 会先把窗口内**全部**时间点物化出来
+    # 再交给我们，规则由不可信文件决定时那可能是几十万个（实测 60 万个 / 1.8 秒）。
+    # 这里边取边截断，时间和内存都是有界的。
+    occurrences: list[datetime] = []
+    truncated = False
+    try:
+        for moment in rule.xafter(
+            window_start, count=MAX_OCCURRENCES_PER_WINDOW + 1, inc=True
+        ):
+            if moment > window_end:
+                break
+            if len(occurrences) >= MAX_OCCURRENCES_PER_WINDOW:
+                truncated = True
+                break
+            occurrences.append(moment)
+    except (ValueError, TypeError) as exc:
+        _warn_once(
+            f"between:{event.uid}:{exc}",
+            "%s 课程按重复规则展开失败，本次不产生提醒：%s；规则=%r",
+            LOG_PREFIX,
+            exc,
+            event.rrule,
+        )
         occurrences = []
 
+    if truncated:
+        _warn_once(
+            f"cap:{event.uid}",
+            "%s 课程的重复规则过密（窗口内超过 %d 次），已只取前 %d 次："
+            "规则=%r；来源=%s",
+            LOG_PREFIX,
+            MAX_OCCURRENCES_PER_WINDOW,
+            MAX_OCCURRENCES_PER_WINDOW,
+            event.rrule,
+            event.source or "<未知来源>",
+        )
+
     excluded = set(event.exdates)
+    # 日期型 EXDATE（``EXDATE;VALUE=DATE:20260915``）在定时课上只给到"哪一天"，
+    # 解析出来是当天 00:00，而这次课的开始时间在 08:00，精确比较永远匹配不上。
+    # 教务系统常用这种写法标注停课/调课，所以按"日"再匹配一次。
+    excluded_days = set(event.exdate_days)
     result: list[CourseEvent] = []
     consumed: set[datetime] = set()
+
+    def _is_excluded(moment: datetime) -> bool:
+        """该次课是否被 EXDATE 排除掉。"""
+        return moment in excluded or moment.date() in excluded_days
+
     for moment in occurrences:
-        if moment in excluded:
+        if _is_excluded(moment):
             continue
         override = event.overrides.get(moment)
         if override is not None:
@@ -464,7 +607,7 @@ def expand_occurrences(
 
     # 覆盖可能把课从窗口外挪进窗口内（如调课），这类要单独补上
     for recurrence_id, override in event.overrides.items():
-        if recurrence_id in consumed or recurrence_id in excluded:
+        if recurrence_id in consumed or _is_excluded(recurrence_id):
             continue
         if window_start <= override.start <= window_end:
             result.append(_materialize(override, override.start))

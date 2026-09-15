@@ -119,6 +119,33 @@ class TestLoadTolerance(unittest.TestCase):
             path.write_text("{ 这不是 json", encoding="utf-8")
             self.assertEqual(PluginState.load(path).subscriptions, [])
 
+    def test_non_list_subscriptions_is_reported(self):
+        """回归：subscriptions 字段存在却不是列表时曾经静默清空。
+
+        与本文件既有的纪律一致——"文件存在却读不出来必须留痕"，
+        否则用户只看到"没有提醒对象"，排查不到根因。
+        """
+        with TemporaryDirectory() as tmp:
+            path = state_path(tmp)
+            path.write_text(
+                json.dumps({"version": 2, "subscriptions": None, "fired": {}}),
+                encoding="utf-8",
+            )
+            with self.assertLogs("class_schedule.store", level="WARNING") as captured:
+                state = PluginState.load(path)
+            self.assertEqual(state.subscriptions, [])
+            self.assertTrue(any("subscriptions" in line for line in captured.output))
+
+    def test_missing_subscriptions_does_not_warn(self):
+        """字段本身缺失（v1 或首次启动）是正常情况，不该告警。"""
+        with TemporaryDirectory() as tmp:
+            path = state_path(tmp)
+            path.write_text(
+                json.dumps({"version": 2, "targets": ["s1"]}), encoding="utf-8"
+            )
+            state = PluginState.load(path)
+            self.assertEqual([s.stream_id for s in state.subscriptions], ["s1"])
+
     def test_wrong_types_are_discarded(self):
         with TemporaryDirectory() as tmp:
             path = state_path(tmp)

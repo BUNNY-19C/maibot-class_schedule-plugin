@@ -379,6 +379,42 @@ def check_runtime(workdir: Path, module_name: str, report: Check) -> None:
                 f"年份 {plugin._holidays.years if plugin._holidays else []}",
             )
 
+            # 真实日历导出的形态：带 VALARM，且用日期型 EXDATE 标停课。
+            # 两者以前都会出错——VALARM 的 SUMMARY 会顶掉课程名，
+            # 日期型 EXDATE 匹配不上导致停课的周照旧提醒
+            gcal_start = datetime.now() + timedelta(days=1)
+            (plugin._data_dir / "ics" / "gcal.ics").write_text(
+                "BEGIN:VCALENDAR\nBEGIN:VEVENT\n"
+                "UID:gcal-1\nSUMMARY:真实日历课\nDESCRIPTION:教师-李四\n"
+                f"DTSTART:{gcal_start.strftime('%Y%m%dT%H%M%S')}\n"
+                f"DTEND:{(gcal_start + timedelta(minutes=100)).strftime('%Y%m%dT%H%M%S')}\n"
+                "RRULE:FREQ=WEEKLY;COUNT=4\n"
+                f"EXDATE;VALUE=DATE:{gcal_start.strftime('%Y%m%d')}\n"
+                "BEGIN:VALARM\nACTION:EMAIL\nTRIGGER:-PT20M\n"
+                "SUMMARY:Alarm summary\nDESCRIPTION:This is an event reminder\n"
+                "END:VALARM\n"
+                "END:VEVENT\nEND:VCALENDAR\n",
+                encoding="utf-8",
+            )
+            plugin._repo.refresh(force=True)
+            imported = [
+                item for item in plugin._repo.events if item.uid == "gcal-1"
+            ]
+            report.expect(
+                "带 VALARM 的日历导入后课程名不被提醒器文案顶掉",
+                len(imported) == 1 and imported[0].summary == "真实日历课",
+                imported[0].summary if imported else "<没解析出来>",
+            )
+            report.expect(
+                "日期型 EXDATE 被识别为当天停课",
+                bool(imported)
+                and list(imported[0].exdate_days) == [gcal_start.date()],
+                str(list(imported[0].exdate_days)) if imported else "<无>",
+            )
+            # 清理这份临时课表，别影响后面的提醒判定
+            (plugin._data_dir / "ics" / "gcal.ics").unlink()
+            plugin._repo.refresh(force=True)
+
             # 形状与麦麦命令执行器真实 invoke_args 一致。
             # 用**私聊**消息：插件默认 access.chat_scope=private，只在私聊工作，
             # 这也正是这个插件的目标场景

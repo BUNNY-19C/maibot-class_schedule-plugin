@@ -204,6 +204,15 @@ class PluginState:
         # ── v1 迁移：裸 stream_id 列表 + 一个全局提前量 ──
         legacy_targets = raw.get("targets")
         if not isinstance(legacy_targets, list):
+            # 键**存在**却不是列表（手改/外部工具写坏，如 null）才告警：
+            # 键不存在是正常的 v1 结构或首次启动，不该刷日志
+            if "subscriptions" in raw:
+                logger.warning(
+                    "%s 状态文件的 subscriptions 字段不是列表（%s），已忽略；"
+                    "该字段里原有的订阅不会恢复",
+                    LOG_PREFIX,
+                    type(items).__name__,
+                )
             return []
 
         # 旧的全局提前量体现了用户意图，迁移时平摊给已有订阅，
