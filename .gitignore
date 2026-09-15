@@ -1,0 +1,12 @@
+# Runner 生成的运行时配置（含隐私配置，不入库）
+/config.toml
+# 本地运行时数据
+data/
+temp/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+# 工具链产生的本地状态
+.mimosa/

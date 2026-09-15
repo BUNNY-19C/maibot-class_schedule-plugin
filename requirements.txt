@@ -1,0 +1,2 @@
+# 插件运行依赖（_manifest.json 的 dependencies 已声明，MaiBot 启动时自动安装）
+python-dateutil>=2.8.0
