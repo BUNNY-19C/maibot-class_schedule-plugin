@@ -549,6 +549,28 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
             await plugin._deliver_for_lead(plugin._subscriptions(), 1, later, 300)
             self.assertEqual(plugin.ctx.send.streams(), ["s1"])  # type: ignore[attr-defined]
 
+    async def test_no_target_warning_distinguishes_empty_schedule(self):
+        """回归：课表为空时不能说"有课程到期"——那不是当前的问题。"""
+        with TemporaryDirectory() as tmp:
+            # 空课表 + 无订阅：应提示"先导入课表"
+            plugin = self.prepare_bare(Path(tmp), targets=())
+            plugin._warned_no_target = False
+            with self.assertLogs("test.class-schedule", level="WARNING") as captured:
+                plugin._warn_about_missing_targets()
+            joined = "\n".join(captured.output)
+            self.assertIn("还没有导入课表", joined)
+            self.assertNotIn("有课程到期", joined)
+
+            # 有课表 + 无订阅：应提示"去订阅"，也不再提"有课程到期"
+            with TemporaryDirectory() as tmp2:
+                plugin2 = self.prepare(Path(tmp2), offset_minutes=20, targets=())
+                plugin2._warned_no_target = False
+                with self.assertLogs("test.class-schedule", level="WARNING") as cap2:
+                    plugin2._warn_about_missing_targets()
+                joined2 = "\n".join(cap2.output)
+                self.assertIn("课表已就绪但没有任何提醒会话", joined2)
+                self.assertNotIn("有课程到期", joined2)
+
     async def test_risky_settings_are_logged_at_load(self):
         """配置组合会导致迟到提醒时必须告警，不能悄悄放宽了事。"""
         with TemporaryDirectory() as tmp:

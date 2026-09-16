@@ -596,10 +596,18 @@ class ClassSchedulePlugin(MaiBotPlugin):
         """没有可投递的会话时给出一次提示（区分"没订阅"和"被名单挡住"）。"""
         if not self._subscriptions():
             if not self._warned_no_target:
-                self.ctx.logger.warning(
-                    f"{LOG_PREFIX} 有课程到期但没有任何提醒会话，"
-                    "请在目标会话里发送 /课表订阅"
-                )
+                repo = self._repo
+                if repo is None or not repo.events:
+                    # 别说"有课程到期"——课表都还是空的，那不是当前的问题
+                    self.ctx.logger.warning(
+                        f"{LOG_PREFIX} 还没有导入课表：发 /课程解析 或把 ics 文件"
+                        "发给机器人，然后在需要收提醒的会话里发送 /课表订阅"
+                    )
+                else:
+                    self.ctx.logger.warning(
+                        f"{LOG_PREFIX} 课表已就绪但没有任何提醒会话，"
+                        "请在需要收提醒的会话里发送 /课表订阅"
+                    )
                 self._warned_no_target = True
             return
 
