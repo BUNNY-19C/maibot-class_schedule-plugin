@@ -3798,6 +3798,116 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
             texts = plugin.ctx.send.texts  # type: ignore[attr-defined]
             self.assertTrue(any("内容是空的" in t for _s, t in texts))
 
+    async def test_course_summary_generated_after_class(self):
+        """下课后聚合该课随手记录，模型整理成结构化总结并落盘。"""
+        with TemporaryDirectory() as tmp:
+            plugin = self.prepare_bare(
+                Path(tmp), targets=("ps",), config=build_config(access={"chat_scope": "private"})
+            )
+            start = datetime.now() - timedelta(minutes=105)  # 100 分钟的课，5 分钟前结束
+            write_ics(Path(tmp) / "ics" / "a.ics", start, summary="高等数学", uid="s1")
+            plugin._repo.refresh(force=True)  # type: ignore[union-attr]
+            # 这节课期间记的两条随手笔记（store 用 index 里的 created_at 判断归属窗口，
+            # 所以加完后直接改 index.json 的时间字段来回溯到课中）
+            store = plugin._notes
+            store.add_text_note("高等数学", "重点", "第三章要考", source="测试")
+            store.add_text_note("高等数学", "公式", "e^iπ+1=0", source="测试")
+            index_path = store.course_dir("高等数学") / "index.json"
+            import json as _json
+            data = _json.loads(index_path.read_text(encoding="utf-8"))
+            data["notes"][0]["created_at"] = (
+                datetime.now() - timedelta(minutes=80)
+            ).isoformat(timespec="seconds")
+            data["notes"][1]["created_at"] = (
+                datetime.now() - timedelta(minutes=60)
+            ).isoformat(timespec="seconds")
+            index_path.write_text(
+                _json.dumps(data, ensure_ascii=False), encoding="utf-8"
+            )
+
+            llm: FakeLlm = plugin.ctx.llm  # type: ignore[assignment]
+            llm.response = "## 核心考点\n- 泰勒展开\n\n## 思维导图\n```mermaid\nmindmap\n 高数\n```"
+
+            await plugin._generate_course_summary(
+                "高等数学",
+                (start, start + timedelta(minutes=100)),
+                "testkey",
+            )
+
+            summary_path = (
+                Path(tmp) / "notes" / "高等数学" / "总结" / f"{start.strftime('%Y-%m-%d')}.md"
+            )
+            self.assertTrue(summary_path.exists())
+            content = summary_path.read_text(encoding="utf-8")
+            self.assertIn("核心考点", content)
+            self.assertIn("mermaid", content)
+            self.assertTrue(plugin._state.was_summarized("testkey"))
+            # 通知发送给提醒会话
+            self.assertTrue(any("课堂总结" in t for _s, t in plugin.ctx.send.texts))  # type: ignore[attr-defined]
+
+    async def test_course_summary_skipped_without_notes(self):
+        """该节课没有任何随手记录：不生成文件，但也标记成已处理。"""
+        with TemporaryDirectory() as tmp:
+            plugin = self.prepare_bare(
+                Path(tmp), targets=(), config=build_config(access={"chat_scope": "private"})
+            )
+            start = datetime.now() - timedelta(minutes=105)
+
+            await plugin._generate_course_summary(
+                "高等数学",
+                (start, start + timedelta(minutes=100)),
+                "emptykey",
+            )
+
+            self.assertFalse(
+                (Path(tmp) / "notes" / "高等数学" / "总结").exists()
+            )
+            # 标记由调度器（_maybe_course_summaries）负责，直调只负责跳过
+            self.assertFalse(plugin._state.was_summarized("emptykey"))
+
+    async def test_course_summary_failure_retries_then_gives_up(self):
+        """模型失败按次数重试，超限后放弃并留痕（不无限循环）。"""
+        with TemporaryDirectory() as tmp:
+            plugin = self.prepare_bare(
+                Path(tmp), targets=(), config=build_config(access={"chat_scope": "private"})
+            )
+            llm: FakeLlm = plugin.ctx.llm  # type: ignore[assignment]
+            llm.fail = True
+            window = (datetime.now() - timedelta(minutes=105),
+                      datetime.now() - timedelta(minutes=5))
+            plugin._notes.add_text_note("高等数学", "重点", "要考", source="测试")
+            # 回溯到课中，否则 notes_between 为空走不到模型调用
+            import json as _json
+            index_path = plugin._notes.course_dir("高等数学") / "index.json"
+            data = _json.loads(index_path.read_text(encoding="utf-8"))
+            data["notes"][0]["created_at"] = window[0].isoformat(timespec="seconds")
+            index_path.write_text(
+                _json.dumps(data, ensure_ascii=False), encoding="utf-8"
+            )
+
+            await plugin._generate_course_summary("高等数学", window, "failkey")
+            self.assertFalse(plugin._state.was_summarized("failkey"))  # 还会重试
+            self.assertEqual(plugin._summary_attempts.get("failkey"), 1)
+            self.assertIn("failkey", plugin._summary_retries)  # 已排入重试队列
+
+            await plugin._generate_course_summary("高等数学", window, "failkey")
+            await plugin._generate_course_summary("高等数学", window, "failkey")
+            self.assertTrue(plugin._state.was_summarized("failkey"))  # 放弃后留痕
+            self.assertNotIn("failkey", plugin._summary_retries)  # 队列清掉
+            self.assertNotIn("failkey", plugin._summary_attempts)
+
+    async def test_summary_disabled_by_config(self):
+        with TemporaryDirectory() as tmp:
+            plugin = self.prepare_bare(
+                Path(tmp),
+                targets=(),
+                config=build_config(
+                    access={"chat_scope": "private"}, study={"summary_enabled": False}
+                ),
+            )
+            plugin._maybe_course_summaries(datetime.now())
+            self.assertEqual(plugin._summary_attempts, {})
+
     async def test_note_commands(self):
         """/笔记 概览与明细、/归到 纠正、/找 检索。"""
         with TemporaryDirectory() as tmp:

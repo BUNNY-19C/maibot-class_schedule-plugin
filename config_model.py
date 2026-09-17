@@ -510,6 +510,29 @@ class StudySettingsConfig(PluginConfigBase):
         ),
         json_schema_extra={"label": "自动按课归属", "order": 5},
     )
+    summary_enabled: bool = Field(
+        default=True,
+        description=(
+            "课后自动总结：一门课下课后，把该节课随手记的内容聚合起来，"
+            "让模型整理成含「核心考点 / 遗留疑问 / 作业清单 / Mermaid 思维导图」"
+            "的结构化 Markdown，存进 notes/<课程名>/总结/ 并通知你"
+        ),
+        json_schema_extra={"label": "课后自动总结", "order": 6},
+    )
+    summary_delay_minutes: int = Field(
+        default=5,
+        ge=0,
+        le=60,
+        description="下课多少分钟后开始生成总结（留点时间让你补记最后几条）",
+        json_schema_extra={"label": "总结延迟（分钟）", "order": 7, "step": 1},
+    )
+    summary_timeout_seconds: int = Field(
+        default=90,
+        ge=10,
+        le=600,
+        description="生成总结的模型调用超时（秒）；失败自动重试，最多 3 次",
+        json_schema_extra={"label": "总结超时（秒）", "order": 8, "step": 10},
+    )
 
 
 class ClassScheduleConfig(PluginConfigBase):

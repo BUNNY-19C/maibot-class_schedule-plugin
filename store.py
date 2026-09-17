@@ -153,6 +153,8 @@ class PluginState:
 
     subscriptions: list[Subscription] = field(default_factory=list)
     fired: dict[str, str] = field(default_factory=dict)
+    #: 已生成的课后总结："<课次key>" -> "<ISO时间>"（key 形如 202609170800:uid）
+    summaries: dict[str, str] = field(default_factory=dict)
 
     # ── 读写 ──────────────────────────────────────────────
 
@@ -174,7 +176,8 @@ class PluginState:
 
         subscriptions = cls._load_subscriptions(raw)
         fired = cls._load_fired(raw.get("fired"))
-        return cls(subscriptions=subscriptions, fired=fired)
+        summaries = cls._load_summaries(raw.get("summaries"))
+        return cls(subscriptions=subscriptions, fired=fired, summaries=summaries)
 
     @staticmethod
     def _load_fired(raw: Any) -> dict[str, str]:
@@ -185,6 +188,16 @@ class PluginState:
                 if isinstance(key, str) and isinstance(value, str):
                     fired[key] = value
         return fired
+
+    @staticmethod
+    def _load_summaries(raw: Any) -> dict[str, str]:
+        """读取已生成总结的记录；结构异常的条目跳过。"""
+        result: dict[str, str] = {}
+        if isinstance(raw, dict):
+            for key, value in raw.items():
+                if isinstance(key, str) and key and isinstance(value, str):
+                    result[key] = value
+        return result
 
     @classmethod
     def _load_subscriptions(cls, raw: dict[str, Any]) -> list[Subscription]:
@@ -243,6 +256,7 @@ class PluginState:
             "version": STATE_VERSION,
             "subscriptions": [item.to_dict() for item in self.subscriptions],
             "fired": self.fired,
+            "summaries": self.summaries,
         }
         path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp_name = tempfile.mkstemp(
@@ -321,6 +335,13 @@ class PluginState:
         return True
 
     # ── 已提醒记录 ────────────────────────────────────────
+
+    def mark_summarized(self, key: str, moment: datetime) -> None:
+        """标记某节课的总结已生成（无论成败，避免重复生成）。"""
+        self.summaries[key] = moment.isoformat(timespec="seconds")
+
+    def was_summarized(self, key: str) -> bool:
+        return key in self.summaries
 
     def mark_fired(self, key: str, moment: datetime) -> None:
         """记录一次已提醒。"""

@@ -179,6 +179,11 @@ class ClassSchedulePlugin(MaiBotPlugin):
         #: 在 before_process 抢到的图片候选（原图 base64/url），
         #: 因为宿主在 process() 阶段生成描述后会**主动清空**原图字节
         self._note_images: dict[str, dict[str, Any]] = {}
+        #: 课后总结连续失败计数：key -> 次数（超过阈值放弃，见 SUMMARY_MAX_ATTEMPTS）
+        self._summary_attempts: dict[str, int] = {}
+        #: 待重试的总结任务：key -> {course, window}（每轮 tick 重新排入，见
+        #: _maybe_course_summaries——失败后不能靠"下课窗口"重试，窗口会移走）
+        self._summary_retries: dict[str, dict[str, Any]] = {}
         #: 已确认"放假安排尚未公布"的年份 → 记录时间，避免反复重试与刷屏
         self._holiday_unpublished: dict[int, datetime] = {}
         #: 下载失败的年份 → 记录时间，按短周期重试（见 HOLIDAY_FAILURE_RETRY_SECONDS）
@@ -556,6 +561,9 @@ class ClassSchedulePlugin(MaiBotPlugin):
             for lead in sorted(by_lead):
                 fired_any |= await self._deliver_for_lead(by_lead[lead], lead, now, interval)
 
+            # 课后总结：下课 N 分钟后聚合该节课的随手记录，让模型整理成结构化笔记
+            self._maybe_course_summaries(now)
+
             if fired_any:
                 self._save_state()
 
@@ -628,6 +636,218 @@ class ClassSchedulePlugin(MaiBotPlugin):
                     f"{'、'.join(failed)}"
                 )
         return fired_any
+
+    # ── 课后自动总结 ──────────────────────────────────────
+
+    #: 同一节课总结连续失败多少次后放弃（避免模型一直故障时每轮重试）
+    SUMMARY_MAX_ATTEMPTS = 3
+
+    def _maybe_course_summaries(self, now: datetime) -> None:
+        """扫一遍今天刚下课的课，安排生成课后总结（后台任务，绝不阻塞 tick）。
+
+        一节课「结束时间落在 [now-delay, now-delay+一个tick] 内」且该节课
+        有随手记录、且尚未生成过总结 → 触发。没有记录的课也标记为已处理，
+        免得在窗口内每轮 tick 都白扫一遍。
+        """
+        conf = self._conf()
+        if not conf.plugin.enabled or not conf.study.enabled:
+            return
+        if not conf.study.summary_enabled:
+            return
+        repo = self._repo
+        notes = self._notes
+        if repo is None or notes is None or not repo.events:
+            return
+
+        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        delay = max(0, int(conf.study.summary_delay_minutes))
+        # 结束时刻恰在 [now-delay, now-delay+interval) 窗口内的课
+        window_end = now - timedelta(minutes=delay)
+        interval = max(15, int(conf.reminder.check_interval_seconds))
+
+        # 上次失败的总结每轮重排（不等窗口，窗口已经移走了）
+        for key, retry in list(self._summary_retries.items()):
+            task = asyncio.create_task(
+                self._run_course_summary(
+                    retry["course"], retry["window"], key
+                ),
+                name="class-schedule-summary-retry",
+            )
+            self._note_tasks.add(task)
+            task.add_done_callback(self._note_tasks.discard)
+
+        for event in repo.events:
+            if event.all_day:
+                continue
+            for occurrence in expand_occurrences(
+                event, day_start, day_start + timedelta(days=1)
+            ):
+                end = occurrence.end or (
+                    occurrence.start + timedelta(minutes=45)
+                )
+                if not (window_end <= end < window_end + timedelta(seconds=interval)):
+                    continue
+                key = (
+                    f"{occurrence.start.strftime('%Y%m%d%H%M')}"
+                    f":{event.uid}:{occurrence.start.strftime('%H%M')}"
+                )
+                if self._state.was_summarized(key):
+                    continue
+                # 先标记再生成：防止 tick 重叠或任务迟到时重复生成；
+                # 生成失败按次数重试（见 _run_course_summary）
+                self._state.mark_summarized(key, now)
+                self._save_state()
+                course = occurrence.display_name
+                window = (occurrence.start, end)
+                task = asyncio.create_task(
+                    self._run_course_summary(course, window, key),
+                    name="class-schedule-summary",
+                )
+                self._note_tasks.add(task)
+                task.add_done_callback(self._note_tasks.discard)
+
+    async def _run_course_summary(
+        self,
+        course: str,
+        window: tuple[datetime, datetime],
+        key: str,
+    ) -> None:
+        try:
+            await self._generate_course_summary(course, window, key)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.ctx.logger.warning(
+                f"{LOG_PREFIX} 课后总结异常（{course}）: {exc}"
+            )
+
+    async def _generate_course_summary(
+        self,
+        course: str,
+        window: tuple[datetime, datetime],
+        key: str,
+    ) -> None:
+        """聚合该节课的随手记录，让模型整理成结构化 Markdown 并落盘 + 通知。"""
+        notes = self._notes
+        if notes is None:
+            return
+        conf = self._conf()
+        start, end = window
+        items = notes.notes_between(course, start, end)
+        if not items:
+            self.ctx.logger.debug(
+                f"{LOG_PREFIX} 「{course}」本节课没有随手记录，跳过总结"
+            )
+            return
+
+        lines = []
+        for note in items:
+            stamp = note.created_at[11:16] if note.created_at else "--:--"
+            if note.file.startswith("img/"):
+                body = note.text or "（无描述）"
+                lines.append(f"[{stamp}] [图片] {body}")
+            else:
+                lines.append(f"[{stamp}] [{note.kind}] {note.text}")
+        record_text = "\n".join(lines)
+
+        prompt = (
+            "下面是一位学生在同一节课（"
+            f"{course}，{start.strftime('%H:%M')}-{end.strftime('%H:%M')}）"
+            "期间随手记下的原始笔记。请整理成一份结构化的课后总结 Markdown，"
+            "严格包含以下四个小节，用 ## 标题：\n"
+            "## 核心考点\n（从笔记里提炼知识点，逐条列出；笔记没提到的不要编造）\n"
+            "## 遗留疑问\n（笔记里暴露的没弄懂的问题；没有就写「无」）\n"
+            "## 作业清单\n（笔记里提到的作业/截止时间；没有就写「无」）\n"
+            "## 思维导图\n（用一个 ```mermaid mindmap 代码块概括知识结构）\n\n"
+            "原始笔记如下：\n" + record_text
+        )
+        timeout = float(conf.study.summary_timeout_seconds)
+        try:
+            call = self.ctx.llm.generate(prompt=prompt, max_tokens=1500)
+            result = await asyncio.wait_for(call, timeout=timeout)
+        except asyncio.TimeoutError:
+            self._summary_failure(course, window, key, "模型超时")
+            return
+        except Exception as exc:
+            self._summary_failure(course, window, key, str(exc))
+            return
+        if isinstance(result, dict) and not result.get("success", True):
+            self._summary_failure(course, window, key, str(result.get("error") or "模型拒绝"))
+            return
+        markdown = (
+            str(result.get("response") or "") if isinstance(result, dict) else str(result)
+        ).strip()
+        if not markdown:
+            self._summary_failure(course, window, key, "模型返回空内容")
+            return
+
+        path = notes.add_summary(course, start.strftime("%Y-%m-%d"), markdown)
+        # 成功补标记：调度器在生成前就标记过（防重复），这里幂等；
+        # 直接调用（如重试队列）成功后也由此留痕
+        self._state.mark_summarized(key, datetime.now())
+        self._summary_attempts.pop(key, None)
+        self._summary_retries.pop(key, None)
+        self._save_state()
+        self.ctx.logger.info(
+            f"{LOG_PREFIX} 课后总结已生成：「{course}」{start.strftime('%m-%d')}"
+            f"（聚合 {len(items)} 条随手记录）→ {path.name}"
+        )
+        await self._notify_summary(course, len(items))
+
+    def _summary_failure(
+        self,
+        course: str,
+        window: tuple[datetime, datetime],
+        key: str,
+        reason: str,
+    ) -> None:
+        """总结失败：进重试队列（每轮 tick 重排），超限后标记放弃并留痕。
+
+        不能靠"下课窗口"自然重试——窗口每轮 tick 都在移动，失败的课下一轮
+        就落在窗口之外了，所以必须有独立的重试队列。
+        """
+        attempts = self._summary_attempts.get(key, 0) + 1
+        self._summary_attempts[key] = attempts
+        if attempts >= self.SUMMARY_MAX_ATTEMPTS:
+            self.ctx.logger.warning(
+                f"{LOG_PREFIX} 「{course}」课后总结连续 {attempts} 次失败，放弃：{reason}"
+            )
+            self._state.mark_summarized(key, datetime.now())  # 留痕，不再重试
+            self._save_state()
+            self._summary_attempts.pop(key, None)
+            self._summary_retries.pop(key, None)
+            return
+        self._summary_retries[key] = {"course": course, "window": window}
+
+    async def _notify_summary(self, course: str, note_count: int) -> None:
+        """总结生成后通知提醒会话。"""
+        targets = [
+            item
+            for item in await self._resolve_user_id_targets(self._subscriptions())
+            if self._should_deliver(item)
+        ]
+        if not targets:
+            return
+        facts = (
+            f"「{course}」这节课刚下课后，插件把 TA 随手记的 {note_count} 条笔记"
+            "整理成了一份课后总结（核心考点/遗留疑问/作业清单/思维导图），"
+            "已存进笔记库。用一句话告诉 TA 总结好了，发 /笔记 "
+            f"{course} 可以看。"
+        )
+        fixed_text = (
+            f"📚 「{course}」课堂总结已生成（{note_count} 条随手记录）——"
+            f"发 /笔记 {course} 查看"
+        )
+        style = self._reply_style_for("note_capture")
+        persona_text = await self._persona_say(facts) if style == "persona" else ""
+        for item in targets:
+            await self._deliver(
+                item.stream_id,
+                facts,
+                reason="note_capture",
+                fixed_text=fixed_text,
+                persona_text=persona_text,
+            )
 
     def _warn_about_missing_targets(self) -> None:
         """没有可投递的会话时给出一次提示（区分"没订阅"和"被名单挡住"）。"""
@@ -1747,6 +1967,9 @@ class ClassSchedulePlugin(MaiBotPlugin):
             await self._reply(stream_id, message)
             return True, "该课暂无笔记", 1
         lines = [f"📒 {target} 最近笔记："]
+        summaries = notes.summaries(target)
+        if summaries:
+            lines.append(f"　📚 课后总结：{len(summaries)} 份（{summaries[-1]} …）")
         for note in notes.recent(target, limit=10):
             stamp = note.created_at[5:16].replace("T", " ") if note.created_at else ""
             head = f"{stamp} [{note.kind}]"

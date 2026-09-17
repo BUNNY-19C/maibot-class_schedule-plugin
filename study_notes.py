@@ -270,6 +270,51 @@ class StudyNoteStore:
         notes = self._load_index(self.course_dir(course)).notes
         return notes[-1] if notes else None
 
+    def notes_between(
+        self, course: str, start: datetime, end: datetime
+    ) -> list[StudyNote]:
+        """某课程在 ``[start, end]`` 时间段内记的笔记（按时间正序）。
+
+        边界比较前把两端截到整秒：created_at 落盘时就是秒精度，
+        不截的话微秒残留会让"恰好等于窗口起点"的笔记被排除掉。
+        """
+        start = start.replace(microsecond=0)
+        end = end.replace(microsecond=0)
+        result: list[StudyNote] = []
+        for note in self._load_index(self.course_dir(course)).notes:
+            if not note.created_at:
+                continue
+            try:
+                moment = datetime.fromisoformat(note.created_at)
+            except ValueError:
+                continue
+            if start <= moment <= end:
+                result.append(note)
+        return result
+
+    # ── 课后总结 ──────────────────────────────────────────
+
+    def summaries_dir(self, course: str) -> Path:
+        return self.course_dir(course) / "总结"
+
+    def add_summary(self, course: str, day: str, markdown: str) -> Path:
+        """保存某天该课的课后总结到 ``总结/<day>.md``，返回文件路径。
+
+        总结由模型生成的 Markdown 组成（不是用户原始输入），直接原子落盘。
+        """
+        if not str(markdown or "").strip():
+            raise ValueError("总结内容为空")
+        target = self.summaries_dir(course) / f"{day}.md"
+        _atomic_write(target, str(markdown))
+        return target
+
+    def summaries(self, course: str) -> list[str]:
+        """该课已有哪些课后总结（按日期排序，新的在后）。"""
+        folder = self.summaries_dir(course)
+        if not folder.exists():
+            return []
+        return sorted(item.stem for item in folder.glob("*.md"))
+
 
 # ── 工具 ──────────────────────────────────────────────────
 
