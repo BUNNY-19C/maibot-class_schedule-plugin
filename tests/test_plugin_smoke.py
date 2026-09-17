@@ -3189,6 +3189,202 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(plugin._repo.file_count, 2)  # type: ignore[union-attr]
             self.assertEqual(len(plugin._repo.events), 2)  # type: ignore[union-attr]
 
+    async def test_url_import_records_source_for_refresh(self):
+        """网址导入要记录来源与指纹，自动刷新才有依据。"""
+        with TemporaryDirectory() as tmp:
+            plugin = self.prepare_bare(Path(tmp))
+            content = ics_text_with(
+                datetime.now() + timedelta(days=1), hour=9, summary="A课", uid="a"
+            )
+
+            with self.fake_fetch(content):
+                ok, message, _ = await plugin.handle_import(
+                    stream_id="s", matched_groups={"url": "https://a.example.com/cal.ics"}
+                )
+
+            self.assertTrue(ok, message)
+            self.assertIn("自动刷新", message)
+            sources = plugin._repo.url_sources()  # type: ignore[union-attr]
+            self.assertEqual(len(sources), 1)
+            info = next(iter(sources.values()))
+            self.assertEqual(info["url"], "https://a.example.com/cal.ics")
+            self.assertTrue(info["fingerprint"])
+
+    async def test_url_refresh_skips_unchanged_content(self):
+        """内容没变就不覆盖文件、不通知，安静跳过。"""
+        with TemporaryDirectory() as tmp:
+            plugin = self.prepare_bare(Path(tmp), targets=("s1",))
+            content = ics_text_with(
+                datetime.now() + timedelta(days=1), hour=9, summary="A课", uid="a"
+            )
+            with self.fake_fetch(content, content):
+                await plugin.handle_import(
+                    stream_id="s", matched_groups={"url": "https://a.example.com/cal.ics"}
+                )
+                before = list(plugin._repo.events)  # type: ignore[union-attr]
+                changed = await plugin._ensure_url_refresh()
+
+            self.assertEqual(changed, [])
+            self.assertEqual(list(plugin._repo.events), before)  # type: ignore[union-attr]
+
+    async def test_url_refresh_updates_and_notifies_on_change(self):
+        """内容变了要覆盖文件并通知提醒会话——静默更新等于没更新。"""
+        with TemporaryDirectory() as tmp:
+            plugin = self.prepare_bare(Path(tmp), targets=("s1",))
+            old = ics_text_with(
+                datetime.now() + timedelta(days=1), hour=9, summary="旧课", uid="a"
+            )
+            new = ics_text_with(
+                datetime.now() + timedelta(days=1), hour=9, summary="新课表", uid="a"
+            )
+            with self.fake_fetch(old, new):
+                await plugin.handle_import(
+                    stream_id="s", matched_groups={"url": "https://a.example.com/cal.ics"}
+                )
+                sent_before = len(plugin.ctx.send.texts)  # type: ignore[attr-defined]
+                changed = await plugin._ensure_url_refresh()
+                await plugin._notify_url_refresh(changed)
+
+            self.assertEqual(len(changed), 1)
+            self.assertTrue(any("新课表" in e.summary for e in plugin._repo.events))  # type: ignore[union-attr]
+            new_sends = plugin.ctx.send.texts[sent_before:]  # type: ignore[attr-defined]
+            self.assertEqual(len(new_sends), 1)
+            self.assertEqual(new_sends[0][0], "s1")
+            self.assertIn("课表自动更新", new_sends[0][1])
+
+    async def test_url_refresh_failure_keeps_old_and_warns_once(self):
+        """下载失败保留旧课表，且同一文件只告警一次。"""
+        with TemporaryDirectory() as tmp:
+            plugin = self.prepare_bare(Path(tmp), targets=("s1",))
+            old = ics_text_with(
+                datetime.now() + timedelta(days=1), hour=9, summary="旧课", uid="a"
+            )
+            with self.fake_fetch(old):
+                await plugin.handle_import(
+                    stream_id="s", matched_groups={"url": "https://a.example.com/cal.ics"}
+                )
+            events_before = list(plugin._repo.events)  # type: ignore[union-attr]
+
+            async def _boom(url, *, timeout=20, max_bytes=0):
+                raise FetchError("网络断了")
+
+            with _AttrPatch(plugin_module, "fetch_ics"):
+                plugin_module.fetch_ics = _boom  # type: ignore[assignment]
+                with self.assertLogs("test.class-schedule", level="WARNING") as captured:
+                    await plugin._ensure_url_refresh()
+                    await plugin._ensure_url_refresh()  # 第二轮：不该再告警
+
+            self.assertEqual(list(plugin._repo.events), events_before)  # type: ignore[union-attr]
+            hits = [line for line in captured.output if "自动刷新" in line]
+            self.assertEqual(len(hits), 1)
+
+    async def test_url_refresh_rejects_bad_content_keeps_old(self):
+        """远端返回坏内容（如错误页）时，旧课表必须原样保留。"""
+        with TemporaryDirectory() as tmp:
+            plugin = self.prepare_bare(Path(tmp), targets=("s1",))
+            old = ics_text_with(
+                datetime.now() + timedelta(days=1), hour=9, summary="旧课", uid="a"
+            )
+            with self.fake_fetch(old, "<html>502 Bad Gateway</html>"):
+                await plugin.handle_import(
+                    stream_id="s", matched_groups={"url": "https://a.example.com/cal.ics"}
+                )
+                events_before = list(plugin._repo.events)  # type: ignore[union-attr]
+                changed = await plugin._ensure_url_refresh()
+
+            self.assertEqual(changed, [])
+            self.assertEqual(list(plugin._repo.events), events_before)  # type: ignore[union-attr]
+
+    async def test_url_refresh_disabled_by_config(self):
+        """url_refresh_hours=0 表示关闭自动刷新。"""
+        with TemporaryDirectory() as tmp:
+            plugin = self.prepare_bare(
+                Path(tmp), config=build_config(source={"url_refresh_hours": 0})
+            )
+            plugin._last_url_refresh = None
+            plugin._maybe_url_refresh()
+            self.assertIsNone(plugin._url_refresh_task)
+
+    async def test_no_targets_skip_refresh_notification(self):
+        """没有提醒会话时只更新文件，不通知（也不报错）。"""
+        with TemporaryDirectory() as tmp:
+            plugin = self.prepare_bare(Path(tmp), targets=())
+            await plugin._notify_url_refresh(["x.ics"])  # 不应抛异常
+            self.assertEqual(plugin.ctx.send.texts, [])  # type: ignore[attr-defined]
+
+    async def test_unload_cancels_url_refresh_task(self):
+        """卸载时自动刷新任务必须被取消，别留下孤儿任务。"""
+        with TemporaryDirectory() as tmp:
+            plugin = self.prepare_bare(Path(tmp))
+            plugin._url_refresh_task = asyncio.create_task(asyncio.sleep(30))
+            await plugin.on_unload()
+            # 取消后引用会被置 None（与提醒循环同一套清理纪律）
+            task = plugin._url_refresh_task
+            self.assertTrue(task is None or task.cancelled() or task.done())
+
+    async def test_holiday_failure_retries_soon(self):
+        """回归：下载失败曾要等满 refresh_hours（12h）才重试。
+
+        服务器实测出现过一次下载超时——短暂断网不该让"假期跳过"失效半天。
+        """
+        with TemporaryDirectory() as tmp:
+            plugin = self.prepare_bare(Path(tmp))
+            plugin._last_holiday_refresh = datetime.now()  # 周期未到
+            plugin._holiday_failed[2026] = datetime.now() - timedelta(seconds=10)
+            plugin._holiday_task = None
+
+            plugin._maybe_refresh_holidays()
+            self.assertIsNone(plugin._holiday_task)  # 10 秒 < 30 分钟，不重试
+
+            plugin._holiday_failed[2026] = datetime.now() - timedelta(minutes=31)
+            plugin._maybe_refresh_holidays()
+            self.assertIsNotNone(plugin._holiday_task)
+
+    async def test_holiday_failure_retries_even_when_periodic_disabled(self):
+        """refresh_hours=0（只在启动时检查）也挡不住失败重试通道。"""
+        with TemporaryDirectory() as tmp:
+            plugin = self.prepare_bare(
+                Path(tmp), config=build_config(holiday={"refresh_hours": 0})
+            )
+            plugin._holiday_failed[2026] = datetime.now() - timedelta(minutes=31)
+            plugin._holiday_task = None
+
+            plugin._maybe_refresh_holidays()
+            self.assertIsNotNone(plugin._holiday_task)
+
+    async def test_holiday_unpublished_not_marked_failed(self):
+        """「尚未公布」是常态，走长周期，不进失败重试表。"""
+        with TemporaryDirectory() as tmp:
+            plugin = self.prepare_bare(Path(tmp))
+            year = datetime.now().year + 1
+            self.fake_holiday_text(json.dumps({"year": year, "days": []}))
+
+            outcome = await plugin._download_holiday_year(
+                year, plugin._holiday_dir() / f"{year}.json"
+            )
+
+            self.assertEqual(outcome, "unpublished")
+            self.assertNotIn(year, plugin._holiday_failed)
+
+    async def test_holiday_success_clears_failure_mark(self):
+        """下载成功要清掉失败标记（清除逻辑在 _ensure_holiday_data 的调度层）。"""
+        with TemporaryDirectory() as tmp:
+            plugin = self.prepare_bare(Path(tmp))
+            plugin._holiday_failed[2026] = datetime.now()
+            plugin._holiday_dir().mkdir(parents=True, exist_ok=True)
+            self.fake_holiday_text(
+                json.dumps(
+                    {
+                        "year": 2026,
+                        "days": [{"name": "元旦", "date": "2026-01-01", "isOffDay": True}],
+                    }
+                )
+            )
+
+            await plugin._ensure_holiday_data(force=True)
+
+            self.assertNotIn(2026, plugin._holiday_failed)
+
     async def test_import_failure_does_not_write_file(self):
         with TemporaryDirectory() as tmp:
             plugin = self.prepare_bare(Path(tmp))

@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import tempfile
@@ -24,6 +25,7 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from .file_intake import content_fingerprint
 from .ics_parser import (
     CourseEvent,
     decode_ics_bytes,
@@ -41,6 +43,9 @@ __all__ = [
 
 _SAFE_NAME_RE = re.compile(r"[^0-9A-Za-z\u4e00-\u9fff._-]+")
 MAX_FILENAME_LENGTH = 80
+#: 记录「网址导入的文件名 → 来源网址 + 内容指纹」的文件。放在 ics 目录里、
+#: 跟课表数据待在一起；自动刷新靠它知道去哪重新下载、内容有没有变化。
+SOURCES_FILENAME = ".sources.json"
 
 
 def safe_filename(name: str, fallback: str = "schedule") -> str:
@@ -104,6 +109,10 @@ class CourseRepository:
         self._errors: list[str] = []
         self._loaded_at: datetime | None = None
         self._fingerprint: tuple[tuple[str, int, int], ...] = ()
+        # 文件名 → {"url": 来源网址, "fingerprint": 内容指纹, "updated_at": ...}
+        # 自动刷新靠它重新下载并判断有没有变化
+        self._url_sources: dict[str, dict[str, str]] = {}
+        self._load_url_sources()
         # refresh 会被事件循环线程和 to_thread 的工作线程同时调用，
         # 而 asyncio 锁管不到线程池路径，所以这里用线程锁串行化
         self._lock = threading.Lock()
@@ -188,15 +197,72 @@ class CourseRepository:
         """上次实际重新解析的时间。"""
         return self._loaded_at
 
+    # ── 网址来源映射（自动刷新用） ─────────────────────────
+
+    def _sources_path(self) -> Path:
+        return self.ics_dir / SOURCES_FILENAME
+
+    def _load_url_sources(self) -> None:
+        """读取来源映射；文件缺失或损坏时按空处理（自动刷新退化成不刷新）。"""
+        try:
+            raw = json.loads(self._sources_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(raw, dict):
+            return
+        sources: dict[str, dict[str, str]] = {}
+        for filename, info in raw.items():
+            if not isinstance(filename, str) or not isinstance(info, dict):
+                continue
+            url = str(info.get("url") or "").strip()
+            if url:
+                sources[filename] = {
+                    "url": url,
+                    "fingerprint": str(info.get("fingerprint") or ""),
+                    "updated_at": str(info.get("updated_at") or ""),
+                }
+        self._url_sources = sources
+
+    def _save_url_sources(self) -> None:
+        try:
+            self.ics_dir.mkdir(parents=True, exist_ok=True)
+            _write_atomic(
+                self._sources_path(),
+                json.dumps(self._url_sources, ensure_ascii=False, indent=2),
+            )
+        except OSError:
+            # 映射写不出去只影响自动刷新，不该让导入失败
+            pass
+
+    def record_url_source(self, filename: str, url: str, fingerprint: str = "") -> None:
+        """记录/更新一个网址导入文件的来源与内容指纹。"""
+        name = Path(str(filename or "")).name
+        if not name or not url:
+            return
+        self._url_sources[name] = {
+            "url": str(url).strip(),
+            "fingerprint": str(fingerprint or ""),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        self._save_url_sources()
+
+    def url_sources(self) -> dict[str, dict[str, str]]:
+        """全部网址来源映射（文件名 → 网址/指纹），供自动刷新使用。"""
+        return dict(self._url_sources)
+
     # ── 导入 ──────────────────────────────────────────────
 
-    def save_ics(self, text: str, filename: str) -> ImportResult:
+    def save_ics(
+        self, text: str, filename: str, *, source_url: str | None = None
+    ) -> ImportResult:
         """把 ICS 文本落盘，返回导入结果。
 
         - 先校验能解析出事件再写文件，避免把坏文件留在目录里让后续每次扫描都报错；
         - 同名文件会被**覆盖**：这是刻意的，因为调用方传的是由网址推导出的稳定
           文件名（见 :func:`import_filename`），重复导入同一网址就应当更新同一份
-          课表。否则调课之后旧文件的原始时间还会继续触发提醒。
+          课表。否则调课之后旧文件的原始时间还会继续触发提醒；
+        - 传 ``source_url`` 时同步记录来源与内容指纹，供自动刷新判断变化
+          （自动刷新走同一条路径，坏内容会在这里被拒绝，旧文件不受影响）。
         """
         self.ensure_dir()
         name = safe_filename(filename)
@@ -213,6 +279,8 @@ class CourseRepository:
             for item in self._errors:
                 if item.startswith(f"{name}:"):
                     warnings.append(item)
+            if source_url:
+                self.record_url_source(name, source_url, content_fingerprint(text))
             return ImportResult(target, len(events), warnings, replaced=replaced)
 
     def delete_ics(self, filename: str) -> bool:
@@ -227,6 +295,8 @@ class CourseRepository:
             return False
         with self._lock:
             self._refresh_locked(force=True)
+        if self._url_sources.pop(name, None) is not None:
+            self._save_url_sources()  # 文件没了，来源映射也该清掉
         return True
 
 

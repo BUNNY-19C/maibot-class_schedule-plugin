@@ -322,5 +322,72 @@ class TestDeleteIcs(unittest.TestCase):
             self.assertTrue((Path(tmp) / "ics" / "keep.txt").exists())
 
 
+class TestUrlSourceMap(unittest.TestCase):
+    """网址来源映射：自动刷新靠它知道去哪下载、内容有没有变。"""
+
+    def test_save_with_source_url_records_mapping(self):
+        with TemporaryDirectory() as tmp:
+            repo = CourseRepository(Path(tmp) / "ics")
+            repo.save_ics(ics_text(), "imported-a-12345678.ics", source_url="https://x.test/a.ics")
+
+            sources = repo.url_sources()
+            self.assertEqual(list(sources), ["imported-a-12345678.ics"])
+            self.assertEqual(sources["imported-a-12345678.ics"]["url"], "https://x.test/a.ics")
+            self.assertTrue(sources["imported-a-12345678.ics"]["fingerprint"])
+
+    def test_mapping_persists_to_new_repo_instance(self):
+        """映射写在 ics 目录里，重建仓库对象后仍在（自动刷新跨重启可用）。"""
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "ics"
+            CourseRepository(path).save_ics(
+                ics_text(), "imported-a-12345678.ics", source_url="https://x.test/a.ics"
+            )
+
+            repo2 = CourseRepository(path)
+            self.assertEqual(
+                repo2.url_sources()["imported-a-12345678.ics"]["url"],
+                "https://x.test/a.ics",
+            )
+
+    def test_save_without_source_url_records_nothing(self):
+        with TemporaryDirectory() as tmp:
+            repo = CourseRepository(Path(tmp) / "ics")
+            repo.save_ics(ics_text(), "manual.ics")
+            self.assertEqual(repo.url_sources(), {})
+
+    def test_delete_ics_removes_mapping(self):
+        with TemporaryDirectory() as tmp:
+            repo = CourseRepository(Path(tmp) / "ics")
+            repo.save_ics(ics_text(), "imported-a-12345678.ics", source_url="https://x.test/a.ics")
+
+            repo.delete_ics("imported-a-12345678.ics")
+
+            self.assertEqual(repo.url_sources(), {})
+
+    def test_corrupt_sources_file_is_tolerated(self):
+        """来源映射坏掉只影响自动刷新，不能让仓库初始化失败。"""
+        with TemporaryDirectory() as tmp:
+            ics_dir = Path(tmp) / "ics"
+            ics_dir.mkdir(parents=True)
+            (ics_dir / ".sources.json").write_text("{ 不是 json", encoding="utf-8")
+
+            repo = CourseRepository(ics_dir)
+            self.assertEqual(repo.url_sources(), {})
+            repo.save_ics(ics_text(), "a.ics")  # 照常可用
+            self.assertEqual(len(repo.events), 1)
+
+    def test_fingerprint_matches_content(self):
+        from class_schedule.file_intake import content_fingerprint
+
+        with TemporaryDirectory() as tmp:
+            repo = CourseRepository(Path(tmp) / "ics")
+            text = ics_text()
+            repo.save_ics(text, "imported-a-12345678.ics", source_url="https://x.test/a.ics")
+            self.assertEqual(
+                repo.url_sources()["imported-a-12345678.ics"]["fingerprint"],
+                content_fingerprint(text),
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

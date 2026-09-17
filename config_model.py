@@ -412,6 +412,17 @@ class SourceSettingsConfig(PluginConfigBase):
         description="从网址导入时允许的最大文件大小",
         json_schema_extra={"label": "导入大小上限（KB）", "order": 3, "step": 64},
     )
+    url_refresh_hours: int = Field(
+        default=6,
+        ge=0,
+        le=168,
+        description=(
+            "网址导入的课表每隔几小时自动重新下载一次：内容有变动才覆盖文件并通知"
+            "提醒会话，没变动不动作；下载失败保留旧课表，下个周期再试。"
+            "0 表示关闭自动刷新（课表变动后需要重新 /课表导入）"
+        ),
+        json_schema_extra={"label": "网址自动刷新（小时）", "order": 4, "step": 1},
+    )
 
 
 class MessageSettingsConfig(PluginConfigBase):

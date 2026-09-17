@@ -95,6 +95,9 @@ PROACTIVE_QUERY_TIMEOUT_SECONDS = 10.0
 #: 记住多少个会话的私聊/群聊类型（给只能拿到 session_id 的注入 hook 用）。
 #: 只是缓存，超出上限丢最旧的，丢了退化成"类型未知"。
 MAX_REMEMBERED_STREAMS = 500
+#: 节假日**下载失败**后的重试间隔（秒）。与 refresh_hours（数据过期周期）是两回事：
+#: 失败可能下一分钟就好了，而数据本身 12 小时都不会变。
+HOLIDAY_FAILURE_RETRY_SECONDS = 1800
 
 
 @dataclass(frozen=True)
@@ -158,8 +161,15 @@ class ClassSchedulePlugin(MaiBotPlugin):
         self._holidays: HolidayCalendar | None = None
         self._holiday_task: asyncio.Task[None] | None = None
         self._holiday_lock = asyncio.Lock()
+        #: 网址课表的自动刷新（单飞后台任务，绝不阻塞 tick）
+        self._url_refresh_task: asyncio.Task[None] | None = None
+        self._url_lock = asyncio.Lock()
+        self._last_url_refresh: datetime | None = None
+        self._url_refresh_warned: dict[str, None] = {}
         #: 已确认"放假安排尚未公布"的年份 → 记录时间，避免反复重试与刷屏
         self._holiday_unpublished: dict[int, datetime] = {}
+        #: 下载失败的年份 → 记录时间，按短周期重试（见 HOLIDAY_FAILURE_RETRY_SECONDS）
+        self._holiday_failed: dict[int, datetime] = {}
         #: 配置里的用户号 → 解析出的会话 ID
         self._resolved_targets: dict[str, str] = {}
         #: 会话 ID → "private"/"group"（供只能拿到 session_id 的 hook 判断适用范围）
@@ -418,6 +428,12 @@ class ClassSchedulePlugin(MaiBotPlugin):
             with suppress(asyncio.CancelledError, Exception):
                 await holiday_task
 
+        url_task, self._url_refresh_task = self._url_refresh_task, None
+        if url_task is not None and not url_task.done():
+            url_task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await url_task
+
     async def on_config_update(
         self, scope: str, config_data: dict[str, Any], version: str
     ) -> None:
@@ -484,6 +500,9 @@ class ClassSchedulePlugin(MaiBotPlugin):
             # 节假日刷新只安排后台任务，绝不在这里 await 网络：
             # 一次慢下载会让两轮 tick 都错过到期窗口 -> 那节课永久漏提醒
             self._maybe_refresh_holidays()
+
+            # 网址课表的自动刷新同理：只安排后台任务，不在 tick 里等网络
+            self._maybe_url_refresh()
 
             # now 必须在所有 await 之后再取，否则窗口与"还有几分钟"都按旧时间算
             now = datetime.now()
@@ -654,18 +673,32 @@ class ClassSchedulePlugin(MaiBotPlugin):
         真正的判过期交给 :func:`holidays.is_stale`（看缓存文件时间），
         这里只控制"多久去检查一次"，避免每轮 tick 都碰磁盘。
         下载本身走后台任务，本方法不阻塞。
+
+        另有一条独立通道：**下载失败**的年份按
+        :data:`HOLIDAY_FAILURE_RETRY_SECONDS` 短周期重试——服务器实测出现过
+        一次下载超时，若照常等满 refresh_hours，"假期跳过"会失效半天；
+        而「尚未公布」与「地址不合法」不进这条通道（一个本来就该等，一个重试也没用）。
         """
         conf = self._conf()
         if not conf.holiday.skip_off_days and not conf.holiday.extra_dates:
             return
-        refresh_hours = float(conf.holiday.refresh_hours)
-        if refresh_hours <= 0:
-            return  # 0 = 只在启动时检查一次
         moment = now or datetime.now()
-        if self._last_holiday_refresh is not None:
-            elapsed = (moment - self._last_holiday_refresh).total_seconds() / 3600
-            if elapsed < refresh_hours:
-                return
+
+        periodic_due = False
+        refresh_hours = float(conf.holiday.refresh_hours)
+        if refresh_hours > 0:
+            if self._last_holiday_refresh is None:
+                periodic_due = True
+            else:
+                elapsed = (moment - self._last_holiday_refresh).total_seconds() / 3600
+                periodic_due = elapsed >= refresh_hours
+
+        failure_due = any(
+            (moment - failed_at).total_seconds() >= HOLIDAY_FAILURE_RETRY_SECONDS
+            for failed_at in self._holiday_failed.values()
+        )
+        if not (periodic_due or failure_due):
+            return
         self._last_holiday_refresh = moment
         self._schedule_holiday_refresh()
 
@@ -1189,7 +1222,7 @@ class ClassSchedulePlugin(MaiBotPlugin):
 
         try:
             result = await asyncio.to_thread(
-                repo.save_ics, text, import_filename(url)
+                repo.save_ics, text, import_filename(url), source_url=url
             )
         except ValueError as exc:
             return False, f"❌ 这不是有效的课表文件：{exc}"
@@ -1202,6 +1235,9 @@ class ClassSchedulePlugin(MaiBotPlugin):
             f"📚 解析出 {result.event_count} 条课程，"
             f"当前共 {len(repo.events)} 条 / {repo.file_count} 个文件"
         )
+        hours = float(self._conf().source.url_refresh_hours)
+        if hours > 0:
+            message += f"\n🔁 已加入自动刷新：每 {hours:g} 小时检查一次，有变动会通知你"
         if result.warnings:
             message += "\n⚠️ " + "；".join(result.warnings[:3])
         return True, message
@@ -1700,10 +1736,17 @@ class ClassSchedulePlugin(MaiBotPlugin):
                     path, now=now, max_age_hours=float(conf.holiday.refresh_hours)
                 ):
                     continue
-                if not await self._download_holiday_year(year, path):
-                    # 「尚未公布」已经单独记下并安静跳过了，不算失败，不该触发告警
-                    if year not in self._holiday_unpublished:
-                        warned = True
+                outcome = await self._download_holiday_year(year, path)
+                if outcome == "ok":
+                    # 成功即清掉失败标记；其余类别见 _download_holiday_year 的分类
+                    self._holiday_failed.pop(year, None)
+                elif outcome == "failed":
+                    # 网络瞬断/超时这类可能自愈的失败：短周期重试，
+                    # 别让一次断网把"假期跳过"废掉整个 refresh_hours
+                    self._holiday_failed[year] = now
+                    warned = True
+                # "unpublished"（常态，长周期后自然重试）与
+                # "bad_url"（重试也不会好，只靠 warn-once 提示）不进重试表
 
             self._holidays = self._reload_holiday_cache()
             # 只有整轮都没出问题才复位"已告警"标志，否则缺年份的告警
@@ -1712,12 +1755,17 @@ class ClassSchedulePlugin(MaiBotPlugin):
                 self._warned_holiday_source = False
             return self._holidays
 
-    async def _download_holiday_year(self, year: int, path: Path) -> bool:
-        """下载某一年的节假日数据并落盘；失败返回 ``False``（保留旧缓存）。"""
+    async def _download_holiday_year(self, year: int, path: Path) -> str:
+        """下载某一年的节假日数据并落盘。
+
+        返回结果类别：``"ok"`` / ``"unpublished"``（公布前没有数据，常态）/
+        ``"bad_url"``（地址本身不合法，重试也不会好）/ ``"failed"``（网络或
+        数据问题，值得短周期重试）。失败保留旧缓存。
+        """
         conf = self._conf()
         url = render_url_template(conf.holiday.source_url_template, year)
         if not url:
-            return False
+            return "bad_url"
         try:
             text = await fetch_text(
                 url, timeout=int(conf.holiday.timeout_seconds)
@@ -1725,10 +1773,10 @@ class ClassSchedulePlugin(MaiBotPlugin):
         except UnsafeUrlError as exc:
             # 地址不合法（含内网）只提示一次即可，不必每年重复报
             self._warn_holiday_source_once(f"数据来源地址不允许：{exc}")
-            return False
+            return "bad_url"
         except FetchError as exc:
             self._warn_holiday_source_once(f"{year} 年数据下载失败：{exc}")
-            return False
+            return "failed"
 
         try:
             probe = HolidayCalendar()
@@ -1741,10 +1789,10 @@ class ClassSchedulePlugin(MaiBotPlugin):
                 f"{LOG_PREFIX} {year} 年放假安排尚未公布，先跳过"
                 "（不影响提醒，公布后会自动补上）"
             )
-            return False
+            return "unpublished"
         except ValueError as exc:
             self._warn_holiday_source_once(f"{year} 年数据格式不对：{exc}")
-            return False
+            return "failed"
 
         # 下回来的内容必须真的覆盖请求的那一年，否则按 <year>.json 落盘后
         # 会被当成"已有数据"，在 refresh_hours 内不再重试，而实际一天都判不出来
@@ -1752,15 +1800,15 @@ class ClassSchedulePlugin(MaiBotPlugin):
             self._warn_holiday_source_once(
                 f"{year} 年数据里没有任何 {year} 年的日期（可能该年公告尚未发布）"
             )
-            return False
+            return "unpublished"
 
         try:
             await asyncio.to_thread(write_cache, self._holiday_dir(), year, text)
         except OSError as exc:
             self.ctx.logger.warning(f"{LOG_PREFIX} 节假日缓存写入失败: {exc}")
-            return False
+            return "failed"
         self.ctx.logger.info(f"{LOG_PREFIX} 已更新 {year} 年法定节假日数据")
-        return True
+        return "ok"
 
     def _warn_holiday_source_once(self, reason: str) -> None:
         """节假日数据拿不到时只告警一次，避免每轮 tick 刷屏。"""
@@ -1771,6 +1819,145 @@ class ClassSchedulePlugin(MaiBotPlugin):
             "（宁可假期多提醒一次，也不漏掉上课日）。可在 /课表假日 查看状态"
         )
         self._warned_holiday_source = True
+
+    # ── 网址课表的自动刷新 ────────────────────────────────
+
+    def _maybe_url_refresh(self, now: datetime | None = None) -> None:
+        """按 ``source.url_refresh_hours`` 周期安排一次网址课表重新下载。"""
+        conf = self._conf()
+        hours = float(conf.source.url_refresh_hours)
+        if hours <= 0:
+            return  # 0 = 关闭自动刷新
+        moment = now or datetime.now()
+        if self._last_url_refresh is not None:
+            if (moment - self._last_url_refresh).total_seconds() < hours * 3600:
+                return
+        self._last_url_refresh = moment
+        self._schedule_url_refresh()
+
+    def _schedule_url_refresh(self) -> None:
+        """把自动刷新丢到后台任务，**绝不阻塞调用方**（理由同节假日刷新）。"""
+        if self._url_refresh_task is not None and not self._url_refresh_task.done():
+            return  # 单飞：已有刷新在进行
+        self._url_refresh_task = asyncio.create_task(
+            self._run_url_refresh(), name="class-schedule-url-refresh"
+        )
+
+    async def _run_url_refresh(self) -> None:
+        try:
+            changed = await self._ensure_url_refresh()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.ctx.logger.warning(f"{LOG_PREFIX} 课表自动刷新异常: {exc}")
+            return
+        try:
+            await self._notify_url_refresh(changed)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.ctx.logger.warning(f"{LOG_PREFIX} 课表更新通知失败: {exc}")
+
+    async def _ensure_url_refresh(self) -> list[str]:
+        """重新下载全部网址课表；有变动的覆盖文件并返回变动文件名列表。
+
+        只在 ``/课表导入`` 时记录过来源的文件会被刷新（本地文件与聊天文件
+        不联网）。没变化就什么都不动；下载失败保留旧课表，坏内容会被
+        :meth:`save_ics <course_source.CourseRepository.save_ics>` 的解析校验
+        挡在落盘之前，旧文件不受影响。调用方请用 :meth:`_schedule_url_refresh`。
+        """
+        repo = self._repo
+        if repo is None:
+            return []
+        async with self._url_lock:
+            conf = self._conf()
+            sources = repo.url_sources()
+            if not sources:
+                return []
+            changed: list[str] = []
+            for filename, info in sources.items():
+                url = str(info.get("url") or "").strip()
+                if not url:
+                    continue
+                try:
+                    text = await fetch_ics(
+                        url,
+                        timeout=int(conf.source.url_timeout_seconds),
+                        max_bytes=int(conf.source.max_ics_kb) * 1024,
+                    )
+                except (UnsafeUrlError, FetchError) as exc:
+                    self._warn_url_refresh_once(
+                        filename, f"自动刷新 {filename} 失败：{exc}"
+                    )
+                    continue
+                # 这次能连上了：清掉该文件的失败告警，免得修好之后还留着旧提示
+                self._url_refresh_warned.pop(filename, None)
+                fingerprint = content_fingerprint(text)
+                if fingerprint == info.get("fingerprint"):
+                    continue  # 内容没变，不动文件也不打扰
+                try:
+                    result = await asyncio.to_thread(repo.save_ics, text, filename)
+                except ValueError as exc:
+                    # 远端返回了坏内容（比如错误页）：旧课表原样保留，
+                    # 指纹不更新，下个周期会再试
+                    self._warn_url_refresh_once(
+                        filename,
+                        f"自动刷新 {filename} 拿到的内容不是有效课表：{exc}",
+                    )
+                    continue
+                repo.record_url_source(filename, url, fingerprint)
+                changed.append(filename)
+                self.ctx.logger.info(
+                    f"{LOG_PREFIX} 课表自动更新：{filename}"
+                    f"（{result.event_count} 条课程，来源={url}）"
+                )
+            return changed
+
+    async def _notify_url_refresh(self, changed: list[str]) -> None:
+        """网址课表自动更新后告知提醒会话——静默更新等于没更新。"""
+        if not changed:
+            return
+        repo = self._repo
+        targets = [
+            item
+            for item in await self._resolve_user_id_targets(self._subscriptions())
+            if self._should_deliver(item)
+        ]
+        if not targets:
+            self.ctx.logger.info(
+                f"{LOG_PREFIX} 课表已自动更新但没有任何提醒会话，不发送通知"
+            )
+            return
+        count = len(repo.events) if repo else 0
+        names = "、".join(changed)
+        facts = (
+            f"网址导入的课表刚刚自动更新了（{len(changed)} 个文件：{names}），"
+            f"现在共有 {count} 条课程。用一两句话告诉用户课表有变动并已同步，"
+            "上课提醒会按新课表执行。"
+        )
+        fixed_text = f"🔄 课表自动更新：{names}（当前共 {count} 条课程）"
+        # 与提醒同一套纪律：文案只生成一次，发给全部会话
+        style = self._reply_style_for("url_refresh")
+        persona_text = await self._persona_say(facts) if style == "persona" else ""
+        for item in targets:
+            await self._deliver(
+                item.stream_id,
+                facts,
+                reason="url_refresh",
+                fixed_text=fixed_text,
+                persona_text=persona_text,
+            )
+
+    def _warn_url_refresh_once(self, key: str, reason: str) -> None:
+        """同一个文件的刷新失败只告警一次（成功后清除，可再次提示）。"""
+        if key in self._url_refresh_warned:
+            return
+        self._url_refresh_warned[key] = None
+        while len(self._url_refresh_warned) > 50:
+            self._url_refresh_warned.pop(next(iter(self._url_refresh_warned)))
+        self.ctx.logger.warning(
+            f"{LOG_PREFIX} {reason}；保留旧课表继续提醒，下个周期再试"
+        )
 
     def _should_skip_off_day(self, day: date) -> bool:
         """该日是否因为放假而不提醒。
