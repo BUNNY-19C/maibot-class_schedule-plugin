@@ -3706,6 +3706,98 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
             # 触发词「记一下」被剥掉，余下的「两张课件」是第一张图的说明
             self.assertEqual(sorted(captions), ["", "两张课件"])
 
+    async def test_image_grabbed_before_host_discards_bytes(self):
+        """回归（核心）：原图必须在 before_process 抢下。
+
+        宿主在 process() 阶段生成视觉描述后**立即清空原图字节**
+        （``component.binary_data = b""``），after_process 时只剩
+        「{图片}」占位符和描述文本——v1.3.1 因此只存出无效笔记。
+        """
+        with TemporaryDirectory() as tmp:
+            plugin = self.prepare_bare(
+                Path(tmp), targets=(), config=build_config(access={"chat_scope": "private"})
+            )
+            # 1) 触发词武装等待状态（走 after_process，与真实链路一致）
+            await self._capture(plugin, self._text_message("ps", "记一下"))
+            self.assertIn("ps", plugin._awaiting_note)
+
+            # 2) 用户发图片：这条消息先过 before_process（原图还在），
+            #    再过 process（字节被清空、换成占位符），
+            #    最后到 after_process（我们的收纳点）
+            raw = b"\x89PNG-real-formula-slide"
+            img_msg = {
+                "session_id": "ps",
+                "message_info": {"user_info": {"user_id": "654321"}},
+                "raw_message": [
+                    {
+                        "type": "image",
+                        "data": "",
+                        "binary_data_base64": base64.b64encode(raw).decode(),
+                    }
+                ],
+            }
+            await plugin.handle_note_image_grab(
+                message=img_msg, stream_id="ps"
+            )
+            self.assertIn("ps", plugin._note_images)  # 抢到了
+
+            consumed_msg = {
+                **img_msg,
+                "processed_plain_text": "{图片}",  # 宿主处理后的形态
+                "raw_message": [{"type": "text", "data": {"text": "{图片}"}}],
+            }
+            await self._capture(plugin, consumed_msg)
+
+            notes = plugin._notes
+            self.assertEqual(notes.count("未分类"), 1)
+            note = notes.recent("未分类")[0]
+            self.assertTrue(note.file.startswith("img/"))
+            saved = Path(tmp) / "notes" / "未分类" / note.file
+            self.assertEqual(saved.read_bytes(), raw)  # 原图！
+            self.assertEqual(note.text, "")  # 占位符不能当说明
+
+    async def test_image_grab_skips_when_not_armed_or_triggered(self):
+        """没触发收纳时，普通图片消息不暂存（别为无关图片占内存）。"""
+        with TemporaryDirectory() as tmp:
+            plugin = self.prepare_bare(
+                Path(tmp), targets=(), config=build_config(access={"chat_scope": "private"})
+            )
+            img_msg = {
+                "session_id": "ps",
+                "message_info": {"user_info": {"user_id": "654321"}},
+                "raw_message": [
+                    {
+                        "type": "image",
+                        "data": "",
+                        "binary_data_base64": base64.b64encode(b"x").decode(),
+                    }
+                ],
+            }
+            await plugin.handle_note_image_grab(message=img_msg, stream_id="ps")
+            self.assertEqual(plugin._note_images, {})
+
+    async def test_placeholder_only_without_image_asks_again(self):
+        """只有占位符、又没有抢到图：明确说内容为空，别存下「{图片}」。"""
+        with TemporaryDirectory() as tmp:
+            plugin = self.prepare_bare(
+                Path(tmp), targets=(), config=build_config(access={"chat_scope": "private"})
+            )
+            plugin._awaiting_note["ps"] = {
+                "deadline": datetime.now() + timedelta(minutes=5),
+                "kind": "笔记",
+            }
+            placeholder_msg = {
+                "session_id": "ps",
+                "message_info": {"user_info": {"user_id": "654321"}},
+                "raw_message": [{"type": "text", "data": {"text": "{图片}"}}],
+                "processed_plain_text": "{图片}",
+            }
+            await self._capture(plugin, placeholder_msg)
+
+            self.assertEqual(plugin._notes.count("未分类"), 0)  # type: ignore[union-attr]
+            texts = plugin.ctx.send.texts  # type: ignore[attr-defined]
+            self.assertTrue(any("内容是空的" in t for _s, t in texts))
+
     async def test_note_commands(self):
         """/笔记 概览与明细、/归到 纠正、/找 检索。"""
         with TemporaryDirectory() as tmp:

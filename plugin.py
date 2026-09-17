@@ -176,6 +176,9 @@ class ClassSchedulePlugin(MaiBotPlugin):
         self._awaiting_note: dict[str, dict[str, Any]] = {}
         #: 每个会话最近一条文本 → (内容, 时间)，供「这个是重点」回指
         self._recent_texts: dict[str, tuple[str, datetime]] = {}
+        #: 在 before_process 抢到的图片候选（原图 base64/url），
+        #: 因为宿主在 process() 阶段生成描述后会**主动清空**原图字节
+        self._note_images: dict[str, dict[str, Any]] = {}
         #: 已确认"放假安排尚未公布"的年份 → 记录时间，避免反复重试与刷屏
         self._holiday_unpublished: dict[int, datetime] = {}
         #: 下载失败的年份 → 记录时间，按短周期重试（见 HOLIDAY_FAILURE_RETRY_SECONDS）
@@ -684,6 +687,14 @@ class ClassSchedulePlugin(MaiBotPlugin):
         ]
         for stream_id in stale_notes:
             self._awaiting_note.pop(stream_id, None)
+        # 抢到的图片候选同样按截止时间清理（内存里有 base64，不能久留）
+        stale_images = [
+            stream_id
+            for stream_id, pending in self._note_images.items()
+            if pending["deadline"] <= now
+        ]
+        for stream_id in stale_images:
+            self._note_images.pop(stream_id, None)
         self._last_prune = now
         if removed:
             logger.debug(f"{LOG_PREFIX} 清理已提醒记录 {removed} 条")
@@ -2546,6 +2557,24 @@ class ClassSchedulePlugin(MaiBotPlugin):
         walk(segments, 0)
         return "".join(texts).strip()
 
+    @staticmethod
+    def _is_image_placeholder(text: str) -> bool:
+        """识别麦麦给纯图片消息的占位符（如「{图片}」「[image]」）。
+
+        占位符不是内容：真正有价值的图内信息在原图里，描述文本在
+        ``[图片：…]`` 形态里——两者都不是这个纯占位符。
+        """
+        stripped = str(text or "").strip()
+        if not stripped:
+            return False
+        return bool(
+            re.fullmatch(
+                r"[{\[【<（(]+\s*(?:图片|图像|照片|image|图)\s*[}\]】>）)]+",
+                stripped,
+                re.IGNORECASE,
+            )
+        )
+
     def _match_capture_trigger(self, text: str) -> tuple[str, str] | None:
         """识别收纳触发词，返回 ``(触发词, 其后的内容)``；不是触发消息返回 ``None``。
 
@@ -2598,6 +2627,58 @@ class ClassSchedulePlugin(MaiBotPlugin):
         return "", None
 
     @HookHandler(
+        "chat.receive.before_process",
+        name="study_note_image_grab",
+        description="在宿主丢弃图片字节前，为笔记收纳抢下原图",
+        mode=HookMode.OBSERVE,
+        order=HookOrder.EARLY,
+        error_policy=ErrorPolicy.SKIP,
+    )
+    async def handle_note_image_grab(self, **kwargs: Any) -> None:
+        """在 ``message.process()`` **之前**把图片原图暂存下来。
+
+        为什么必须挂在这个阶段：宿主对图片的处理顺序是「生成文字描述 →
+        ``component.binary_data = b""`` 丢掉原图字节 → 才轮到
+        ``chat.receive.after_process``」。等 after_process 再想拿图，只剩
+        「{图片}」占位符和一段描述文字——v1.3.1 实测踩的就是这个。
+
+        这里只做**廉价的暂存**（读消息结构，不联网下载），真正的下载发生在
+        收纳的后台任务里。只有「已处于等待内容状态」或「消息以触发词开头」
+        才会暂存，避免为每张无关图片浪费内存。
+        """
+        conf = self._conf()
+        if not conf.plugin.enabled or not conf.study.enabled or not conf.study.allow_images:
+            return
+        message = kwargs.get("message")
+        if message is None:
+            return
+        identity = identity_from_kwargs(kwargs)
+        stream_id = str(identity.stream_id or "").strip()
+        if not stream_id:
+            return
+        if self._scope_denial(identity) is not None:
+            return
+        if conf.access.apply_to_commands and self._evaluate(identity).denied:
+            return
+
+        text = self._extract_message_text(message)
+        armed = stream_id in self._awaiting_note
+        triggered = self._match_capture_trigger(text) is not None
+        if not armed and not triggered:
+            return
+
+        candidates = self._find_image_segments(message)
+        if not candidates:
+            return
+        self._note_images[stream_id] = {
+            "deadline": datetime.now()
+            + timedelta(minutes=max(1, int(conf.study.arm_minutes))),
+            "images": candidates,
+        }
+        while len(self._note_images) > MAX_REMEMBERED_STREAMS:
+            self._note_images.pop(next(iter(self._note_images)))
+
+    @HookHandler(
         "chat.receive.after_process",
         name="study_note_capture",
         description="自然语言收纳学习笔记：记一下 / 这个是公式 / 这个是重点…",
@@ -2619,6 +2700,10 @@ class ClassSchedulePlugin(MaiBotPlugin):
         归属是**软信号**：正在上课时段默认归当节课（可关），
         其余进「未分类」，随时 ``/归到 课程名`` 纠正。
         OBSERVE 模式 + 图片下载走后台任务，不阻塞消息链路。
+
+        图片原图由 :meth:`handle_note_image_grab` 在更早的
+        ``chat.receive.before_process`` 抢下——宿主在 process() 阶段生成描述后
+        会立刻清空原图字节，after_process 这边已经拿不到了。
         """
         conf = self._conf()
         if not conf.plugin.enabled or not conf.study.enabled:
@@ -2641,12 +2726,19 @@ class ClassSchedulePlugin(MaiBotPlugin):
             return  # 命令由命令系统处理，不进收纳
         now = datetime.now()
 
+        # before_process 抢到的图（若有）与当前消息里的图（若有）合并
+        stashed = self._note_images.pop(stream_id, None)
+        stashed_images = (
+            stashed["images"] if stashed and now <= stashed["deadline"] else []
+        )
+        image_candidates = [*stashed_images, *self._find_image_segments(message)]
+
         # 1) 等待内容状态：上一条只发了触发词，这一条就是内容
         pending = self._awaiting_note.pop(stream_id, None)
         if pending is not None and now <= pending["deadline"]:
             self._spawn_note_capture(
                 stream_id, identity, kind=str(pending["kind"]), text=text,
-                message=message, source="待收纳内容",
+                image_candidates=image_candidates, source="待收纳内容",
             )
             return
 
@@ -2666,7 +2758,7 @@ class ClassSchedulePlugin(MaiBotPlugin):
         if remainder:
             self._spawn_note_capture(
                 stream_id, identity, kind=kind, text=remainder,
-                message=message, source="同消息",
+                image_candidates=image_candidates, source="同消息",
             )
             return
 
@@ -2681,7 +2773,7 @@ class ClassSchedulePlugin(MaiBotPlugin):
         ):
             self._spawn_note_capture(
                 stream_id, identity, kind=kind, text=recent[0],
-                message=None, source="回指上一条消息",
+                image_candidates=stashed_images, source="回指上一条消息",
             )
             return
 
@@ -2707,13 +2799,18 @@ class ClassSchedulePlugin(MaiBotPlugin):
         *,
         kind: str,
         text: str,
-        message: Any,
+        image_candidates: list[dict[str, str]],
         source: str,
     ) -> None:
         """把一次收纳丢到后台任务（图片要下载，不能阻塞消息链路）。"""
         task = asyncio.create_task(
             self._capture_and_ack(
-                stream_id, identity, kind=kind, text=text, message=message, source=source
+                stream_id,
+                identity,
+                kind=kind,
+                text=text,
+                image_candidates=image_candidates,
+                source=source,
             ),
             name="class-schedule-note-capture",
         )
@@ -2727,7 +2824,7 @@ class ClassSchedulePlugin(MaiBotPlugin):
         *,
         kind: str,
         text: str,
-        message: Any,
+        image_candidates: list[dict[str, str]],
         source: str,
     ) -> None:
         """执行收纳并回执。图片与文本至少要有一样，否则提示而不是静默。"""
@@ -2742,9 +2839,12 @@ class ClassSchedulePlugin(MaiBotPlugin):
         course_name = course or "未分类"
 
         text = str(text or "").strip()
+        if self._is_image_placeholder(text):
+            # 麦麦对纯图片消息会给「{图片}」这类占位符——那是占位，不是内容
+            text = ""
         images: list[tuple[bytes, str]] = []
-        if conf.study.allow_images and message is not None:
-            images = await self._load_note_images(message, conf)
+        if conf.study.allow_images and image_candidates:
+            images = await self._load_note_images(image_candidates, conf)
 
         try:
             saved = 0
@@ -2884,14 +2984,16 @@ class ClassSchedulePlugin(MaiBotPlugin):
         return ".png"
 
     async def _load_note_images(
-        self, message: Any, conf: ClassScheduleConfig
+        self,
+        candidates: list[dict[str, str]],
+        conf: ClassScheduleConfig,
     ) -> list[tuple[bytes, str]]:
         """取出收纳图片的**原始字节**：base64 直接解码，URL 走同一套 SSRF 校验下载。
 
         失败的图片逐个跳过并记日志，不影响文本与其它图片。
         """
         result: list[tuple[bytes, str]] = []
-        for candidate in self._find_image_segments(message):
+        for candidate in candidates:
             data = b""
             b64 = candidate.get("base64") or ""
             url = candidate.get("url") or ""

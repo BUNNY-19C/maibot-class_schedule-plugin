@@ -54,6 +54,7 @@ EXPECTED_HOOKS = {
     "schedule_nl_inject",
     "schedule_chat_scope_probe",
     "study_note_capture",
+    "study_note_image_grab",
 }
 EXPECTED_HOOK_NAME = "chat.receive.after_process"
 EXPECTED_CONFIG_SECTIONS = {
@@ -214,7 +215,7 @@ def check_loader(maibot: Path, workdir: Path, report: Check) -> str:
     report.expect("14 个命令全部注册", commands == EXPECTED_COMMANDS, str(sorted(commands)))
     report.expect("1 个 Tool 已注册", tools == EXPECTED_TOOLS, str(sorted(tools)))
     report.expect(
-        "四个 Hook 都已注册（文件导入 + 课表注入 + 类型记录 + 笔记收纳）",
+        "五个 Hook 都已注册（文件导入 + 课表注入 + 类型记录 + 笔记收纳 + 原图抢存）",
         hooks == EXPECTED_HOOKS,
         str(sorted(hooks)),
     )
