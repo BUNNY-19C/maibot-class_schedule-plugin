@@ -451,6 +451,67 @@ class MessageSettingsConfig(PluginConfigBase):
     )
 
 
+class StudySettingsConfig(PluginConfigBase):
+    """学习陪伴配置：按课收纳公式、重点与图片。"""
+
+    __ui_label__ = "学习陪伴"
+    __ui_icon__ = "book"
+
+    enabled: bool = Field(
+        default=True,
+        description=(
+            "开启学习笔记收纳：按课分目录存公式、重点与图片。"
+            "触发方式是自然语言，如「记一下 …」「这个是公式」「这个是重点」"
+            "（正在上课时段发来的默认归当节课，其余进「未分类」）"
+        ),
+        json_schema_extra={"label": "开启学习收纳", "order": 0},
+    )
+    capture_keywords: list[str] = Field(
+        default_factory=lambda: [
+            "记一下", "记这个", "记个笔记", "记重点", "帮我记",
+            "这个是公式", "这是公式", "这个是重点", "这是重点", "记住这个",
+        ],
+        description=(
+            "触发收纳的关键词，一行一个。消息以关键词开头（或整条就是关键词）"
+            "才会触发，避免把「我记一下时间」这类普通句子误收"
+        ),
+        json_schema_extra={"label": "收纳触发词", "order": 1, "rows": 5},
+    )
+    arm_minutes: int = Field(
+        default=10,
+        ge=1,
+        le=120,
+        description=(
+            "只发了「记一下」这类触发词时，等待内容的时长（分钟）；"
+            "期间下一条消息/图片会被收纳"
+        ),
+        json_schema_extra={"label": "等待内容时长（分钟）", "order": 2, "step": 1},
+    )
+    refer_window_minutes: int = Field(
+        default=15,
+        ge=1,
+        le=120,
+        description=(
+            "「这个是重点」这类回指触发词能往前看多久：这条消息自己没有内容时，"
+            "收纳你最近发过的那条文本（在这个窗口内）"
+        ),
+        json_schema_extra={"label": "回指窗口（分钟）", "order": 3, "step": 1},
+    )
+    allow_images: bool = Field(
+        default=True,
+        description="允许把图片一并收纳（下载平台给的地址存原图，受同一套安全校验约束）",
+        json_schema_extra={"label": "收纳图片", "order": 4},
+    )
+    auto_attribution: bool = Field(
+        default=True,
+        description=(
+            "按课表自动归属：正在上课时段发来的笔记默认归当节课（软信号，"
+            "调课/请假会失真，可随时用 /归到 纠正）。关闭则全部进「未分类」"
+        ),
+        json_schema_extra={"label": "自动按课归属", "order": 5},
+    )
+
+
 class ClassScheduleConfig(PluginConfigBase):
     """课程表提醒插件完整配置。"""
 
@@ -485,4 +546,7 @@ class ClassScheduleConfig(PluginConfigBase):
     )
     message: MessageSettingsConfig = Field(
         default_factory=MessageSettingsConfig, description="提醒消息"
+    )
+    study: StudySettingsConfig = Field(
+        default_factory=StudySettingsConfig, description="学习陪伴（按课收纳笔记）"
     )

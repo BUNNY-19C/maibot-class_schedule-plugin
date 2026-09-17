@@ -29,6 +29,7 @@ from class_schedule.holidays import write_cache
 from class_schedule.netutil import FetchError
 from class_schedule.plugin import MAX_LIST_LINES, ClassSchedulePlugin
 from class_schedule.store import PluginState
+from class_schedule.study_notes import StudyNoteStore
 
 
 def ics_text_with(day: datetime, *, hour: int, summary: str, uid: str) -> str:
@@ -358,6 +359,8 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
         plugin._repo.ensure_dir()
         plugin._repo.refresh(force=True)
         plugin._state = PluginState()
+        # 与 on_load 一致：学习笔记存储挂在数据目录的 notes/ 下
+        plugin._notes = StudyNoteStore(data_dir / "notes")
         for stream_id in targets:
             plugin._state.add_subscription(ChatIdentity(stream_id=stream_id))
         return plugin
@@ -3467,6 +3470,231 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
         from class_schedule.plugin import create_plugin
 
         self.assertIsInstance(create_plugin(), ClassSchedulePlugin)
+
+    # ── 学习陪伴：自然语言收纳 ────────────────────────────
+
+    @staticmethod
+    def _text_message(stream_id: str, text: str, *, private: bool = True) -> dict:
+        """构造一条带文本段的入站消息（receive hook 的形态）。"""
+        message = {
+            "message_id": f"m-{abs(hash(text)) % 99999}",
+            "session_id": stream_id,
+            "message_info": {"user_info": {"user_id": "654321"}},
+            "raw_message": [{"type": "text", "data": {"text": text}}],
+        }
+        if not private:
+            message["message_info"]["group_info"] = {"group_id": "123456"}
+        return message
+
+    async def _capture(self, plugin, message: dict):
+        """触发收纳 hook 并等后台任务结束（测试要确定性）。"""
+        await plugin.handle_note_capture(message=message, stream_id=message.get("session_id"))
+        for task in list(plugin._note_tasks):
+            try:
+                await task
+            except Exception:
+                pass
+
+    async def test_capture_same_message_content(self):
+        """「记一下 欧拉公式」：触发词后面的就是内容，直接归档。"""
+        with TemporaryDirectory() as tmp:
+            plugin = self.prepare_bare(
+                Path(tmp), targets=(), config=build_config(access={"chat_scope": "private"})
+            )
+            await self._capture(
+                plugin, self._text_message("ps", "记一下 欧拉公式 e^iπ+1=0")
+            )
+
+            notes = plugin._notes
+            self.assertEqual(notes.count("未分类"), 1)
+            note = notes.recent("未分类")[0]
+            self.assertEqual(note.text, "欧拉公式 e^iπ+1=0")
+            self.assertEqual(note.kind, "笔记")
+            # 回执说明归到了哪门课
+            self.assertIn("已记入", plugin.ctx.send.last_text())  # type: ignore[attr-defined]
+
+    async def test_capture_kind_from_trigger(self):
+        """「这个是公式」「这个是重点」决定笔记类型。"""
+        with TemporaryDirectory() as tmp:
+            plugin = self.prepare_bare(
+                Path(tmp), targets=(), config=build_config(access={"chat_scope": "private"})
+            )
+            plugin._recent_texts["ps"] = ("质点在光滑平面上运动", datetime.now())
+            await self._capture(plugin, self._text_message("ps", "这个是公式"))
+            await self._capture(plugin, self._text_message("ps", "这个是重点"))
+
+            notes = plugin._notes
+            self.assertEqual(notes.count("未分类"), 2)
+            kinds = [n.kind for n in notes.recent("未分类", limit=2)]
+            self.assertEqual(sorted(kinds), ["公式", "重点"])
+
+    async def test_capture_arm_then_next_message(self):
+        """只发「记一下」→ 进入等待；下一条消息成为内容。"""
+        with TemporaryDirectory() as tmp:
+            plugin = self.prepare_bare(
+                Path(tmp), targets=(), config=build_config(access={"chat_scope": "private"})
+            )
+            await self._capture(plugin, self._text_message("ps", "记一下"))
+            self.assertIn("ps", plugin._awaiting_note)
+            self.assertIn("接下来这条消息", plugin.ctx.send.last_text())  # type: ignore[attr-defined]
+
+            await self._capture(plugin, self._text_message("ps", "第三节是重点考试章节"))
+
+            notes = plugin._notes
+            self.assertEqual(notes.count("未分类"), 1)
+            self.assertEqual(notes.recent("未分类")[0].text, "第三节是重点考试章节")
+            self.assertNotIn("ps", plugin._awaiting_note)
+
+    async def test_capture_expired_arm_ignored(self):
+        """等待窗口过期后，普通消息不再被当作内容。"""
+        with TemporaryDirectory() as tmp:
+            plugin = self.prepare_bare(
+                Path(tmp), targets=(), config=build_config(access={"chat_scope": "private"})
+            )
+            plugin._awaiting_note["ps"] = {
+                "deadline": datetime.now() - timedelta(minutes=1),
+                "kind": "笔记",
+            }
+            await self._capture(plugin, self._text_message("ps", "这只是一句闲聊"))
+
+            self.assertEqual(plugin._notes.count("未分类"), 0)  # type: ignore[union-attr]
+
+    async def test_capture_attribution_to_ongoing_course(self):
+        """正在上课时段的笔记默认归当节课（软信号）。"""
+        with TemporaryDirectory() as tmp:
+            plugin = self.prepare(
+                Path(tmp),
+                offset_minutes=-10,  # 10 分钟前开始的课，此刻进行中
+                targets=(),
+                config=build_config(access={"chat_scope": "private"}),
+            )
+            await self._capture(plugin, self._text_message("ps", "记一下 老师划了第二章"))
+
+            notes = plugin._notes
+            self.assertIn("高等数学", notes.courses())
+            self.assertEqual(notes.count("高等数学"), 1)
+            self.assertEqual(notes.count("未分类"), 0)
+
+    async def test_capture_attribution_off_goes_uncategorized(self):
+        """auto_attribution=false 时全部进未分类。"""
+        with TemporaryDirectory() as tmp:
+            plugin = self.prepare(
+                Path(tmp),
+                offset_minutes=-10,
+                targets=(),
+                config=build_config(
+                    access={"chat_scope": "private"},
+                    study={"auto_attribution": False},
+                ),
+            )
+            await self._capture(plugin, self._text_message("ps", "记一下 随便什么"))
+
+            self.assertEqual(plugin._notes.count("未分类"), 1)  # type: ignore[union-attr]
+
+    async def test_capture_group_message_ignored_in_private_scope(self):
+        """默认只走私聊：群里发「记一下」不收纳。"""
+        with TemporaryDirectory() as tmp:
+            plugin = self.prepare_bare(
+                Path(tmp), targets=(), config=build_config(access={"chat_scope": "private"})
+            )
+            await self._capture(
+                plugin, self._text_message("gs", "记一下 群里的东西", private=False)
+            )
+
+            self.assertEqual(plugin._notes.courses(), [])  # type: ignore[union-attr]
+            self.assertEqual(plugin.ctx.send.texts, [])  # type: ignore[attr-defined]
+
+    async def test_capture_disabled_by_config(self):
+        with TemporaryDirectory() as tmp:
+            plugin = self.prepare_bare(
+                Path(tmp),
+                targets=(),
+                config=build_config(
+                    access={"chat_scope": "private"}, study={"enabled": False}
+                ),
+            )
+            await self._capture(plugin, self._text_message("ps", "记一下 什么"))
+
+            self.assertEqual(plugin._notes.courses(), [])  # type: ignore[union-attr]
+
+    async def test_capture_skips_commands_and_non_triggers(self):
+        """命令不进收纳；普通句子不触发但会被记为回指对象。"""
+        with TemporaryDirectory() as tmp:
+            plugin = self.prepare_bare(
+                Path(tmp), targets=(), config=build_config(access={"chat_scope": "private"})
+            )
+            await self._capture(plugin, self._text_message("ps", "/课表"))
+            self.assertEqual(plugin._notes.courses(), [])  # type: ignore[union-attr]
+
+            await self._capture(plugin, self._text_message("ps", "我今天有点累"))
+            self.assertEqual(plugin._notes.courses(), [])  # type: ignore[union-attr]
+            # 但它是回指对象
+            self.assertIn("ps", plugin._recent_texts)
+
+    async def test_capture_image_note(self):
+        """「记一下」+ 图片：下载原图收纳。"""
+        with TemporaryDirectory() as tmp:
+            plugin = self.prepare_bare(
+                Path(tmp), targets=(), config=build_config(access={"chat_scope": "private"})
+            )
+            png = base64.b64encode(b"\x89PNG-fake-image").decode()
+            message = {
+                "session_id": "ps",
+                "message_info": {"user_info": {"user_id": "654321"}},
+                "raw_message": [
+                    {"type": "text", "data": {"text": "记一下 这张图重要"}},
+                    {"type": "image", "data": {"base64": png}},
+                ],
+            }
+            await self._capture(plugin, message)
+
+            notes = plugin._notes
+            self.assertEqual(notes.count("未分类"), 1)
+            note = notes.recent("未分类")[0]
+            self.assertTrue(note.file.startswith("img/"))
+            saved = Path(tmp) / "notes" / "未分类" / note.file
+            self.assertEqual(saved.read_bytes(), b"\x89PNG-fake-image")
+
+    async def test_note_commands(self):
+        """/笔记 概览与明细、/归到 纠正、/找 检索。"""
+        with TemporaryDirectory() as tmp:
+            plugin = self.prepare_bare(
+                Path(tmp), targets=(), config=build_config(access={"chat_scope": "private"})
+            )
+            plugin._notes.add_text_note("未分类", "公式", "欧拉公式 e^iπ+1=0")
+
+            await plugin.handle_notes(**private_kwargs("ps"))
+            overview = plugin.ctx.send.texts[-1][1]  # type: ignore[attr-defined]
+            self.assertIn("未分类", overview)
+
+            ok, message, _ = await plugin.handle_note_move(
+                **private_kwargs("ps"), matched_groups={"course": "高等数学"}
+            )
+            self.assertIn("已把", message)
+            self.assertEqual(plugin._notes.count("高等数学"), 1)  # type: ignore[union-attr]
+
+            await plugin.handle_note_search(
+                **private_kwargs("ps"), matched_groups={"keyword": "欧拉"}
+            )
+            search = plugin.ctx.send.texts[-1][1]  # type: ignore[attr-defined]
+            self.assertIn("高等数学", search)
+
+            await plugin.handle_notes(**private_kwargs("ps"), matched_groups={"course": "高等数学"})
+            detail = plugin.ctx.send.texts[-1][1]  # type: ignore[attr-defined]
+            self.assertIn("欧拉公式", detail)
+
+    async def test_injection_includes_current_course(self):
+        """注入文本带「当前正在上课」行，模型才知道语境。"""
+        with TemporaryDirectory() as tmp:
+            plugin = self.prepare(
+                Path(tmp),
+                offset_minutes=-10,  # 课正在进行
+                targets=("ps",),
+                config=build_config(access={"chat_scope": "private"}),
+            )
+            text = plugin._build_injection_text(plugin.config)  # type: ignore[union-attr]
+            self.assertIn("【当前】正在上课：高等数学", text)
+            self.assertIn("高等数学", text)  # 课表本体仍在
 
     # ── 适用范围：默认只走私聊 ────────────────────────────
 

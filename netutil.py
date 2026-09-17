@@ -29,6 +29,7 @@ from .ics_parser import decode_ics_bytes
 __all__ = [
     "FetchError",
     "UnsafeUrlError",
+    "fetch_bytes",
     "fetch_ics",
     "fetch_text",
     "validate_url",
@@ -249,3 +250,47 @@ async def fetch_ics(
 ) -> str:
     """异步抓取 ICS 文本；与 :func:`fetch_text` 同一实现，保留语义化的名字。"""
     return await fetch_text(url, timeout=timeout, max_bytes=max_bytes)
+
+
+def _fetch_bytes_sync(
+    url: str, timeout: int, max_bytes: int, allow_hosts: Iterable[str] = ()
+) -> bytes:
+    """在线程中执行的同步二进制抓取（含校验），安全逻辑与 :func:`_fetch_sync` 完全一致。"""
+    allow_hosts = tuple(allow_hosts or ())
+    validate_url(url, allow_hosts=allow_hosts)
+
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    opener = urllib.request.build_opener(_GuardedRedirectHandler(allow_hosts))
+
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            # 重定向后的最终地址再校验一次
+            validate_url(response.geturl(), allow_hosts=allow_hosts)
+            data = response.read(max_bytes + 1)
+            if len(data) > max_bytes:
+                raise FetchError(f"文件超过大小上限 {max_bytes // 1024} KB，已中止")
+    except UnsafeUrlError:
+        raise
+    except urllib.error.HTTPError as exc:
+        raise FetchError(f"服务器返回 HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise FetchError(f"网络请求失败: {exc.reason}") from exc
+    except (TimeoutError, socket.timeout) as exc:
+        raise FetchError("网络请求超时") from exc
+
+    if not data:
+        raise FetchError("服务器返回了空内容")
+    return data
+
+
+async def fetch_bytes(
+    url: str,
+    *,
+    timeout: int = DEFAULT_TIMEOUT,
+    max_bytes: int = DEFAULT_MAX_BYTES,
+    allow_hosts: Iterable[str] = (),
+) -> bytes:
+    """异步抓取二进制内容（学习笔记收纳图片用）；安全校验与 :func:`fetch_text` 同一套。"""
+    return await asyncio.to_thread(
+        _fetch_bytes_sync, url, timeout, max_bytes, allow_hosts
+    )

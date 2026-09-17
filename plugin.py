@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import base64
+import binascii
 import logging
 import re
 from collections.abc import Awaitable, Callable, Iterable
@@ -67,7 +69,8 @@ from .holidays import (
     write_cache,
 )
 from .ics_parser import CourseEvent, expand_occurrences
-from .netutil import FetchError, UnsafeUrlError, fetch_ics, fetch_text
+from .netutil import FetchError, UnsafeUrlError, fetch_bytes, fetch_ics, fetch_text
+from .study_notes import StudyNoteStore, course_folder_name
 from .reminder import collect_due, one_line, render_message, upcoming_events
 from .store import MAX_LEAD_MINUTES, PluginState, Subscription
 
@@ -166,6 +169,13 @@ class ClassSchedulePlugin(MaiBotPlugin):
         self._url_lock = asyncio.Lock()
         self._last_url_refresh: datetime | None = None
         self._url_refresh_warned: dict[str, None] = {}
+        #: 学习笔记（按课分目录收纳）
+        self._notes: StudyNoteStore | None = None
+        self._note_tasks: set[asyncio.Task[None]] = set()
+        #: 「记一下」之后等内容的会话 → {"deadline":…, "kind":…}
+        self._awaiting_note: dict[str, dict[str, Any]] = {}
+        #: 每个会话最近一条文本 → (内容, 时间)，供「这个是重点」回指
+        self._recent_texts: dict[str, tuple[str, datetime]] = {}
         #: 已确认"放假安排尚未公布"的年份 → 记录时间，避免反复重试与刷屏
         self._holiday_unpublished: dict[int, datetime] = {}
         #: 下载失败的年份 → 记录时间，按短周期重试（见 HOLIDAY_FAILURE_RETRY_SECONDS）
@@ -310,6 +320,9 @@ class ClassSchedulePlugin(MaiBotPlugin):
         self._repo.ensure_dir()
         self._repo.refresh(force=True)
 
+        # 学习笔记按课分目录，挂在插件数据目录的 notes/ 下
+        self._notes = StudyNoteStore(self._data_dir / "notes")
+
         # 读宿主人设与 bot 账号：persona 文案与 proactive 验证都依赖它
         self._bot_accounts = {}
         self._persona_loaded = False
@@ -398,9 +411,11 @@ class ClassSchedulePlugin(MaiBotPlugin):
         self.ctx.logger.info(f"{LOG_PREFIX} 已卸载")
 
     async def _cancel_intake_tasks(self) -> None:
-        """取消尚未完成的文件导入任务，避免卸载后还在写盘/发消息。"""
+        """取消尚未完成的后台任务（文件导入与笔记收纳），避免卸载后还在写盘/发消息。"""
         pending = [task for task in self._intake_tasks if not task.done()]
+        pending += [task for task in self._note_tasks if not task.done()]
         self._intake_tasks.clear()
+        self._note_tasks.clear()
         for task in pending:
             task.cancel()
         for task in pending:
@@ -661,6 +676,14 @@ class ClassSchedulePlugin(MaiBotPlugin):
         ]
         for stream_id in stale:
             self._awaiting_ics.pop(stream_id, None)
+        # 「记一下」的等待内容状态同理
+        stale_notes = [
+            stream_id
+            for stream_id, pending in self._awaiting_note.items()
+            if pending["deadline"] <= now
+        ]
+        for stream_id in stale_notes:
+            self._awaiting_note.pop(stream_id, None)
         self._last_prune = now
         if removed:
             logger.debug(f"{LOG_PREFIX} 清理已提醒记录 {removed} 条")
@@ -1674,6 +1697,118 @@ class ClassSchedulePlugin(MaiBotPlugin):
         await self._reply(str(kwargs.get("stream_id", "")), message)
         return True, "已返回状态", 1
 
+    # ── 学习笔记命令 ──────────────────────────────────────
+
+    @Command(
+        "schedule_notes",
+        description="查看学习笔记（不带课名列全部，带课名列该课最近 10 条）",
+        pattern=r"^/笔记(?:\s+(?P<course>\S+))?\s*$",
+    )
+    @_requires_access
+    async def handle_notes(self, **kwargs: Any) -> CommandResult:
+        notes = self._notes
+        stream_id = str(kwargs.get("stream_id", "")).strip()
+        if notes is None:
+            message = "⏳ 插件尚未初始化完成，请稍后再试"
+            await self._reply(stream_id, message)
+            return False, message, 0
+
+        course = str((kwargs.get("matched_groups") or {}).get("course") or "").strip()
+        if not course:
+            courses = notes.courses()
+            if not courses:
+                message = (
+                    "📒 还没有学习笔记。发「记一下 …」「这个是重点」即可收纳，"
+                    "会自动归到正在上的课。"
+                )
+            else:
+                lines = ["📒 学习笔记："] + [
+                    f"　{item}：{notes.count(item)} 条" for item in courses
+                ]
+                lines.append("　发 /笔记 课程名 看具体内容")
+                message = "\n".join(lines)
+            await self._reply(stream_id, message)
+            return True, "已返回笔记概览", 1
+
+        target = course_folder_name(course)
+        if not notes.count(target):
+            message = f"📒「{target}」还没有笔记（共 {notes.count(target)} 条）。"
+            await self._reply(stream_id, message)
+            return True, "该课暂无笔记", 1
+        lines = [f"📒 {target} 最近笔记："]
+        for note in notes.recent(target, limit=10):
+            stamp = note.created_at[5:16].replace("T", " ") if note.created_at else ""
+            head = f"{stamp} [{note.kind}]"
+            body = note.text or ""
+            lines.append(f"　{head} {one_line(body, 40)}" if body else f"　{head} 🖼 图片")
+            if note.file and note.file.startswith("img/"):
+                lines[-1] += "（含图片）"
+        message = "\n".join(lines)
+        await self._reply(stream_id, message)
+        return True, "已返回笔记列表", 1
+
+    @Command(
+        "schedule_note_move",
+        description="把最近一条「未分类」笔记归到指定课程",
+        pattern=r"^/归到\s+(?P<course>\S+)\s*$",
+    )
+    @_requires_access
+    async def handle_note_move(self, **kwargs: Any) -> CommandResult:
+        notes = self._notes
+        stream_id = str(kwargs.get("stream_id", "")).strip()
+        course = str((kwargs.get("matched_groups") or {}).get("course") or "").strip()
+        if notes is None:
+            message = "⏳ 插件尚未初始化完成，请稍后再试"
+            await self._reply(stream_id, message)
+            return False, message, 0
+        if not course:
+            message = "用法：/归到 课程名"
+            await self._reply(stream_id, message)
+            return False, message, 0
+
+        moved = notes.move_latest("未分类", course)
+        if moved is None:
+            message = "ℹ️ 「未分类」里没有可归类的笔记。"
+        else:
+            message = (
+                f"✅ 已把 [{moved.kind}] 归到「{notes.course_dir(course).name}」"
+                f"（该课现共 {notes.count(course)} 条）"
+            )
+            self.ctx.logger.info(
+                f"{LOG_PREFIX} 笔记 {moved.id} 已由未分类归入「{course}」"
+            )
+        await self._reply(stream_id, message)
+        return True, message, 1
+
+    @Command(
+        "schedule_note_search",
+        description="按关键词搜学习笔记",
+        pattern=r"^/找\s+(?P<keyword>\S+)\s*$",
+    )
+    @_requires_access
+    async def handle_note_search(self, **kwargs: Any) -> CommandResult:
+        notes = self._notes
+        stream_id = str(kwargs.get("stream_id", "")).strip()
+        keyword = str((kwargs.get("matched_groups") or {}).get("keyword") or "").strip()
+        if notes is None:
+            message = "⏳ 插件尚未初始化完成，请稍后再试"
+            await self._reply(stream_id, message)
+            return False, message, 0
+        hits = notes.search(keyword, limit=8) if keyword else []
+        if not hits:
+            message = f"🔍 没有找到包含「{keyword}」的笔记。"
+        else:
+            lines = [f"🔍 找到 {len(hits)} 条："]
+            for note in hits:
+                stamp = note.created_at[5:16].replace("T", " ") if note.created_at else ""
+                lines.append(
+                    f"　{note.course} [{note.kind}] {stamp} "
+                    f"{one_line(note.text or '🖼 图片', 30)}"
+                )
+            message = "\n".join(lines)
+        await self._reply(stream_id, message)
+        return True, message, 1
+
     @staticmethod
     def _parse_lead_value(raw: str) -> int | None:
         """解析提前量输入，返回合法分钟数；非数字或越界返回 ``None``。
@@ -2362,7 +2497,388 @@ class ClassSchedulePlugin(MaiBotPlugin):
         if len(self._imported_fingerprints) > MAX_IMPORT_FINGERPRINTS:
             self._imported_fingerprints.pop(0)
 
-    # ── 自然语言问课：把课表注入规划器 ────────────────────
+    # ── 学习陪伴：按课收纳公式/重点/图片 ──────────────────
+
+    @staticmethod
+    def _extract_message_text(message: Any) -> str:
+        """从入站消息里取纯文本（``processed_plain_text`` 优先，其次拼接 text 段）。"""
+        segments: Any = []
+        if isinstance(message, dict):
+            plain = str(message.get("processed_plain_text") or "").strip()
+            if plain:
+                return plain
+            segments = (
+                message.get("raw_message")
+                or message.get("message_segments")
+                or message.get("segments")
+                or []
+            )
+        else:
+            plain = str(getattr(message, "processed_plain_text", "") or "").strip()
+            if plain:
+                return plain
+            segments = getattr(message, "raw_message", None) or []
+
+        texts: list[str] = []
+
+        def walk(node: Any, depth: int) -> None:
+            if depth > 4:
+                return
+            if isinstance(node, list):
+                for item in node:
+                    walk(item, depth + 1)
+                return
+            if not isinstance(node, dict):
+                return
+            seg_type = str(node.get("type") or "").strip().lower()
+            data = node.get("data")
+            if seg_type == "text":
+                value = data.get("text") if isinstance(data, dict) else data
+                if value:
+                    texts.append(str(value))
+                return
+            if seg_type in ("dict", "segment", "message", "") and isinstance(data, dict):
+                walk(data, depth + 1)
+                return
+            if isinstance(data, list):
+                walk(data, depth + 1)
+
+        walk(segments, 0)
+        return "".join(texts).strip()
+
+    def _match_capture_trigger(self, text: str) -> tuple[str, str] | None:
+        """识别收纳触发词，返回 ``(触发词, 其后的内容)``；不是触发消息返回 ``None``。
+
+        只认「以触发词开头」或「整条就是触发词」的消息——「我记一下时间」这种
+        普通句子不会触发；「记一下 欧拉公式」会拿到内容「欧拉公式」。
+        """
+        stripped = str(text or "").strip()
+        if not stripped or stripped.startswith("/"):
+            return None
+        for keyword in self._conf().study.capture_keywords or []:
+            word = str(keyword).strip()
+            if not word:
+                continue
+            if stripped == word:
+                return word, ""
+            if stripped.startswith(word):
+                return word, stripped[len(word):].strip()
+        return None
+
+    @staticmethod
+    def _kind_of(trigger: str) -> str:
+        """由触发词推断笔记类型。"""
+        if "公式" in trigger:
+            return "公式"
+        if "重点" in trigger:
+            return "重点"
+        return "笔记"
+
+    def _current_course(
+        self, now: datetime
+    ) -> tuple[str, tuple[datetime, datetime] | None]:
+        """此刻正在进行的课（**软信号**：调课/请假会失真，只做默认归属）。
+
+        返回 ``(课程名, (开始, 结束))``；当前没有课则 ``("", None)``。
+        """
+        repo = self._repo
+        if repo is None:
+            return "", None
+        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_end = day_start + timedelta(days=1)
+        for event in repo.events:
+            if event.all_day:
+                continue
+            for occurrence in expand_occurrences(event, day_start, day_end):
+                end = occurrence.end or (
+                    occurrence.start + timedelta(minutes=45)
+                )
+                if occurrence.start <= now <= end:
+                    return occurrence.display_name, (occurrence.start, end)
+        return "", None
+
+    @HookHandler(
+        "chat.receive.after_process",
+        name="study_note_capture",
+        description="自然语言收纳学习笔记：记一下 / 这个是公式 / 这个是重点…",
+        mode=HookMode.OBSERVE,
+        order=HookOrder.EARLY,
+        error_policy=ErrorPolicy.SKIP,
+    )
+    async def handle_note_capture(self, **kwargs: Any) -> None:
+        """关键词触发的笔记收纳。
+
+        三种消息形态都能收：
+
+        1. 「记一下 欧拉公式 e^iπ+1=0」——触发词后面的就是内容；
+        2. 只发「记一下」——进入等待状态（``study.arm_minutes``），
+           下一条消息/图片作为内容；
+        3. 「这个是重点」「这个是公式」——回指：收纳你最近发过的那条文本
+           （``study.refer_window_minutes`` 窗口内）。
+
+        归属是**软信号**：正在上课时段默认归当节课（可关），
+        其余进「未分类」，随时 ``/归到 课程名`` 纠正。
+        OBSERVE 模式 + 图片下载走后台任务，不阻塞消息链路。
+        """
+        conf = self._conf()
+        if not conf.plugin.enabled or not conf.study.enabled:
+            return
+        message = kwargs.get("message")
+        if message is None:
+            return
+        identity = identity_from_kwargs(kwargs)
+        stream_id = str(identity.stream_id or "").strip()
+        if not stream_id:
+            return
+        # 笔记比课表更私人：与文件导入同一道适用范围 + 名单闸门
+        if self._scope_denial(identity) is not None:
+            return
+        if conf.access.apply_to_commands and self._evaluate(identity).denied:
+            return
+
+        text = self._extract_message_text(message)
+        if text.startswith("/"):
+            return  # 命令由命令系统处理，不进收纳
+        now = datetime.now()
+
+        # 1) 等待内容状态：上一条只发了触发词，这一条就是内容
+        pending = self._awaiting_note.pop(stream_id, None)
+        if pending is not None and now <= pending["deadline"]:
+            self._spawn_note_capture(
+                stream_id, identity, kind=str(pending["kind"]), text=text,
+                message=message, source="待收纳内容",
+            )
+            return
+
+        # 2) 关键词触发
+        match = self._match_capture_trigger(text)
+        if match is None:
+            # 记录最近文本供回指（有界缓存）
+            if text:
+                self._recent_texts[stream_id] = (text, now)
+                while len(self._recent_texts) > MAX_REMEMBERED_STREAMS:
+                    self._recent_texts.pop(next(iter(self._recent_texts)))
+            return
+
+        trigger, remainder = match
+        kind = self._kind_of(trigger)
+
+        if remainder:
+            self._spawn_note_capture(
+                stream_id, identity, kind=kind, text=remainder,
+                message=message, source="同消息",
+            )
+            return
+
+        # 只有触发词：回指型先尝试收纳上一条文本
+        recent = self._recent_texts.get(stream_id)
+        refer_window = max(1, int(conf.study.refer_window_minutes))
+        referential = any(word in trigger for word in ("这个", "这是", "记住"))
+        if (
+            referential
+            and recent
+            and (now - recent[1]).total_seconds() <= refer_window * 60
+        ):
+            self._spawn_note_capture(
+                stream_id, identity, kind=kind, text=recent[0],
+                message=None, source="回指上一条消息",
+            )
+            return
+
+        # 否则进入等待内容状态
+        minutes = max(1, int(conf.study.arm_minutes))
+        self._awaiting_note[stream_id] = {
+            "deadline": now + timedelta(minutes=minutes),
+            "kind": kind,
+        }
+        await self._deliver(
+            stream_id,
+            f"用户说了「{trigger}」，想记笔记但这条消息里没有内容。"
+            f"请用一句话告诉 TA：好的，接下来这条消息的内容会帮你记下来"
+            f"（{minutes} 分钟内有效）。",
+            reason="note_capture",
+            fixed_text=f"📝 好，接下来这条消息我会帮你记下来（{minutes} 分钟内有效）。",
+        )
+
+    def _spawn_note_capture(
+        self,
+        stream_id: str,
+        identity: Any,
+        *,
+        kind: str,
+        text: str,
+        message: Any,
+        source: str,
+    ) -> None:
+        """把一次收纳丢到后台任务（图片要下载，不能阻塞消息链路）。"""
+        task = asyncio.create_task(
+            self._capture_and_ack(
+                stream_id, identity, kind=kind, text=text, message=message, source=source
+            ),
+            name="class-schedule-note-capture",
+        )
+        self._note_tasks.add(task)
+        task.add_done_callback(self._note_tasks.discard)
+
+    async def _capture_and_ack(
+        self,
+        stream_id: str,
+        identity: Any,
+        *,
+        kind: str,
+        text: str,
+        message: Any,
+        source: str,
+    ) -> None:
+        """执行收纳并回执。图片与文本至少要有一样，否则提示而不是静默。"""
+        notes = self._notes
+        if notes is None:
+            return
+        conf = self._conf()
+        course = ""
+        window: tuple[datetime, datetime] | None = None
+        if conf.study.auto_attribution:
+            course, window = self._current_course(datetime.now())
+        course_name = course or "未分类"
+
+        text = str(text or "").strip()
+        image: tuple[bytes, str] | None = None
+        if conf.study.allow_images and message is not None:
+            image = await self._download_note_image(message, conf)
+
+        try:
+            if image is not None:
+                data, suffix = image
+                note = notes.add_image_note(
+                    course_name, kind, data, suffix=suffix,
+                    text=text[:200], source=source,
+                )
+            elif text:
+                note = notes.add_text_note(course_name, kind, text, source=source)
+            else:
+                await self._deliver(
+                    stream_id,
+                    "用户要记笔记，但这条消息里既没有文本也没有图片。"
+                    "请告诉 TA：要记的内容是空的，重新发一次。",
+                    reason="note_capture",
+                    fixed_text="📝 要记的内容是空的：文本或图片至少要有一样，重新发一次吧。",
+                )
+                return
+        except (ValueError, OSError) as exc:
+            self.ctx.logger.warning(f"{LOG_PREFIX} 学习笔记写入失败: {exc}")
+            await self._deliver(
+                stream_id,
+                f"收纳用户笔记时写盘失败：{exc}。请告诉 TA 稍后再试。",
+                reason="note_capture",
+                fixed_text=f"❌ 笔记没存上：{exc}",
+            )
+            return
+
+        count = notes.count(course_name)
+        window_part = (
+            f"（{window[0].strftime('%H:%M')}-{window[1].strftime('%H:%M')} 进行中）"
+            if window
+            else ""
+        )
+        self.ctx.logger.info(
+            f"{LOG_PREFIX} 已收纳{kind}进「{course_name}」：{note.id}"
+            f"（{'图片' if image is not None else '文本'}，来源={source}，"
+            f"该课共 {count} 条）"
+        )
+        await self._deliver(
+            stream_id,
+            f"用户刚记了一条{kind}，已归入课程「{course_name}」{window_part}，"
+            f"该课目前共 {count} 条笔记。用一句话确认，并说清归到了哪门课；"
+            "若归错了课，TA 可以发 /归到 课程名 纠正。",
+            reason="note_capture",
+            fixed_text=(
+                f"✅ 已记入「{course_name}」[{kind}]（第 {count} 条）。"
+                "归错了课可发 /归到 课程名 纠正"
+            ),
+        )
+
+    @staticmethod
+    def _find_image_segment(message: Any) -> tuple[str, str]:
+        """从消息里找第一个图片段，返回 ``(url, base64)``；没有则空串。"""
+        segments: Any = []
+        if isinstance(message, dict):
+            segments = (
+                message.get("raw_message")
+                or message.get("message_segments")
+                or message.get("segments")
+                or []
+            )
+        else:
+            segments = getattr(message, "raw_message", None) or []
+        found: list[tuple[str, str]] = []
+
+        def walk(node: Any, depth: int) -> None:
+            if depth > 4 or found:
+                return
+            if isinstance(node, list):
+                for item in node:
+                    walk(item, depth + 1)
+                return
+            if not isinstance(node, dict):
+                return
+            seg_type = str(node.get("type") or "").strip().lower()
+            data = node.get("data")
+            if seg_type == "image":
+                payload = data if isinstance(data, dict) else {}
+                url = ""
+                b64 = ""
+                for key in ("url", "image_url", "file_url"):
+                    if payload.get(key):
+                        url = str(payload[key]).strip()
+                        break
+                for key in ("base64", "base64_data", "data_base64"):
+                    if payload.get(key):
+                        b64 = str(payload[key]).strip()
+                        break
+                if url or b64:
+                    found.append((url, b64))
+                return
+            if seg_type in ("dict", "segment", "message", "") and isinstance(data, dict):
+                walk(data, depth + 1)
+                return
+            if isinstance(data, list):
+                walk(data, depth + 1)
+
+        walk(segments, 0)
+        return found[0] if found else ("", "")
+
+    async def _download_note_image(
+        self, message: Any, conf: ClassScheduleConfig
+    ) -> tuple[bytes, str] | None:
+        """取收纳图片的内容：base64 直接解码，URL 走同一套 SSRF 校验下载。"""
+        url, b64 = self._find_image_segment(message)
+        if b64:
+            try:
+                return base64.b64decode("".join(b64.split())), ".png"
+            except (binascii.Error, ValueError) as exc:
+                self.ctx.logger.warning(f"{LOG_PREFIX} 收纳图片 base64 解码失败: {exc}")
+                return None
+        if not url:
+            return None
+        suffix = ".png"
+        lowered = url.lower().split("?", 1)[0]
+        for candidate in (".jpg", ".jpeg", ".gif", ".webp", ".bmp"):
+            if lowered.endswith(candidate):
+                suffix = candidate
+                break
+        try:
+            data = await fetch_bytes(
+                url,
+                timeout=int(conf.file_import.timeout_seconds),
+                max_bytes=int(conf.file_import.max_kb) * 1024,
+                allow_hosts=conf.file_import.allowed_hosts,
+            )
+        except (UnsafeUrlError, FetchError) as exc:
+            self.ctx.logger.info(f"{LOG_PREFIX} 收纳图片下载失败：{exc}")
+            return None
+        return data, suffix
+
+
 
     @HookHandler(
         "maisaka.planner.before_request",
@@ -2442,7 +2958,7 @@ class ClassSchedulePlugin(MaiBotPlugin):
         events = repo.events
         if not events:
             return ""
-        return build_inject_text(
+        text = build_inject_text(
             events,
             now=datetime.now(),
             days=int(conf.nl_query.days),
@@ -2450,6 +2966,19 @@ class ClassSchedulePlugin(MaiBotPlugin):
             holiday_label=self._holiday_name_for,
             expander=expand_occurrences,
         )
+        if not text:
+            return ""
+        # 当前课感知：模型知道"此刻在上什么课"，才能把「这个是重点」这类
+        # 语境接住，也才能在闲聊里自然带出课程语境（软信号，可能失真）
+        if conf.study.enabled and conf.study.auto_attribution:
+            course, window = self._current_course(datetime.now())
+            if course and window:
+                text = (
+                    f"【当前】正在上课：{course}"
+                    f"（{window[0].strftime('%H:%M')}-{window[1].strftime('%H:%M')}）\n"
+                    + text
+                )
+        return text
 
     def _holiday_name_for(self, day: date) -> str:
         """给注入文本用的放假说明（如「中秋节放假」），无则空串。"""
