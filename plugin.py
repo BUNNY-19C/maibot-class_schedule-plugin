@@ -874,6 +874,29 @@ class ClassSchedulePlugin(MaiBotPlugin):
         self._save_state()
         return record, created, ""
 
+    def _auto_subscribe(self, identity: Any) -> bool:
+        """导入成功后把当前会话登记为提醒对象，省掉再发一次 /课表订阅。
+
+        走与命令同一条 :meth:`_try_subscribe` 路径：会话数上限照常生效，
+        达到上限时只记日志、不影响导入本身；``file_import.auto_subscribe``
+        关闭时完全不做（那是"有时只是帮别人看课表"用户的退路）。
+        """
+        conf = self._conf()
+        if not conf.file_import.auto_subscribe:
+            return False
+        record, created, denied = self._try_subscribe(identity)
+        if record is None:
+            self.ctx.logger.info(
+                f"{LOG_PREFIX} 自动订阅未生效：{denied}（{identity.display}）"
+            )
+            return False
+        if created:
+            self.ctx.logger.info(
+                f"{LOG_PREFIX} 已自动订阅：{identity.display}"
+                f"（{record.type_label}，导入即订阅）"
+            )
+        return True
+
     # ── 宿主人设与身份 ────────────────────────────────────
 
     async def _load_host_persona(self) -> None:
@@ -1202,7 +1225,9 @@ class ClassSchedulePlugin(MaiBotPlugin):
         await asyncio.to_thread(repo.refresh, force=force)
         return repo
 
-    async def _import_from_url(self, url: str) -> tuple[bool, str]:
+    async def _import_from_url(
+        self, url: str, identity: Any = None
+    ) -> tuple[bool, str]:
         """下载并保存一份 URL 课表，返回 ``(是否成功, 提示文案)``。"""
         conf = self._conf()
         try:
@@ -1238,6 +1263,9 @@ class ClassSchedulePlugin(MaiBotPlugin):
         hours = float(self._conf().source.url_refresh_hours)
         if hours > 0:
             message += f"\n🔁 已加入自动刷新：每 {hours:g} 小时检查一次，有变动会通知你"
+        # 与聊天文件一致：导入即订阅当前会话（可关）
+        if self._auto_subscribe(identity):
+            message += "\n🔔 本会话已自动订阅上课提醒，不想收了发 /课表退订。"
         if result.warnings:
             message += "\n⚠️ " + "；".join(result.warnings[:3])
         return True, message
@@ -1352,7 +1380,8 @@ class ClassSchedulePlugin(MaiBotPlugin):
     async def handle_import(self, **kwargs: Any) -> CommandResult:
         groups = kwargs.get("matched_groups") or {}
         url = str(groups.get("url", "")).strip()
-        ok, message = await self._import_from_url(url)
+        identity = identity_from_kwargs(kwargs)
+        ok, message = await self._import_from_url(url, identity=identity)
         await self._reply(str(kwargs.get("stream_id", "")), message)
         return ok, message, 2 if ok else 1
 
@@ -2234,7 +2263,7 @@ class ClassSchedulePlugin(MaiBotPlugin):
         # 真正要导入了才清掉等待状态
         self._clear_awaiting_ics(stream_id)
         for candidate in candidates:
-            outgoing = await self._import_chat_file(candidate, repo, conf)
+            outgoing = await self._import_chat_file(candidate, repo, conf, identity=identity)
             if outgoing is None:
                 continue
             facts = outgoing.facts
@@ -2245,9 +2274,19 @@ class ClassSchedulePlugin(MaiBotPlugin):
             )
 
     async def _import_chat_file(
-        self, candidate: Any, repo: CourseRepository, conf: ClassScheduleConfig
+        self,
+        candidate: Any,
+        repo: CourseRepository,
+        conf: ClassScheduleConfig,
+        *,
+        identity: Any = None,
     ) -> "OutgoingMessage | None":
-        """导入一个聊天文件，返回要发出去的内容（失败也返回说明，便于告知用户）。"""
+        """导入一个聊天文件，返回要发出去的内容（失败也返回说明，便于告知用户）。
+
+        ``identity`` 是发件会话的身份：给了且导入成功，就按
+        ``file_import.auto_subscribe`` 自动把该会话登记为提醒对象，
+        回执话术随之改变（不再引导去发 /课表订阅）。
+        """
         name = candidate.display
         try:
             text, source = await load_candidate_text(
@@ -2297,7 +2336,14 @@ class ClassSchedulePlugin(MaiBotPlugin):
             f"（{result.event_count} 条课程，来源={source}）"
         )
         action = "更新" if result.replaced else "导入"
-        subscribe_hint = "想收上课提醒，在需要提醒的会话里发 /课表订阅。"
+        subscribed = self._auto_subscribe(identity) if identity is not None else False
+        if subscribed:
+            subscribe_hint = (
+                "本会话已自动订阅上课提醒，到点会在这里收到；"
+                "想改提前量发 /课表提前 30，不想收了发 /课表退订。"
+            )
+        else:
+            subscribe_hint = "想收上课提醒，在需要提醒的会话里发 /课表订阅。"
         return OutgoingMessage(
             fixed=(
                 f"✅ 已{action}课表「{name}」：解析出 {result.event_count} 条课程，"

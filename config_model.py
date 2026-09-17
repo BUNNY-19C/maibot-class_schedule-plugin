@@ -329,6 +329,15 @@ class FileImportSettingsConfig(PluginConfigBase):
         ),
         json_schema_extra={"label": "等待文件时长（分钟）", "order": 4, "step": 1},
     )
+    auto_subscribe: bool = Field(
+        default=True,
+        description=(
+            "导入成功后自动把当前会话设为提醒对象，不用再发 /课表订阅。"
+            "适合\"导入就是为了收提醒\"的用法；若你有时只是帮别人看课表，"
+            "关掉这一项可避免意外订阅（退订用 /课表退订）"
+        ),
+        json_schema_extra={"label": "导入后自动订阅", "order": 5},
+    )
 
 
 class NaturalQuerySettingsConfig(PluginConfigBase):

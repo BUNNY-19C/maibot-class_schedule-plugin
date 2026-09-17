@@ -3248,9 +3248,10 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(changed), 1)
             self.assertTrue(any("新课表" in e.summary for e in plugin._repo.events))  # type: ignore[union-attr]
             new_sends = plugin.ctx.send.texts[sent_before:]  # type: ignore[attr-defined]
-            self.assertEqual(len(new_sends), 1)
-            self.assertEqual(new_sends[0][0], "s1")
-            self.assertIn("课表自动更新", new_sends[0][1])
+            # 网址导入会自动订阅请求会话 s，加上预置的 s1 共两个提醒对象
+            self.assertEqual(len(new_sends), 2)
+            self.assertEqual(sorted(s for s, _t in new_sends), ["s", "s1"])
+            self.assertTrue(all("课表自动更新" in t for _s, t in new_sends))
 
     async def test_url_refresh_failure_keeps_old_and_warns_once(self):
         """下载失败保留旧课表，且同一文件只告警一次。"""
@@ -3636,6 +3637,100 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
             await self._intake(plugin, message)
 
             self.assertEqual(len(plugin._repo.events), 1)  # type: ignore[union-attr]
+
+    async def test_private_file_import_auto_subscribes(self):
+        """回归：私聊里识别 ics 即自动订阅本会话，不再要求发 /课表订阅。"""
+        with TemporaryDirectory() as tmp:
+            plugin = self.prepare_bare(
+                Path(tmp),
+                targets=(),
+                config=build_config(access={"chat_scope": "private"}),
+            )
+            message = self._file_message(
+                base64_data=base64.b64encode(self._ics_bytes()).decode(),
+                stream_id="dm-1",
+            )
+            message["message_info"].pop("group_info")
+
+            await self._intake(plugin, message)
+
+            record = plugin._state.find("dm-1")
+            self.assertIsNotNone(record)
+            self.assertEqual(record.chat_type, "private")
+            self.assertEqual(record.user_id, "654321")
+            # 回执不再引导去发 /课表订阅，而是说明已自动订阅
+            texts = plugin.ctx.send.texts  # type: ignore[attr-defined]
+            self.assertEqual(len(texts), 1)
+            self.assertIn("已自动订阅", texts[0][1])
+            self.assertNotIn("/课表订阅", texts[0][1])
+
+    async def test_auto_subscribe_can_be_disabled(self):
+        """auto_subscribe=false 是"帮别人看课表"用户的退路。"""
+        with TemporaryDirectory() as tmp:
+            plugin = self.prepare_bare(
+                Path(tmp),
+                targets=(),
+                config=build_config(
+                    access={"chat_scope": "private"},
+                    file_import={"auto_subscribe": False},
+                ),
+            )
+            message = self._file_message(
+                base64_data=base64.b64encode(self._ics_bytes()).decode(),
+                stream_id="dm-1",
+            )
+            message["message_info"].pop("group_info")
+
+            await self._intake(plugin, message)
+
+            self.assertIsNone(plugin._state.find("dm-1"))
+            texts = plugin.ctx.send.texts  # type: ignore[attr-defined]
+            self.assertEqual(len(texts), 1)
+            self.assertIn("/课表订阅", texts[0][1])
+
+    async def test_url_import_auto_subscribes_requesting_session(self):
+        """网址导入同样导入即订阅（行为一致）。"""
+        with TemporaryDirectory() as tmp:
+            plugin = self.prepare_bare(Path(tmp), targets=())
+            content = ics_text_with(
+                datetime.now() + timedelta(days=1), hour=9, summary="A课", uid="a"
+            )
+            with self.fake_fetch(content):
+                ok, message, _ = await plugin.handle_import(
+                    stream_id="ps", matched_groups={"url": "https://a.example.com/cal.ics"}
+                )
+
+            self.assertTrue(ok, message)
+            self.assertIsNotNone(plugin._state.find("ps"))
+            self.assertIn("自动订阅", message)
+
+    async def test_auto_subscribe_respects_session_limit(self):
+        """达到会话上限时：导入照常成功、只是不自动订阅（记日志）。"""
+        with TemporaryDirectory() as tmp:
+            plugin = self.prepare_bare(
+                Path(tmp),
+                targets=("full1", "full2"),
+                config=build_config(access={"chat_scope": "private"}),
+            )
+            plugin.set_plugin_config(
+                build_config(
+                    access={"chat_scope": "private"},
+                    target={"max_subscriptions": 2},
+                    file_import={"auto_subscribe": True},
+                )
+            )
+            message = self._file_message(
+                base64_data=base64.b64encode(self._ics_bytes()).decode(),
+                stream_id="dm-1",
+            )
+            message["message_info"].pop("group_info")
+
+            await self._intake(plugin, message)
+
+            # 导入成功
+            self.assertEqual(len(plugin._repo.events), 1)  # type: ignore[union-attr]
+            # 但没有自动订阅（上限 2 已满）
+            self.assertIsNone(plugin._state.find("dm-1"))
 
     async def test_group_chat_gets_no_schedule_injection(self):
         """群聊里不注入课表——这是最直接的隐私保护。"""
