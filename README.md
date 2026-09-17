@@ -7,8 +7,10 @@
 
 ## 特性
 
-- **导入方式多**:`/课程解析` 引导发文件、直接发 `.ics`、放进本地目录、公网网址导入。
-  支持 `RRULE` 重复、`EXDATE` 调休、`RECURRENCE-ID` 调课。
+- **导入方式多**:`/课程解析` 引导发文件、直接发 `.ics`、放进本地目录、公网网址导入
+  (网址课表默认每 6 小时自动检查更新,有变动才覆盖并通知)。支持 `RRULE` 重复、
+  `EXDATE` 调休、`RECURRENCE-ID` 调课。
+- **导入即订阅**:私聊里导入成功,当前会话就开始收提醒,不用再发订阅命令。
 - **提前量按会话独立**:同一节课,会话 A 提前 30 分钟、会话 B 提前 10 分钟,互不干扰。
 - **默认只在私聊工作**:课表是个人日程,群聊里的命令、文件、注入、投递一律不响应。
   想让群聊也能用,把 `access.chat_scope` 改成 `"both"`。
@@ -20,7 +22,11 @@
 
 ## 快速开始
 
-1. 把整个目录放进麦麦的插件目录,名字保持 `maibot_plugin_class_schedule`:
+1. 安装插件(二选一):
+
+   - 下载 [最新 Release](https://github.com/BUNNY-19C/maibot-class_schedule-plugin/releases/latest)
+     里的 zip,解压到麦麦的插件目录;
+   - 或把本仓库放进插件目录,目录名保持 `maibot_plugin_class_schedule`:
 
    ```
    MaiBot/plugins/maibot_plugin_class_schedule/
