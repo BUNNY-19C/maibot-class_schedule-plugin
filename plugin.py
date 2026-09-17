@@ -2742,19 +2742,25 @@ class ClassSchedulePlugin(MaiBotPlugin):
         course_name = course or "未分类"
 
         text = str(text or "").strip()
-        image: tuple[bytes, str] | None = None
+        images: list[tuple[bytes, str]] = []
         if conf.study.allow_images and message is not None:
-            image = await self._download_note_image(message, conf)
+            images = await self._load_note_images(message, conf)
 
         try:
-            if image is not None:
-                data, suffix = image
-                note = notes.add_image_note(
-                    course_name, kind, data, suffix=suffix,
-                    text=text[:200], source=source,
-                )
+            saved = 0
+            if images:
+                # 每张图一条笔记；描述文本（视觉管道生成的说明）作为第一张的
+                # 说明文字保留——可检索，但**原图才是笔记本体**，公式在图里
+                caption = text[:1000]
+                for data, suffix in images:
+                    notes.add_image_note(
+                        course_name, kind, data, suffix=suffix,
+                        text=caption if saved == 0 else "", source=source,
+                    )
+                    saved += 1
             elif text:
-                note = notes.add_text_note(course_name, kind, text, source=source)
+                notes.add_text_note(course_name, kind, text, source=source)
+                saved = 1
             else:
                 await self._deliver(
                     stream_id,
@@ -2764,6 +2770,7 @@ class ClassSchedulePlugin(MaiBotPlugin):
                     fixed_text="📝 要记的内容是空的：文本或图片至少要有一样，重新发一次吧。",
                 )
                 return
+            note = notes.last_of(course_name)
         except (ValueError, OSError) as exc:
             self.ctx.logger.warning(f"{LOG_PREFIX} 学习笔记写入失败: {exc}")
             await self._deliver(
@@ -2780,10 +2787,10 @@ class ClassSchedulePlugin(MaiBotPlugin):
             if window
             else ""
         )
+        media = f"{len(images)} 张图片" if images else "文本"
         self.ctx.logger.info(
             f"{LOG_PREFIX} 已收纳{kind}进「{course_name}」：{note.id}"
-            f"（{'图片' if image is not None else '文本'}，来源={source}，"
-            f"该课共 {count} 条）"
+            f"（{media}，来源={source}，该课共 {count} 条）"
         )
         await self._deliver(
             stream_id,
@@ -2798,8 +2805,19 @@ class ClassSchedulePlugin(MaiBotPlugin):
         )
 
     @staticmethod
-    def _find_image_segment(message: Any) -> tuple[str, str]:
-        """从消息里找第一个图片段，返回 ``(url, base64)``；没有则空串。"""
+    def _find_image_segments(message: Any) -> list[dict[str, str]]:
+        """收集消息里的全部图片段，返回候选列表。
+
+        实测（SnowLuma + 麦麦 1.2.x）图片段长这样——**原图 base64 在段的
+        顶层** ``binary_data_base64`` 键里，``data`` 是空串::
+
+            {"type": "image", "data": "", "hash": …, "binary_data_base64": …}
+
+        所以除 ``data`` 内的常规键外，必须读段顶层的 ``binary_data_base64``，
+        否则就会漏掉原图、只存下视觉描述文本（v1.3.0 实测踩过）。
+        适配器把 QQ 表情包也标成独立段，一并接受——用户主动说「记一下」时，
+        那个"表情包"很可能是截图。
+        """
         segments: Any = []
         if isinstance(message, dict):
             segments = (
@@ -2810,11 +2828,9 @@ class ClassSchedulePlugin(MaiBotPlugin):
             )
         else:
             segments = getattr(message, "raw_message", None) or []
-        found: list[tuple[str, str]] = []
+        found: list[dict[str, str]] = []
 
         def walk(node: Any, depth: int) -> None:
-            if depth > 4 or found:
-                return
             if isinstance(node, list):
                 for item in node:
                     walk(item, depth + 1)
@@ -2823,20 +2839,21 @@ class ClassSchedulePlugin(MaiBotPlugin):
                 return
             seg_type = str(node.get("type") or "").strip().lower()
             data = node.get("data")
-            if seg_type == "image":
+            if seg_type in ("image", "emoji"):
                 payload = data if isinstance(data, dict) else {}
-                url = ""
-                b64 = ""
+                candidate: dict[str, str] = {}
+                for key in ("binary_data_base64", "base64", "base64_data", "data_base64"):
+                    value = node.get(key) or payload.get(key)
+                    if value:
+                        candidate["base64"] = str(value).strip()
+                        break
                 for key in ("url", "image_url", "file_url"):
-                    if payload.get(key):
-                        url = str(payload[key]).strip()
+                    value = node.get(key) or payload.get(key)
+                    if value:
+                        candidate["url"] = str(value).strip()
                         break
-                for key in ("base64", "base64_data", "data_base64"):
-                    if payload.get(key):
-                        b64 = str(payload[key]).strip()
-                        break
-                if url or b64:
-                    found.append((url, b64))
+                if candidate:
+                    found.append(candidate)
                 return
             if seg_type in ("dict", "segment", "message", "") and isinstance(data, dict):
                 walk(data, depth + 1)
@@ -2845,40 +2862,61 @@ class ClassSchedulePlugin(MaiBotPlugin):
                 walk(data, depth + 1)
 
         walk(segments, 0)
-        return found[0] if found else ("", "")
+        return found
 
-    async def _download_note_image(
-        self, message: Any, conf: ClassScheduleConfig
-    ) -> tuple[bytes, str] | None:
-        """取收纳图片的内容：base64 直接解码，URL 走同一套 SSRF 校验下载。"""
-        url, b64 = self._find_image_segment(message)
-        if b64:
-            try:
-                return base64.b64decode("".join(b64.split())), ".png"
-            except (binascii.Error, ValueError) as exc:
-                self.ctx.logger.warning(f"{LOG_PREFIX} 收纳图片 base64 解码失败: {exc}")
-                return None
-        if not url:
-            return None
-        suffix = ".png"
-        lowered = url.lower().split("?", 1)[0]
-        for candidate in (".jpg", ".jpeg", ".gif", ".webp", ".bmp"):
+    @staticmethod
+    def _detect_image_suffix(data: bytes, url: str = "") -> str:
+        """按魔数判图片扩展名，判不出再看 URL，最后退回 .png。"""
+        if data.startswith(b"\x89PNG"):
+            return ".png"
+        if data.startswith(b"\xff\xd8\xff"):
+            return ".jpg"
+        if data.startswith(b"GIF8"):
+            return ".gif"
+        if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            return ".webp"
+        if data.startswith(b"BM"):
+            return ".bmp"
+        lowered = str(url or "").lower().split("?", 1)[0]
+        for candidate in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"):
             if lowered.endswith(candidate):
-                suffix = candidate
-                break
-        try:
-            data = await fetch_bytes(
-                url,
-                timeout=int(conf.file_import.timeout_seconds),
-                max_bytes=int(conf.file_import.max_kb) * 1024,
-                allow_hosts=conf.file_import.allowed_hosts,
-            )
-        except (UnsafeUrlError, FetchError) as exc:
-            self.ctx.logger.info(f"{LOG_PREFIX} 收纳图片下载失败：{exc}")
-            return None
-        return data, suffix
+                return candidate
+        return ".png"
 
+    async def _load_note_images(
+        self, message: Any, conf: ClassScheduleConfig
+    ) -> list[tuple[bytes, str]]:
+        """取出收纳图片的**原始字节**：base64 直接解码，URL 走同一套 SSRF 校验下载。
 
+        失败的图片逐个跳过并记日志，不影响文本与其它图片。
+        """
+        result: list[tuple[bytes, str]] = []
+        for candidate in self._find_image_segments(message):
+            data = b""
+            b64 = candidate.get("base64") or ""
+            url = candidate.get("url") or ""
+            if b64:
+                try:
+                    data = base64.b64decode("".join(b64.split()))
+                except (binascii.Error, ValueError) as exc:
+                    self.ctx.logger.warning(
+                        f"{LOG_PREFIX} 收纳图片 base64 解码失败: {exc}"
+                    )
+                    continue
+            elif url:
+                try:
+                    data = await fetch_bytes(
+                        url,
+                        timeout=int(conf.file_import.timeout_seconds),
+                        max_bytes=int(conf.file_import.max_kb) * 1024,
+                        allow_hosts=conf.file_import.allowed_hosts,
+                    )
+                except (UnsafeUrlError, FetchError) as exc:
+                    self.ctx.logger.info(f"{LOG_PREFIX} 收纳图片下载失败：{exc}")
+                    continue
+            if data:
+                result.append((data, self._detect_image_suffix(data, url)))
+        return result
 
     @HookHandler(
         "maisaka.planner.before_request",

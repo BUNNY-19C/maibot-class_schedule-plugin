@@ -3631,19 +3631,29 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
             # 但它是回指对象
             self.assertIn("ps", plugin._recent_texts)
 
-    async def test_capture_image_note(self):
-        """「记一下」+ 图片：下载原图收纳。"""
+    async def test_capture_image_note_real_snowluma_shape(self):
+        """回归：图片收纳必须认得 SnowLuma 的真实形态。
+
+        实测发现原图 base64 在段**顶层**的 ``binary_data_base64`` 键里、
+        ``data`` 是空串——以前只找 data 内的键，结果原图拿不到，
+        只存了视觉管道生成的描述文本（用户指出：那是麦麦的理解，不是笔记）。
+        """
         with TemporaryDirectory() as tmp:
             plugin = self.prepare_bare(
                 Path(tmp), targets=(), config=build_config(access={"chat_scope": "private"})
             )
-            png = base64.b64encode(b"\x89PNG-fake-image").decode()
+            raw = b"\x89PNG-fake-formula-image"
             message = {
                 "session_id": "ps",
                 "message_info": {"user_info": {"user_id": "654321"}},
                 "raw_message": [
                     {"type": "text", "data": {"text": "记一下 这张图重要"}},
-                    {"type": "image", "data": {"base64": png}},
+                    {
+                        "type": "image",
+                        "data": "",
+                        "hash": "abc",
+                        "binary_data_base64": base64.b64encode(raw).decode(),
+                    },
                 ],
             }
             await self._capture(plugin, message)
@@ -3653,7 +3663,48 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
             note = notes.recent("未分类")[0]
             self.assertTrue(note.file.startswith("img/"))
             saved = Path(tmp) / "notes" / "未分类" / note.file
-            self.assertEqual(saved.read_bytes(), b"\x89PNG-fake-image")
+            self.assertEqual(saved.read_bytes(), raw)
+            self.assertEqual(saved.suffix, ".png")  # 魔数识别
+            # 视觉描述作为说明文字保留（可检索），但本体是原图
+            self.assertIn("这张图重要", note.text)
+
+    async def test_capture_multiple_images_each_gets_a_note(self):
+        """一次发多张图：每张各存一条，描述只挂在第一张上。"""
+        with TemporaryDirectory() as tmp:
+            plugin = self.prepare_bare(
+                Path(tmp), targets=(), config=build_config(access={"chat_scope": "private"})
+            )
+            raw_a = b"\x89PNG-image-A"
+            raw_b = b"\x89PNG-image-B"
+            message = {
+                "session_id": "ps",
+                "message_info": {"user_info": {"user_id": "654321"}},
+                "raw_message": [
+                    {"type": "text", "data": {"text": "记一下 两张课件"}},
+                    {
+                        "type": "image",
+                        "data": "",
+                        "binary_data_base64": base64.b64encode(raw_a).decode(),
+                    },
+                    {
+                        "type": "image",
+                        "data": "",
+                        "binary_data_base64": base64.b64encode(raw_b).decode(),
+                    },
+                ],
+            }
+            await self._capture(plugin, message)
+
+            notes = plugin._notes
+            self.assertEqual(notes.count("未分类"), 2)
+            recent = notes.recent("未分类", limit=2)
+            saved_bytes = {
+                (Path(tmp) / "notes" / "未分类" / n.file).read_bytes() for n in recent
+            }
+            self.assertEqual(saved_bytes, {raw_a, raw_b})
+            captions = [n.text for n in recent]
+            # 触发词「记一下」被剥掉，余下的「两张课件」是第一张图的说明
+            self.assertEqual(sorted(captions), ["", "两张课件"])
 
     async def test_note_commands(self):
         """/笔记 概览与明细、/归到 纠正、/找 检索。"""
