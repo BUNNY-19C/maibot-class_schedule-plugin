@@ -533,6 +533,71 @@ class StudySettingsConfig(PluginConfigBase):
         description="生成总结的模型调用超时（秒）；失败自动重试，最多 3 次",
         json_schema_extra={"label": "总结超时（秒）", "order": 8, "step": 10},
     )
+    cloud_enabled: bool = Field(
+        default=True,
+        description=(
+            "启用硅基流动云端能力（公式识别/结构化整理/语义检索）。"
+            "**注意：开启后截图与笔记内容会发送到所配置的 API 地址做识别**。"
+            "不配 API Key 时相关能力自动降级（识别跳过、检索退回关键词全文）"
+        ),
+        json_schema_extra={"label": "启用云端识别", "order": 9},
+    )
+    api_base_url: str = Field(
+        default="https://api.siliconflow.cn/v1",
+        description="API 服务地址（OpenAI 兼容）。只允许公网 https 地址",
+        json_schema_extra={"label": "API 地址", "order": 10},
+    )
+    api_key: str = Field(
+        default="",
+        description=(
+            "API Key。config.toml 不进版本库，Key 不会上传；留空则云端能力全部降级"
+        ),
+        json_schema_extra={"label": "API Key", "order": 11, "rows": 1},
+    )
+    vlm_model: str = Field(
+        default="Qwen/Qwen3-VL-32B-Instruct",
+        description="公式/图片识别模型",
+        json_schema_extra={"label": "视觉模型", "order": 12},
+    )
+    vlm_fallback_model: str = Field(
+        default="Qwen/Qwen3-VL-8B-Instruct",
+        description="识别失败时降级的视觉模型（重试一次）",
+        json_schema_extra={"label": "视觉降级模型", "order": 13},
+    )
+    struct_model: str = Field(
+        default="deepseek-ai/DeepSeek-V3.2",
+        description="结构化整理与打标的文本模型",
+        json_schema_extra={"label": "整理模型", "order": 14},
+    )
+    embedding_model: str = Field(
+        default="Qwen/Qwen3-Embedding-8B",
+        description="语义检索的向量模型",
+        json_schema_extra={"label": "Embedding 模型", "order": 15},
+    )
+    rerank_model: str = Field(
+        default="Qwen3-Reranker-8B",
+        description="语义检索精排模型；留空则不做精排",
+        json_schema_extra={"label": "Rerank 模型", "order": 16},
+    )
+    cloud_timeout_seconds: int = Field(
+        default=30,
+        ge=5,
+        le=180,
+        description="云端 API 单次调用超时（秒）",
+        json_schema_extra={"label": "云端超时（秒）", "order": 17, "step": 5},
+    )
+    image_cache_enabled: bool = Field(
+        default=True,
+        description="相同图片 hash 直接命中缓存，避免重复识别与重复计费",
+        json_schema_extra={"label": "图片识别缓存", "order": 18},
+    )
+    queue_size: int = Field(
+        default=200,
+        ge=10,
+        le=2000,
+        description="异步处理队列长度；满了丢弃并告警（不阻塞消息）",
+        json_schema_extra={"label": "队列长度", "order": 19},
+    )
 
 
 class ClassScheduleConfig(PluginConfigBase):
