@@ -4375,8 +4375,14 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
                     }
                 ),
             )
-            await plugin.on_load()
+            with self.assertLogs("test.class-schedule", level="INFO") as captured:
+                await plugin.on_load()
             try:
+                # 正向也要留痕：出问题时"到底开没开"是第一件要确认的事
+                self.assertTrue(
+                    any("公式识别已启用" in line for line in captured.output),
+                    captured.output,
+                )
                 self.assertIsNotNone(plugin._recognizer)
                 self.assertIsNotNone(plugin._cloud_client)
                 pipeline = plugin._pipeline

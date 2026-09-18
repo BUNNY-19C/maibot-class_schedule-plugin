@@ -472,6 +472,14 @@ class ClassSchedulePlugin(MaiBotPlugin):
                 f"（{conf.study.api_base_url}）不是 https 地址；"
                 "图片照常入库，不做公式识别"
             )
+        elif self._recognizer is not None:
+            # 正向也要留痕：出问题时"到底开没开"是第一件要确认的事，
+            # 只在不成功时说话会让人无从判断（线上排查时正缺这一行）
+            self.ctx.logger.info(
+                f"{LOG_PREFIX} 公式识别已启用：模型 {conf.study.vlm_model}"
+                f"（失败降级 {conf.study.vlm_fallback_model or '无'}，"
+                f"图片缓存 {'开' if conf.study.image_cache_enabled else '关'}）"
+            )
 
     async def on_unload(self) -> None:
         await self._stop_and_cancel_loop()
