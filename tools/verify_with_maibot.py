@@ -801,6 +801,13 @@ def check_holiday_data(module_name: str, report: Check) -> None:
 
 
 def main() -> int:
+    # 插件回执里有 ✅ 这类符号，Windows 控制台默认 GBK 会让 print 直接抛异常
+    # （在服务器上实测踩到：得先 chcp 65001 才能跑完）。这里主动把输出改成
+    # UTF-8，让脚本在默认控制台直接可用，不因为打不出一个对勾而中断验证。
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
     parser = argparse.ArgumentParser(description="用本机麦麦验证课程表提醒插件")
     parser.add_argument("--maibot", help="麦麦本体目录（包含 src/plugin_runtime）")
     args = parser.parse_args()
