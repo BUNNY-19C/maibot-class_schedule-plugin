@@ -247,6 +247,10 @@ python tools/verify_with_maibot.py --maibot "<麦麦的 modules/MaiBot 目录>"
 - **公式库当前只能通过识别与检索使用**:没有删除/改正公式的命令,也没有清失败
   计数的命令;需要人工修正时直接改 `notes.db`(原始层 `latex_raw` 只增不改,
   整理层可用 `tools/renormalize_formulas.py` 按当前规则重算)。
+- **同一张图重发会各存一份**:笔记层不做内容去重(只有公式库按图片 hash 缓存与
+  指纹去重),所以反复发同几张课件会堆出重复的原图与笔记。清理用
+  `python tools/dedupe_note_images.py --root <数据目录>/notes`(先预览,
+  `--apply` 才动手;被清理的文件进 `notes/_trash_<时间>/`,可随时搬回)。
 - **时区按墙上时间处理**:宿主时区与课表时区不一致时会整体平移,
   见[时间口径](#时间口径)。容器化/UTC 部署前请自行确认。
 

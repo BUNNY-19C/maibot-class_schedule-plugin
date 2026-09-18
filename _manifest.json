@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "github.BUNNY-19C.class-schedule",
-  "version": "1.6.3",
+  "version": "1.6.4",
   "name": "课程表提醒",
   "description": "导入课表 ICS 文件，在上课前自定义分钟数（默认 20 分钟）主动推送上课提醒；支持自然语言收纳学习笔记，并把截图里的公式识别成 LaTeX 存进笔记库",
   "author": {
