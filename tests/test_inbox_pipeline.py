@@ -220,7 +220,7 @@ class RecognitionEndToEnd(unittest.IsolatedAsyncioTestCase):
         row = db.formula_by_image_hash(image_hash(_PNG))
         self.assertIsNotNone(row)
         self.assertEqual(row["name"], "半角公式")
-        self.assertEqual(row["latex_normalized"], "(\\pi)/(2)")
+        self.assertEqual(row["latex_normalized"], "\\frac{\\pi}2")
         tags = db.formula_tags_for(int(row["id"]))
         self.assertIn("#公式", tags)
         self.assertNotIn("#未分类", tags)  # 「未分类」不是一门课，不进标签

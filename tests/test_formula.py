@@ -37,8 +37,46 @@ class NormalizeLatexTest(unittest.TestCase):
         self.assertEqual(normalize_latex(r"\alpha \times \beta"), normalize_latex(r"\alpha\cdot\beta"))
 
     def test_fraction_macros_and_slash_converge(self):
-        for variant in (r"\frac{1}{2}", r"\dfrac{1}{2}", r"\tfrac{1}{2}", "1/2", r"\frac12"):
-            self.assertEqual(normalize_latex(variant), normalize_latex(r"\frac{1}{2}"), variant)
+        for variant in (
+            r"\frac{1}{2}", r"\dfrac{1}{2}", r"\tfrac{1}{2}", r"\tfrac12",
+            r"\frac12", "1/2",
+        ):
+            self.assertEqual(normalize_latex(variant), r"\frac12", variant)
+        self.assertEqual(normalize_latex(r"\frac{a}{b}"), normalize_latex("a/b"))
+        self.assertEqual(normalize_latex(r"a\div b"), normalize_latex("a/b"))
+
+    def test_equation_with_fraction_is_not_reshaped(self):
+        """回归（线上真实返回）：等式里带分式不能被"按斜杠切段补括号"重新结合。
+
+        模型给的是 ``[\\sigma]=\\frac{\\sigma_{\\lim}}{S_{\\sigma}}=…``，
+        旧实现按顶层斜杠切段补括号，产出
+        ``([\\sigma]=(\\sigma_{\\lim}))/((S_{\\sigma})=…)``——两个等号被塞进分母，
+        公式的意思就没了。最常见形状 ``x=\\frac{a}{b}`` 同样会被弄成 ``(x=(a))/(b)``。
+        """
+        source = (
+            r"[\sigma]=\frac{\sigma_{\lim}}{S_{\sigma}}"
+            r"=\frac{\sigma_{S}}{S_{\sigma}}"
+        )
+        self.assertEqual(normalize_latex(source), source)
+        self.assertEqual(normalize_latex(r"x=\frac{a}{b}"), r"x=\fracab")
+        self.assertEqual(normalize_latex("x=a/b"), r"x=\fracab")
+        self.assertEqual(normalize_latex(r"v=\frac{s}{t}"), normalize_latex("v=s/t"))
+
+    def test_multiplication_after_division_keeps_precedence(self):
+        """``a/b\\cdot c`` 是 ``(a/b)\\cdot c``：右边不能被吃成 ``b\\cdot c``。
+
+        根因是去空白把 ``\\cdot c`` 粘成了未定义宏 ``\\cdotc``，操作数扫描于是
+        一路吃到 ``c``，算出 ``a/(b\\cdot c)``。
+        """
+        self.assertEqual(normalize_latex(r"a/b\cdot c"), r"\fracab\cdot c")
+        self.assertEqual(normalize_latex(r"a \cdot b/c"), r"a\cdot\fracbc")
+        self.assertEqual(normalize_latex(r"a/b/c"), r"\frac{\fracab}c")
+
+    def test_macro_followed_by_space_is_not_fused(self):
+        """``\\pi r^2`` 不能被去空白粘成 ``\\pir^2``（未定义宏）。"""
+        self.assertEqual(normalize_latex(r"\pi r^2"), r"\pi r^{2}")
+        self.assertEqual(normalize_latex(r"\sin x+\cos y"), r"\sin x+\cos y")
+        self.assertEqual(normalize_latex(r"\int f(x) dx"), r"\int f(x)dx")
 
     def test_layout_noise_removed(self):
         self.assertEqual(

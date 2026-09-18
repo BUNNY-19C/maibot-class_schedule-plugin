@@ -129,11 +129,13 @@ def normalize_latex(raw: str) -> str:
     text = _TEXT_WRAPPERS.sub(r"\1", text)
     # 2. Unicode → LaTeX。必须先做：后面所有规则只认 ASCII 形式
     text = "".join(_UNICODE_TO_LATEX.get(ch, ch) for ch in text)
-    # 3. 排版噪声与空白：LaTeX 里空格不参与语义，一律去掉
+    # 3. 排版噪声与空白：LaTeX 里空格不参与语义，但宏名后的分界空格是例外
     text = _NOISE_MACROS.sub("", text)
-    text = re.sub(r"\s+", "", text)
-    # 4. 分式与乘法的同义宏收敛
-    text = re.sub(r"\\(?:d|c|t)frac\b", r"\\frac", text)
+    text = _strip_spacing(text)
+    # 4. 分式与乘法的同义宏收敛。这里用 ``(?![A-Za-z])`` 而不是 ``\b``：
+    #    ``\tfrac12`` 这种省花括号的写法里，``frac`` 后面跟的是数字，``\b`` 不成立，
+    #    会漏掉不归一（同一公式两种写法各存一条）
+    text = re.sub(r"\\(?:d|c|t)frac(?![A-Za-z])", r"\\frac", text)
     text = text.replace(r"\times", r"\cdot").replace(r"\ast", r"\cdot")
     # 5. 上下标统一成花括号形式：e^(i\pi) 与 e^{i\pi} 是同一个公式
     text = re.sub(r"\^\(([^()]*)\)", r"^{\1}", text)
@@ -143,12 +145,54 @@ def normalize_latex(raw: str) -> str:
     # 6. √ 映射成 \sqrt{} 后把紧随的单个符号收进括号：√2 → \sqrt{2}
     text = re.sub(r"\\sqrt\{\}(\\[A-Za-z]+|[A-Za-z0-9])", r"\\sqrt{\1}", text)
     # 7. 去掉只包一个字符的括号（\sqrt{2}→\sqrt2）。^ 与 _ 的括号是语义，不动
-    text = re.sub(r"(?<![\^_]){([^{}])}", r"\1", text)
-    # 8. \frac{A}{B} → (A)/(B)：分式写法与 1/2 这类斜杠写法在这里合流
-    text = _expand_fractions(text)
-    # 9. a/b → (a)/(b)：让 1/2 与 \frac{1}{2} 得到同一个指纹
-    text = _parenthesize_divisions(text)
+    text = _strip_single_char_braces(text)
+    # 8. 分式归一：\frac 家族统一成 \frac{A}{B}（参数补花括号），裸除法也并进来
+    text = _normalize_fracs(text)
+    # 9. a/b → \frac{a}{b}：让 1/2 与 \frac{1}{2} 得到同一个指纹
+    text = _fracs_from_slashes(text)
+    # 10. 分式改写会把占位空格搬离它原本的宏名，先收拾干净（只有紧跟宏名的才是
+    #     "必须保留的分界空格"，其余是残留，删掉）
+    text = _drop_stray_placeholders(text)
+    # 11. 最后再收一次单字符花括号：上一步补出来的 {2} 要变回 2，才与 \frac{1}{2}
+    #     那条路合流。必须在清占位符之后做，否则残留占位符会把括号撑成"多字符"
+    text = _strip_single_char_braces(text)
     return text.strip()
+
+
+def _drop_stray_placeholders(text: str) -> str:
+    """占位符只在紧跟宏名时保留为空格，其余位置一律删除（保证幂等）。"""
+    marked = re.sub(r"(\\[A-Za-z]+)" + _PLACEHOLDER, lambda m: m.group(1) + "\x01", text)
+    return marked.replace(_PLACEHOLDER, "").replace("\x01", " ")
+
+
+#: 去空白时用来临时顶替"必须保留的分界空格"的占位符。
+#: 公式文本里不会出现 NUL，用它顶一下最省事，最后再换回空格。
+_PLACEHOLDER = "\x00"
+#: 宏名 + 空白 + 字母：这个空白**不能删**。LaTeX 里 ``\cdot c`` 与 ``\cdotc``
+#: 不是一回事（后者是未定义宏），全局去空白会把 ``\pi r^2`` 粘成 ``\pir^2``、
+#: ``a/b\cdot c`` 粘成 ``a/b\cdotc``——后者会让除法的右操作数把 ``\cdotc``
+#: 整个吃进去，算出 ``a/(b\cdot c)``，公式的意思就变了。
+_MACRO_SPACE_BEFORE_LETTER = re.compile(r"(\\[A-Za-z]+)\s+(?=[A-Za-z])")
+
+
+def _strip_spacing(text: str) -> str:
+    """去掉排版空白，但把"宏名后必须保留的分界空格"留成占位符。
+
+    占位符**不能在这里换回空格**：后面的分式改写会把操作数搬进花括号，
+    那时它已经不在宏名后面了，留着就会被当成内容写进 `\\frac{ b}c`（还会不幂等）。
+    统一交给 :func:`_drop_stray_placeholders` 在最后收拾。
+    """
+    text = _MACRO_SPACE_BEFORE_LETTER.sub(r"\1" + _PLACEHOLDER, text)
+    return re.sub(r"\s+", "", text)
+
+
+def _strip_single_char_braces(text: str) -> str:
+    """去掉只包一个字符的花括号（``\\sqrt{2}``→``\\sqrt2``）。
+
+    ``^`` 与 ``_`` 后面的花括号是语义（``e^{2}`` 不能写成 ``e^2`` 之后再被误解），
+    所以那里不动。
+    """
+    return re.sub(r"(?<![\^_]){([^{}])}", r"\1", text)
 
 
 def _single_token(text: str, index: int) -> str | None:
@@ -193,17 +237,87 @@ def _take_group(text: str, index: int) -> tuple[str | None, int]:
     return None, index
 
 
-#: 分式展开的递归上限。纯为挡病态输入（几千层 \\frac 嵌套会让递归爆栈），
-#: 正常公式远达不到；超限的分支原样保留，不展开也不报错。
+#: 分式归一的递归上限。纯为挡病态输入（几千层 \\frac 嵌套会让递归爆栈），
+#: 正常公式远达不到；超限的分支原样保留，不归一也不报错。
 MAX_FRACTION_DEPTH = 20
 
+#: 会**断开操作数**的符号：除法两侧只吃紧邻的原子，遇到这些就停。
+#: 为什么必须停：乘除同优先级、左结合，``a/b\cdot c`` 的意思是 ``(a/b)\cdot c``，
+#: 把右边一路吃成 ``b\cdot c`` 就变成 ``a/(b\cdot c)``——**改掉了公式的意思**。
+_BREAK_CHARS = frozenset("+-=<>,")
+_BREAK_MACROS = (
+    r"\cdot", r"\div", r"\pm", r"\mp", r"\cup", r"\cap", r"\circ", r"\times",
+)
+#: 与 ``/`` 同义的除号宏：一起改成分式，别让 ``a\div b`` 与 ``a/b`` 各算一个指纹
+_DIV_MACRO = r"\div"
+_MACRO_RE = re.compile(r"\\[A-Za-z]+")
 
-def _expand_fractions(text: str, depth: int = 0) -> str:
-    """把 ``\\frac{A}{B}``（含 ``\\frac AB`` 写法）展开成 ``(A)/(B)``。
 
-    分子分母要**递归展开**：``\\frac{\\frac{a}{b}}{c}`` 的外层参数里还藏着
-    一个 ``\\frac``。若只从外往里扫一遍、扫过参数就不再回头，内层那个会被
-    原样留在括号里，于是"归一化再归一化"还会变一次（不幂等 → 同一公式存两条）。
+def _atom_end(text: str, index: int) -> int:
+    """读一个原子（宏 / 括号组 / 单字符）连同它的上下标，返回结束位置。"""
+    if index >= len(text):
+        return index
+    char = text[index]
+    if char == "\\":
+        match = _MACRO_RE.match(text, index)
+        end = match.end() if match else index + 1
+    elif char in "{(":
+        closer = "}" if char == "{" else ")"
+        depth = 0
+        end = index + 1  # 括号不闭合时当一个字符算，绝不吞掉后面的内容
+        for position in range(index, len(text)):
+            if text[position] == char:
+                depth += 1
+            elif text[position] == closer:
+                depth -= 1
+                if depth == 0:
+                    end = position + 1
+                    break
+    else:
+        end = index + 1
+    while end < len(text) and text[end] in "^_":
+        suffix = _atom_end(text, end + 1)
+        if suffix <= end + 1:
+            break  # ^ 后面什么都没有，别把它吃进来
+        end = suffix
+    return end
+
+
+def _starts_break_macro(text: str, index: int) -> bool:
+    """``index`` 处是不是一个"断开操作数"的宏（二元运算符）。"""
+    if index >= len(text) or text[index] != "\\":
+        return False
+    match = _MACRO_RE.match(text, index)
+    return bool(match) and match.group(0) in _BREAK_MACROS
+
+
+def _operand_end(text: str, index: int) -> int | None:
+    """读一个操作数（一个或多个相邻原子）；读不出内容返回 ``None``。
+
+    相邻原子算同一个操作数（``kT``、``\sigma_{\lim}``、``(a)(b)``），这在数学上
+    是安全的：括起来只会更明确，不会改变结合关系。
+    """
+    cursor = index
+    end: int | None = None
+    while cursor < len(text):
+        if text[cursor] == "/" or text[cursor] in _BREAK_CHARS:
+            break
+        if _starts_break_macro(text, cursor):
+            break
+        next_end = _atom_end(text, cursor)
+        if next_end <= cursor:
+            break
+        cursor = next_end
+        end = cursor
+    return end
+
+
+def _normalize_fracs(text: str, depth: int = 0) -> str:
+    """``\\frac`` 家族统一成 ``\\frac{A}{B}``，参数一律补花括号。
+
+    参数要**递归归一**：``\\frac{\\frac{a}{b}}{c}`` 的外层参数里还藏着一个
+    ``\\frac``，只扫一遍外层就不再回头的话，内层会原样留着，于是"归一化再归一化"
+    还会变一次（不幂等 → 同一公式存两条）。
     """
     out: list[str] = []
     index = 0
@@ -214,9 +328,9 @@ def _expand_fractions(text: str, depth: int = 0) -> str:
                 denominator, after_den = _take_group(text, after_num)
                 if denominator is not None:
                     if depth < MAX_FRACTION_DEPTH:
-                        numerator = _expand_fractions(numerator, depth + 1)
-                        denominator = _expand_fractions(denominator, depth + 1)
-                    out.append(f"({numerator})/({denominator})")
+                        numerator = _normalize_fracs(numerator, depth + 1)
+                        denominator = _normalize_fracs(denominator, depth + 1)
+                    out.append(f"\\frac{{{numerator}}}{{{denominator}}}")
                     index = after_den
                     continue
             # 结构不完整：原样留着，别把内容丢掉
@@ -228,56 +342,46 @@ def _expand_fractions(text: str, depth: int = 0) -> str:
     return "".join(out)
 
 
-def _split_top_level(text: str, separator: str) -> list[str]:
-    """按分隔符切分，但跳过 ``{}`` 与 ``()`` 内部（结构内的斜杠不算除法）。"""
-    parts: list[str] = []
-    current: list[str] = []
-    brace = paren = 0
-    for char in text:
-        if char == "{":
-            brace += 1
-        elif char == "}":
-            brace = max(0, brace - 1)
-        elif char == "(":
-            paren += 1
-        elif char == ")":
-            paren = max(0, paren - 1)
-        if char == separator and brace == 0 and paren == 0:
-            parts.append("".join(current))
-            current = []
+def _fracs_from_slashes(text: str) -> str:
+    """裸除法改成分式：``1/2`` → ``\\frac{1}{2}``，``a/b/c`` → ``\\frac{\\frac{a}{b}}{c}``。
+
+    为什么不再"给两侧补括号"：补括号必须知道操作数边界，而边界一旦算错就会
+    重新结合整个表达式。**线上真实返回暴露过这个错误**——模型给的是
+
+        [\\sigma]=\\frac{\\sigma_{\\lim}}{S_{\\sigma}}=\\frac{\\sigma_{S}}{S_{\\sigma}}
+
+    按顶层斜杠切段补括号会变成 ``([\\sigma]=(\\sigma_{\\lim}))/((S_{\\sigma})=…)``，
+    等于把两个等号也塞进分母，公式的意思就没了。改成"斜杠变分式"以后边界靠
+    操作数扫描决定，写到哪一段都只影响那一段，``x=\\frac{a}{b}`` 这类最常见形状
+    也不会再被改动。
+    """
+    out: list[str] = []
+    operand_at = 0  # out 里当前左操作数的起点
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char == "/" or text.startswith(_DIV_MACRO, index):
+            operator_end = index + 1 if char == "/" else index + len(_DIV_MACRO)
+            left = "".join(out[operand_at:])
+            right_end = _operand_end(text, operator_end)
+            if left and right_end is not None:
+                right = text[operator_end: right_end]
+                out[operand_at:] = [f"\\frac{{{left}}}{{{right}}}"]
+                index = right_end
+                continue
+            # 除号两侧不完整：原样留着，别猜
+            out.append(text[index: operator_end])
+            index = operator_end
             continue
-        current.append(char)
-    parts.append("".join(current))
-    return parts
-
-
-def _is_wrapped(part: str) -> bool:
-    """整段是否已被一对括号包住（``(a)`` 是，``(a)(b)`` 不是）。"""
-    if len(part) < 2 or part[0] != "(" or part[-1] != ")":
-        return False
-    depth = 0
-    for position, char in enumerate(part):
-        if char == "(":
-            depth += 1
-        elif char == ")":
-            depth -= 1
-            if depth == 0:
-                return position == len(part) - 1
-    return False
-
-
-def _parenthesize_divisions(text: str) -> str:
-    """给裸除法两侧补括号：``1/2`` → ``(1)/(2)``，与 ``\\frac`` 展开式一致。"""
-    parts = _split_top_level(text, "/")
-    if len(parts) < 2:
-        return text
-    normalized: list[str] = []
-    for part in parts:
-        stripped = part.strip()
-        if not stripped:
-            return text  # 空段（a//b 之类）不猜，原样放行
-        normalized.append(stripped if _is_wrapped(stripped) else f"({stripped})")
-    return "/".join(normalized)
+        start = index
+        end = _atom_end(text, start)
+        if end <= start:
+            end = start + 1
+        out.append(text[start:end])
+        index = end
+        if char in _BREAK_CHARS or _starts_break_macro(text, start):
+            operand_at = len(out)  # 断开处之后是新的操作数
+    return "".join(out)
 
 
 def fingerprint(normalized_latex: str) -> str:
