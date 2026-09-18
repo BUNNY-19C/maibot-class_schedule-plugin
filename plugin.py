@@ -17,6 +17,7 @@ import functools
 import base64
 import binascii
 import logging
+import sqlite3 as _sqlite3
 import re
 from collections.abc import Awaitable, Callable, Iterable
 from contextlib import suppress
@@ -71,6 +72,9 @@ from .holidays import (
 from .ics_parser import CourseEvent, expand_occurrences
 from .netutil import FetchError, UnsafeUrlError, fetch_bytes, fetch_ics, fetch_text
 from .study_notes import StudyNoteStore, course_folder_name
+from .inbox import InboxDeduper, ParsedMessage
+from .notes_db import NotesDatabase
+from .pipeline import StudyPipeline
 from .reminder import collect_due, one_line, render_message, upcoming_events
 from .store import MAX_LEAD_MINUTES, PluginState, Subscription
 
@@ -181,6 +185,10 @@ class ClassSchedulePlugin(MaiBotPlugin):
         self._note_images: dict[str, dict[str, Any]] = {}
         #: 课后总结连续失败计数：key -> 次数（超过阈值放弃，见 SUMMARY_MAX_ATTEMPTS）
         self._summary_attempts: dict[str, int] = {}
+        #: 笔记库（SQLite）与异步管道（阶段 2'：Inbox 落库）
+        self._notes_db: NotesDatabase | None = None
+        self._pipeline: StudyPipeline | None = None
+        self._inbox_dedup = InboxDeduper()
         #: 待重试的总结任务：key -> {course, window}（每轮 tick 重新排入，见
         #: _maybe_course_summaries——失败后不能靠"下课窗口"重试，窗口会移走）
         self._summary_retries: dict[str, dict[str, Any]] = {}
@@ -330,6 +338,26 @@ class ClassSchedulePlugin(MaiBotPlugin):
 
         # 学习笔记按课分目录，挂在插件数据目录的 notes/ 下
         self._notes = StudyNoteStore(self._data_dir / "notes")
+        # 阶段 2'：SQLite 笔记库 + 管道（DB 建表放线程里，别卡加载）
+        try:
+            if self._notes_db is not None:
+                # 重复 on_load（热重载）：先关旧连接，避免文件句柄泄漏
+                try:
+                    self._notes_db.close()
+                except Exception:
+                    pass
+            db = NotesDatabase(self._data_dir / "notes.db")
+            await asyncio.to_thread(db.initialize)
+            self._notes_db = db
+            self._pipeline = StudyPipeline(
+                db=db,
+                save_image=self._save_inbox_image,
+            )
+            self._pipeline.start()
+        except (OSError, _sqlite3.Error) as exc:
+            self._notes_db = None
+            self._pipeline = None
+            self.ctx.logger.warning(f"{LOG_PREFIX} 笔记库初始化失败（不影响提醒/收纳主路径）: {exc}")
 
         # 读宿主人设与 bot 账号：persona 文案与 proactive 验证都依赖它
         self._bot_accounts = {}
@@ -415,6 +443,14 @@ class ClassSchedulePlugin(MaiBotPlugin):
     async def on_unload(self) -> None:
         await self._stop_and_cancel_loop()
         await self._cancel_intake_tasks()
+        if self._pipeline is not None:
+            await self._pipeline.stop()
+            self._pipeline = None
+        if self._notes_db is not None:
+            try:
+                self._notes_db.close()
+            finally:
+                self._notes_db = None
         self._save_state()
         self.ctx.logger.info(f"{LOG_PREFIX} 已卸载")
 
@@ -2015,6 +2051,26 @@ class ClassSchedulePlugin(MaiBotPlugin):
         return True, message, 1
 
     @Command(
+        "schedule_notes_db",
+        description="查看 SQLite 笔记库状态（状态分布/向量数）",
+        pattern=r"^/笔记库\s*$",
+    )
+    @_requires_access
+    async def handle_notes_db(self, **kwargs: Any) -> CommandResult:
+        stream_id = str(kwargs.get("stream_id", "")).strip()
+        db = self._notes_db
+        if db is None:
+            message = "ℹ️ 笔记库未启用（初始化失败时不影响提醒与 markdown 收纳）"
+        else:
+            counts = db.status_counts()
+            total = sum(counts.values())
+            detail = "、".join(f"{k} {v}" for k, v in sorted(counts.items())) or "空"
+            vectors = len(db.all_embeddings())
+            message = f"🗂 笔记库共 {total} 条（{detail}）；向量 {vectors} 条"
+        await self._reply(stream_id, message)
+        return True, message, 1
+
+    @Command(
         "schedule_note_search",
         description="按关键词搜学习笔记",
         pattern=r"^/找\s+(?P<keyword>\S+)\s*$",
@@ -2901,6 +2957,46 @@ class ClassSchedulePlugin(MaiBotPlugin):
         while len(self._note_images) > MAX_REMEMBERED_STREAMS:
             self._note_images.pop(next(iter(self._note_images)))
 
+    def _save_inbox_image(self, course: str, data: bytes, suffix: str) -> str:
+        """管道写原图到笔记库目录（相对 <course>/ 的路径）。"""
+        if self._notes is None or not data:
+            return ""
+        try:
+            return self._notes.save_raw_image(course, data, suffix or ".png")
+        except OSError:
+            return ""
+
+    async def _persist_inbox_note(
+        self, course: str, kind: str, text: str, images: list, message_id: str, source: str
+    ) -> None:
+        """把一条收纳同时写进 SQLite 笔记库（v1.4 markdown 层保持不变）。"""
+        if self._pipeline is None or self._notes_db is None:
+            return
+        if text and self._inbox_dedup.should_skip(text):
+            return  # 同一窗口内重复内容不再入笔记库
+        parsed = ParsedMessage(
+            text=text,
+            images=list(images),
+            message_id=message_id,
+            timestamp=datetime.now().isoformat(timespec="seconds"),
+        )
+        source_type = "图片" if images else "文字"
+        try:
+            note_id = await self._pipeline.process(
+                parsed, course=course, source_type=source_type
+            )
+            if kind:
+                await asyncio.to_thread(
+                    self._notes_db.attach_tag, "note", note_id, f"#{kind}"
+                )
+            if kind:
+                await asyncio.to_thread(
+                    self._notes_db.attach_tag, "note", note_id, f"#{kind}"
+                )
+        except Exception as exc:
+            # 笔记库是增强层：坏了绝不影响 v1.4 的收纳与回执
+            self.ctx.logger.warning(f"{LOG_PREFIX} 笔记库落库失败（已忽略）: {exc}")
+
     @HookHandler(
         "chat.receive.after_process",
         name="study_note_capture",
@@ -3104,6 +3200,9 @@ class ClassSchedulePlugin(MaiBotPlugin):
             )
             return
 
+        await self._persist_inbox_note(
+            course_name, kind, text, images, "", source
+        )
         count = notes.count(course_name)
         window_part = (
             f"（{window[0].strftime('%H:%M')}-{window[1].strftime('%H:%M')} 进行中）"

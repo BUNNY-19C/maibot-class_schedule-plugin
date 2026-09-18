@@ -130,7 +130,8 @@ class NotesDatabase:
     def _connection(self) -> sqlite3.Connection:
         if self._conn is None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            self._conn = sqlite3.connect(str(self.path))
+            # 本类用自己的 threading.Lock 串行化所有读写，允许跨线程使用连接
+            self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
             self._conn.row_factory = sqlite3.Row
         return self._conn
 
@@ -386,6 +387,14 @@ class NotesDatabase:
                 (int(note_id),),
             ).fetchall()
         return [str(row["name"]) for row in rows]
+
+    def status_counts(self) -> dict[str, int]:
+        """按状态统计笔记条数（/笔记库 用）。"""
+        with self._lock:
+            rows = self._connection().execute(
+                "SELECT status, COUNT(*) c FROM notes GROUP BY status"
+            ).fetchall()
+        return {str(row["status"]): int(row["c"]) for row in rows}
 
     def all_embeddings(self) -> list[tuple[int, list[float]]]:
         """全部向量（语义召回用；几千条量级直接内存算）。"""

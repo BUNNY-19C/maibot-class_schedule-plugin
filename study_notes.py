@@ -308,6 +308,20 @@ class StudyNoteStore:
         _atomic_write(target, str(markdown))
         return target
 
+
+    def save_raw_image(self, course: str, data: bytes, suffix: str = ".png") -> str:
+        """保存一张原图到 <课程>/img/ 并返回相对路径（管道用，不建索引）。"""
+        import secrets
+        from datetime import datetime as _dt
+
+        if not data:
+            raise ValueError("图片内容为空")
+        folder = self._img_dir(self.course_dir(course))
+        folder.mkdir(parents=True, exist_ok=True)
+        name = f"{_dt.now().strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(2)}{suffix}"
+        _atomic_bytes(folder / name, data)
+        return f"img/{name}"
+
     def summaries(self, course: str) -> list[str]:
         """该课已有哪些课后总结（按日期排序，新的在后）。"""
         folder = self.summaries_dir(course)
