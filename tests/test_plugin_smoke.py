@@ -4361,6 +4361,94 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
             hits = [line for line in captured.output if "不会收到提醒" in line]
             self.assertEqual(len(hits), 1)
 
+    # ── 阶段 3'：云端识别接线（配置 → 客户端 → 识别器 → 管道）与降级路径 ──
+
+    async def test_recognizer_wired_from_config(self):
+        with TemporaryDirectory() as tmp:
+            plugin = self.make_plugin(
+                Path(tmp),
+                build_config(
+                    study={
+                        "api_key": "sk-test-key",
+                        "vlm_model": "Qwen/custom-vlm",
+                        "vlm_fallback_model": "Qwen/small-vlm",
+                    }
+                ),
+            )
+            await plugin.on_load()
+            try:
+                self.assertIsNotNone(plugin._recognizer)
+                self.assertIsNotNone(plugin._cloud_client)
+                pipeline = plugin._pipeline
+                self.assertIs(pipeline.recognizer, plugin._recognizer)
+                self.assertTrue(pipeline.running)
+                message = (await plugin.handle_notes_db(**private_kwargs("ps")))[1]
+                self.assertIn("公式识别", message)
+            finally:
+                await plugin.on_unload()
+            self.assertIsNone(plugin._pipeline)  # 卸载必须收掉 worker
+
+    async def test_missing_key_degrades_quietly(self):
+        """没配 Key 是预期状态：不识别、不告警，但 /笔记库 要看得出原因。"""
+        with TemporaryDirectory() as tmp:
+            plugin = self.make_plugin(Path(tmp), build_config(study={"api_key": ""}))
+            with self.assertNoLogs("test.class-schedule", level="WARNING"):
+                await plugin.on_load()
+            try:
+                self.assertIsNone(plugin._recognizer)
+                message = (await plugin.handle_notes_db(**private_kwargs("ps")))[1]
+                self.assertIn("未启用", message)
+            finally:
+                await plugin.on_unload()
+
+    async def test_cloud_disabled_says_so(self):
+        with TemporaryDirectory() as tmp:
+            plugin = self.make_plugin(
+                Path(tmp), build_config(study={"cloud_enabled": False})
+            )
+            await plugin.on_load()
+            try:
+                self.assertIsNone(plugin._recognizer)
+                message = (await plugin.handle_notes_db(**private_kwargs("ps")))[1]
+                self.assertIn("已关闭", message)
+                # 管道照常，图片仍然入库（只是不识别）
+                self.assertIsNotNone(plugin._pipeline)
+            finally:
+                await plugin.on_unload()
+
+    async def test_non_https_api_base_is_rejected_with_warning(self):
+        """填了 Key 却把地址配成 http：必须告警，且不装配识别器。"""
+        with TemporaryDirectory() as tmp:
+            plugin = self.make_plugin(
+                Path(tmp),
+                build_config(
+                    study={"api_key": "sk-test-key", "api_base_url": "http://api.example.com/v1"}
+                ),
+            )
+            with self.assertLogs("test.class-schedule", level="WARNING") as captured:
+                await plugin.on_load()
+            try:
+                self.assertIsNone(plugin._recognizer)
+                self.assertTrue(
+                    any("不是 https 地址" in line for line in captured.output), captured.output
+                )
+                self.assertIsNone(plugin._cloud_client)  # Key 不会留在内存里备用
+            finally:
+                await plugin.on_unload()
+
+    async def test_notes_db_reports_dropped_jobs(self):
+        """队列满丢弃必须有出口：/笔记库 里要能看到丢弃数。"""
+        with TemporaryDirectory() as tmp:
+            plugin = self.make_plugin(
+                Path(tmp), build_config(study={"api_key": "sk-test-key"})
+            )
+            await plugin.on_load()
+            try:
+                plugin._pipeline.dropped = 7
+                self.assertIn("队列满丢弃 7", plugin._recognition_status_line())
+            finally:
+                await plugin.on_unload()
+
 
 if __name__ == "__main__":
     unittest.main()

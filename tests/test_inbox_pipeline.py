@@ -1,18 +1,46 @@
-"""阶段 2' 重建测试：捕获 → SQLite 笔记库（端到端，防死锁教训）。"""
+"""阶段 2'/3' 重建测试：捕获 → SQLite 笔记库 → 公式识别 worker（端到端，防死锁教训）。"""
 
 import asyncio
 import base64
+import json
 import unittest
-from datetime import datetime, timedelta
 from pathlib import Path
-from tempfile import TemporaryDirectory
 
 import _bootstrap  # noqa: F401  —— 注册插件包
 
 import test_plugin_smoke as smoke  # type: ignore  # 复用 FakeCtx/辅助
+from class_schedule.formula import FormulaRecognizer, image_hash
 from class_schedule.inbox import InboxDeduper, parse_message
 from class_schedule.notes_db import NotesDatabase
 from class_schedule.pipeline import StudyPipeline
+
+#: 一张最小的 PNG（只用于"是图片字节"这件事，不参与解码）
+_PNG = b"\x89PNG\r\n\x1a\n" + b"fake-image-bytes"
+
+_FORMULA_REPLY = json.dumps(
+    {
+        "latex": r"\frac{\pi}{2}",
+        "name": "半角公式",
+        "aliases": ["半角"],
+        "category": "高等数学",
+        "subcategory": "三角函数",
+        "knowledge_points": ["半角公式"],
+        "description": "半角公式",
+        "confidence": 0.92,
+    },
+    ensure_ascii=False,
+)
+
+
+async def _wait_until(predicate, *, timeout: float = 5.0) -> bool:
+    """轮询等待后台 worker 完成（真实线程 + 真实事件循环，防死锁靠超时暴露）。"""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if predicate():
+            return True
+        await asyncio.sleep(0.01)
+    return False
 
 
 class InboxLayerTest(unittest.TestCase):
@@ -105,6 +133,134 @@ class PersistEndToEnd(unittest.IsolatedAsyncioTestCase):
             plugin._pipeline = None
             await capture("记一下 牛顿第二定律")
             self.assertEqual(plugin._notes.count("未分类"), 3)
+
+
+class RecognitionEndToEnd(unittest.IsolatedAsyncioTestCase):
+    """图片笔记 → 落库 → worker 识别 → 公式库 + 回执（真队列，真线程）。"""
+
+    async def test_image_note_recognized_by_worker(self):
+        import shutil
+        import tempfile as _tf
+
+        from class_schedule.plugin import ClassSchedulePlugin
+        from class_schedule.store import PluginState
+        from class_schedule.study_notes import StudyNoteStore
+
+        tmp_path = Path(_tf.mkdtemp(prefix="inbox3-"))
+        self.addCleanup(shutil.rmtree, tmp_path, True)
+
+        plugin = ClassSchedulePlugin()
+        plugin._set_context(smoke.FakeCtx(tmp_path))  # type: ignore[arg-type]
+        plugin.set_plugin_config(
+            {"plugin": {"config_version": "1.0.0", "enabled": True},
+             "reply": {"style": "fixed", "ack_style": "fixed"},
+             "access": {"chat_scope": "private"}}
+        )
+        plugin._data_dir = tmp_path
+        plugin._notes = StudyNoteStore(tmp_path / "notes")
+        plugin._state = PluginState()
+        plugin._awaiting_note = {}
+        db = NotesDatabase(tmp_path / "notes.db")
+        db.initialize()
+        self.addCleanup(db.close)
+        plugin._notes_db = db
+
+        class FakeVision:
+            def __init__(self):
+                self.calls = 0
+
+            async def vision(self, **kwargs):
+                self.calls += 1
+                return {"text": _FORMULA_REPLY, "prompt_tokens": 0, "completion_tokens": 0}
+
+        client = FakeVision()
+        plugin._recognizer = FormulaRecognizer(
+            db=db, client=client, model="vlm-primary", fallback_model="vlm-fallback"
+        )
+        plugin._pipeline = StudyPipeline(
+            db=db,
+            save_image=plugin._save_inbox_image,
+            recognizer=plugin._recognizer,
+            on_recognized=plugin._on_formula_recognized,
+            queue_size=8,
+        )
+        plugin._pipeline.start()
+        self.addAsyncCleanup(plugin._pipeline.stop)
+
+        # 「记一下」只带图 → 等待内容 → 下一条图片消息被收纳并触发识别
+        await plugin.handle_note_capture(
+            message={
+                "session_id": "ps",
+                "message_info": {"user_info": {"user_id": "654321"}},
+                "raw_message": [{"type": "text", "data": {"text": "记一下"}}],
+            },
+            stream_id="ps",
+        )
+        await plugin.handle_note_capture(
+            message={
+                "session_id": "ps",
+                "message_info": {"user_info": {"user_id": "654321"}},
+                "raw_message": [
+                    {"type": "image", "data": {},
+                     "binary_data_base64": base64.b64encode(_PNG).decode()}
+                ],
+            },
+            stream_id="ps",
+        )
+        for task in list(plugin._note_tasks):
+            await task
+
+        pipeline = plugin._pipeline
+        self.assertTrue(await _wait_until(lambda: pipeline.completed >= 1), "worker 未消费队列任务")
+        self.assertTrue(
+            await _wait_until(lambda: db.formula_count() == 1), "公式没落库"
+        )
+        self.assertEqual(client.calls, 1)
+
+        row = db.formula_by_image_hash(image_hash(_PNG))
+        self.assertIsNotNone(row)
+        self.assertEqual(row["name"], "半角公式")
+        self.assertEqual(row["latex_normalized"], "(\\pi)/(2)")
+        tags = db.formula_tags_for(int(row["id"]))
+        self.assertIn("#公式", tags)
+        self.assertNotIn("#未分类", tags)  # 「未分类」不是一门课，不进标签
+        # 新公式要回执：用户得知道这张图被认出来了
+        texts = [text for _stream, text in plugin.ctx.send.texts]  # type: ignore[attr-defined]
+        self.assertTrue(any("半角公式" in text for text in texts), texts)
+
+        # 同一张图再收一次 → 命中图片缓存，不再调模型、不重复建公式
+        await plugin.handle_note_capture(
+            message={
+                "session_id": "ps",
+                "message_info": {"user_info": {"user_id": "654321"}},
+                "raw_message": [
+                    {"type": "text", "data": {"text": "记一下 这张图再看一遍"}},
+                    {"type": "image", "data": {},
+                     "binary_data_base64": base64.b64encode(_PNG).decode()},
+                ],
+            },
+            stream_id="ps",
+        )
+        for task in list(plugin._note_tasks):
+            await task
+        self.assertTrue(await _wait_until(lambda: plugin._recognizer.cached_count >= 1))
+        self.assertEqual(client.calls, 1)
+        self.assertEqual(db.formula_count(), 1)
+
+
+class ImageBytesRoundTrip(unittest.TestCase):
+    """plain 图片消息（无触发词）也要能攒下来：before_process 抢存 → 收纳时才用得上。"""
+
+    def test_parse_message_keeps_original_bytes(self):
+        message = {
+            "message_id": "m9",
+            "raw_message": [
+                {"type": "image", "data": "", "binary_data_base64": base64.b64encode(_PNG).decode()}
+            ],
+        }
+        parsed = parse_message(message)
+        self.assertEqual(parsed.images[0][0], _PNG)
+        self.assertEqual(parsed.message_id, "m9")
 
 
 if __name__ == "__main__":

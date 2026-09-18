@@ -195,3 +195,33 @@
 | `refer_window_minutes` | `15` | 「这个是重点」能回指多久之前的那条消息 |
 | `allow_images` | `true` | 允许收纳图片(原图落盘,受同一套安全校验) |
 | `auto_attribution` | `true` | 按课表自动归属当节课;关闭则全部进「未分类」 |
+
+### 课后自动总结
+
+见 [行为与隐私](behavior.md#学习收纳陪伴辅助学习)。
+
+| 字段 | 默认 | 说明 |
+| --- | --- | --- |
+| `summary_enabled` | `true` | 一门课下课后,把该节随手记的内容聚合成本节总结 |
+| `summary_delay_minutes` | `5` | 下课多少分钟后开始生成(留时间补记最后几条) |
+| `summary_timeout_seconds` | `90` | 生成总结的模型调用超时;失败自动重试 |
+
+### 云端识别
+
+配 `api_key` 后,图片笔记会送进视觉模型识别成公式。**开启即意味着图片会上传到你
+配置的 API 地址**;不配 Key 全部能力自动降级(图片只入库、不做识别),
+笔记与检索不受影响。详见 [行为与隐私](behavior.md#图片里的公式会被认出来)。
+
+| 字段 | 默认 | 说明 |
+| --- | --- | --- |
+| `cloud_enabled` | `true` | 云端能力总开关;关掉后不装配识别器,不再有云端调用 |
+| `api_base_url` | 硅基流动 | OpenAI 兼容服务地址;只允许 https(内网地址在调用前被拒) |
+| `api_key` | 空 | API Key;**留空 = 不识别**。写在 config.toml 里,不进版本库 |
+| `vlm_model` | `Qwen/Qwen3-VL-32B-Instruct` | 公式识别的视觉模型 |
+| `vlm_fallback_model` | `Qwen/Qwen3-VL-8B-Instruct` | 识别失败时降级重试一次用的模型 |
+| `struct_model` | `deepseek-ai/DeepSeek-V3.2` | 结构化整理与打标的文本模型 |
+| `embedding_model` | `Qwen/Qwen3-Embedding-8B` | 语义检索的向量模型 |
+| `rerank_model` | `Qwen3-Reranker-8B` | 检索精排模型;留空则不做精排 |
+| `cloud_timeout_seconds` | `30` | 单次云端调用超时 |
+| `image_cache_enabled` | `true` | 图片 hash 命中缓存就直接复用,不重复识别与计费 |
+| `queue_size` | `200` | 识别队列长度;满了丢弃识别任务(笔记照收)并计数,`/笔记库` 可查 |

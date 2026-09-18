@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS formulas(
   source_message_id TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_formulas_image_hash ON formulas(image_hash);
 CREATE TABLE IF NOT EXISTS formula_tags(
   formula_id INTEGER NOT NULL,
   tag_id INTEGER NOT NULL,
@@ -240,6 +241,49 @@ class NotesDatabase:
                 )
             conn.commit()
             return formula_id
+
+    def formula_by_fingerprint(self, fingerprint: str) -> sqlite3.Row | None:
+        """按指纹取公式（判断"这条是不是新公式"，决定要不要回执给用户）。"""
+        value = str(fingerprint or "").strip()
+        if not value:
+            return None
+        with self._lock:
+            return self._connection().execute(
+                "SELECT * FROM formulas WHERE fingerprint = ?", (value,)
+            ).fetchone()
+
+    def formula_by_image_hash(self, digest: str) -> sqlite3.Row | None:
+        """按图片 hash 取公式——识别缓存：同一张图不再调模型、不再计费。
+
+        取最近一条：同一张图理论上对应同一指纹，但用户可能先用降级模型识别过、
+        后来配置好了又识别一次，此时返回新的那条更符合预期。
+        """
+        value = str(digest or "").strip()
+        if not value:
+            return None
+        with self._lock:
+            return self._connection().execute(
+                "SELECT * FROM formulas WHERE image_hash = ? ORDER BY id DESC LIMIT 1",
+                (value,),
+            ).fetchone()
+
+    def formula_count(self) -> int:
+        """公式总数（/笔记库 展示用）。"""
+        with self._lock:
+            row = self._connection().execute(
+                "SELECT COUNT(*) c FROM formulas"
+            ).fetchone()
+        return int(row["c"]) if row is not None else 0
+
+    def formula_tags_for(self, formula_id: int) -> list[str]:
+        """某个公式的标签名列表（按置信度降序）。"""
+        with self._lock:
+            rows = self._connection().execute(
+                "SELECT t.name FROM formula_tags ft JOIN tags t ON t.id = ft.tag_id"
+                " WHERE ft.formula_id = ? ORDER BY ft.confidence DESC",
+                (int(formula_id),),
+            ).fetchall()
+        return [str(row["name"]) for row in rows]
 
     def attach_tag(
         self,

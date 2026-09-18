@@ -73,6 +73,8 @@ from .ics_parser import CourseEvent, expand_occurrences
 from .netutil import FetchError, UnsafeUrlError, fetch_bytes, fetch_ics, fetch_text
 from .study_notes import StudyNoteStore, course_folder_name
 from .inbox import InboxDeduper, ParsedMessage
+from .formula import FormulaRecognizer
+from .llm_client import SiliconFlowClient
 from .notes_db import NotesDatabase
 from .pipeline import StudyPipeline
 from .reminder import collect_due, one_line, render_message, upcoming_events
@@ -188,6 +190,9 @@ class ClassSchedulePlugin(MaiBotPlugin):
         #: 笔记库（SQLite）与异步管道（阶段 2'：Inbox 落库）
         self._notes_db: NotesDatabase | None = None
         self._pipeline: StudyPipeline | None = None
+        #: 云端客户端与公式识别器（阶段 3'：图片笔记 → VLM 识别）
+        self._cloud_client: SiliconFlowClient | None = None
+        self._recognizer: FormulaRecognizer | None = None
         self._inbox_dedup = InboxDeduper()
         #: 待重试的总结任务：key -> {course, window}（每轮 tick 重新排入，见
         #: _maybe_course_summaries——失败后不能靠"下课窗口"重试，窗口会移走）
@@ -338,8 +343,14 @@ class ClassSchedulePlugin(MaiBotPlugin):
 
         # 学习笔记按课分目录，挂在插件数据目录的 notes/ 下
         self._notes = StudyNoteStore(self._data_dir / "notes")
-        # 阶段 2'：SQLite 笔记库 + 管道（DB 建表放线程里，别卡加载）
+        # 阶段 2'/3'：SQLite 笔记库 + 管道 + 公式识别 worker（建表放线程里，别卡加载）
         try:
+            if self._pipeline is not None:
+                # 重复 on_load（热重载）先收掉上一批 worker：否则它们的队列还在被
+                # 消费，而下面马上要关掉旧连接，会撞上"Cannot operate on a closed database"
+                with suppress(Exception):
+                    await self._pipeline.stop()
+                self._pipeline = None
             if self._notes_db is not None:
                 # 重复 on_load（热重载）：先关旧连接，避免文件句柄泄漏
                 try:
@@ -349,14 +360,19 @@ class ClassSchedulePlugin(MaiBotPlugin):
             db = NotesDatabase(self._data_dir / "notes.db")
             await asyncio.to_thread(db.initialize)
             self._notes_db = db
+            self._recognizer = self._build_recognizer(conf, db)
             self._pipeline = StudyPipeline(
                 db=db,
                 save_image=self._save_inbox_image,
+                recognizer=self._recognizer,
+                on_recognized=self._on_formula_recognized,
+                queue_size=int(conf.study.queue_size),
             )
             self._pipeline.start()
         except (OSError, _sqlite3.Error) as exc:
             self._notes_db = None
             self._pipeline = None
+            self._recognizer = None
             self.ctx.logger.warning(f"{LOG_PREFIX} 笔记库初始化失败（不影响提醒/收纳主路径）: {exc}")
 
         # 读宿主人设与 bot 账号：persona 文案与 proactive 验证都依赖它
@@ -438,6 +454,23 @@ class ClassSchedulePlugin(MaiBotPlugin):
                 f"{LOG_PREFIX} access.chat_scope=private 挡不住 LLM 工具："
                 "工具调用不带会话信息，模型在群里被问到课表仍能查到。"
                 "若机器人也在群里，建议把 access.tool_query_enabled 关掉"
+            )
+        if conf.study.cloud_enabled and not str(conf.study.api_key or "").strip():
+            # 与上面几条不同：没配 Key 是**预期状态**（多数人不配云端），
+            # 所以只记 INFO 留痕，不当成告警刷屏；/笔记库 里也能看到降级原因
+            self.ctx.logger.info(
+                f"{LOG_PREFIX} 云端识别已开启但没配 study.api_key："
+                "图片照常入库，不做公式识别；填上 Key 即自动生效"
+            )
+        elif conf.study.cloud_enabled and self._recognizer is None:
+            # 填了 Key 却用不起来 = 真配错了（地址不是 https），必须告警。
+            # 注意装配期**只**看协议：内网 https 地址要等真正调用时才有 SSRF 校验
+            # （校验要做 DNS 解析，不能在装载路径上同步跑），那时会落成识别失败，
+            # 原因能在 /笔记库 的"最近失败原因"里看到
+            self.ctx.logger.warning(
+                f"{LOG_PREFIX} 云端识别用不起来：study.api_base_url"
+                f"（{conf.study.api_base_url}）不是 https 地址；"
+                "图片照常入库，不做公式识别"
             )
 
     async def on_unload(self) -> None:
@@ -2052,7 +2085,7 @@ class ClassSchedulePlugin(MaiBotPlugin):
 
     @Command(
         "schedule_notes_db",
-        description="查看 SQLite 笔记库状态（状态分布/向量数）",
+        description="查看 SQLite 笔记库状态（状态分布/向量数/公式数与识别队列）",
         pattern=r"^/笔记库\s*$",
     )
     @_requires_access
@@ -2066,9 +2099,40 @@ class ClassSchedulePlugin(MaiBotPlugin):
             total = sum(counts.values())
             detail = "、".join(f"{k} {v}" for k, v in sorted(counts.items())) or "空"
             vectors = len(db.all_embeddings())
-            message = f"🗂 笔记库共 {total} 条（{detail}）；向量 {vectors} 条"
+            lines = [
+                f"🗂 笔记库共 {total} 条（{detail}）；向量 {vectors} 条；"
+                f"公式 {db.formula_count()} 条"
+            ]
+            lines.append(self._recognition_status_line())
+            message = "\n".join(lines)
         await self._reply(stream_id, message)
         return True, message, 1
+
+    def _recognition_status_line(self) -> str:
+        """识别链路的可见状态：可用/降级原因、累计识别数、队列积压与丢弃。
+
+        "丢弃"必须有出口：队列满时用户只会看到"图片记下了但没识别"，
+        没有这个数字就完全无从判断是没配 Key 还是被丢了。
+        """
+        if self._recognizer is None:
+            if not self._conf().study.cloud_enabled:
+                return "🧮 公式识别：已关闭（study.cloud_enabled）"
+            return "🧮 公式识别：未启用（缺 API Key 或地址不是 https，见启动日志）"
+        recognizer = self._recognizer
+        parts = [
+            f"识别成功 {recognizer.recognized_count}",
+            f"图片缓存命中 {recognizer.cached_count}",
+            f"失败 {recognizer.failed_count}",
+        ]
+        pipeline = self._pipeline
+        if pipeline is not None:
+            parts.append(f"排队 {pipeline.queue_depth}")
+            if pipeline.dropped:
+                parts.append(f"队列满丢弃 {pipeline.dropped}")
+        line = "🧮 公式识别：" + "、".join(parts)
+        if recognizer.last_error:
+            line += f"\n　最近失败原因：{recognizer.last_error[:100]}"
+        return line
 
     @Command(
         "schedule_note_search",
@@ -2957,6 +3021,69 @@ class ClassSchedulePlugin(MaiBotPlugin):
         while len(self._note_images) > MAX_REMEMBERED_STREAMS:
             self._note_images.pop(next(iter(self._note_images)))
 
+    def _build_recognizer(
+        self, conf: ClassScheduleConfig, db: NotesDatabase
+    ) -> FormulaRecognizer | None:
+        """按配置装配公式识别器；任一环缺失就返回 ``None``（降级，不报错）。
+
+        三种"配了但用不了"的情况（关闭、没 Key、地址不是公网 https）都由
+        :meth:`_warn_risky_settings` 在启动日志里说一次原因——它们都不会报错，
+        只在用户毫无察觉时少干活，所以必须留痕。
+        """
+        self._cloud_client = None
+        study = conf.study
+        if not study.cloud_enabled:
+            return None
+        key = str(study.api_key or "").strip()
+        if not key:
+            return None
+        client = SiliconFlowClient(
+            key,
+            base_url=str(study.api_base_url or "").strip(),
+            timeout_seconds=int(study.cloud_timeout_seconds),
+        )
+        if not client.configured:
+            return None  # 缺 Key 或不是 https：装配期就能判定，不必等到调用
+        self._cloud_client = client
+        return FormulaRecognizer(
+            db=db,
+            client=client,
+            model=str(study.vlm_model or "").strip(),
+            fallback_model=str(study.vlm_fallback_model or "").strip(),
+            image_cache_enabled=bool(study.image_cache_enabled),
+        )
+
+    async def _on_formula_recognized(
+        self, job: dict[str, Any], result: dict[str, Any]
+    ) -> None:
+        """公式识别完成后的回执。
+
+        只在**新公式**时说话：同一公式（指纹相同）之前存过就不再通知，
+        否则每次重发同一张图都会刷一条消息。识别失败由 /笔记库 的计数体现，
+        不当场打扰用户——原图已经收好了。
+        """
+        if not result.get("created"):
+            return
+        stream_id = str(job.get("stream_id") or "").strip()
+        if not stream_id:
+            return
+        name = str(result.get("name") or "") or "未知公式"
+        latex = str(result.get("latex_normalized") or result.get("latex") or "")
+        course = str(job.get("course") or "")
+        note = f"（归入「{course}」）" if course and course != "未分类" else ""
+        tail = ""
+        if result.get("low_confidence"):
+            tail = "。我对它没把握，已标 #待确认，你可以用 /找 核对一下"
+        if result.get("degraded"):
+            tail += "。主模型没认出来，这条是降级模型的结果"
+        await self._deliver(
+            stream_id,
+            f"用户刚发的图片里认出一个公式：{name}，LaTeX 是 {latex}{note}。"
+            "用一句话告诉 TA 认出来了，如果没把握就说明需要 TA 确认。",
+            reason="formula_recognized",
+            fixed_text=f"🧮 认出公式：{name}{note}\n　{latex}{tail}",
+        )
+
     def _save_inbox_image(self, course: str, data: bytes, suffix: str) -> str:
         """管道写原图到笔记库目录（相对 <course>/ 的路径）。"""
         if self._notes is None or not data:
@@ -2967,9 +3094,20 @@ class ClassSchedulePlugin(MaiBotPlugin):
             return ""
 
     async def _persist_inbox_note(
-        self, course: str, kind: str, text: str, images: list, message_id: str, source: str
+        self,
+        course: str,
+        kind: str,
+        text: str,
+        images: list,
+        message_id: str,
+        source: str,
+        stream_id: str = "",
     ) -> None:
-        """把一条收纳同时写进 SQLite 笔记库（v1.4 markdown 层保持不变）。"""
+        """把一条收纳同时写进 SQLite 笔记库（v1.4 markdown 层保持不变）。
+
+        图片笔记会在这里排进识别队列（worker 异步做公式识别），所以要把
+        ``stream_id`` 带下去——识别结果要回到用户所在的会话。
+        """
         if self._pipeline is None or self._notes_db is None:
             return
         if text and self._inbox_dedup.should_skip(text):
@@ -2982,17 +3120,13 @@ class ClassSchedulePlugin(MaiBotPlugin):
         )
         source_type = "图片" if images else "文字"
         try:
-            note_id = await self._pipeline.process(
-                parsed, course=course, source_type=source_type
+            await self._pipeline.process(
+                parsed,
+                course=course,
+                source_type=source_type,
+                kind=kind,
+                stream_id=stream_id,
             )
-            if kind:
-                await asyncio.to_thread(
-                    self._notes_db.attach_tag, "note", note_id, f"#{kind}"
-                )
-            if kind:
-                await asyncio.to_thread(
-                    self._notes_db.attach_tag, "note", note_id, f"#{kind}"
-                )
         except Exception as exc:
             # 笔记库是增强层：坏了绝不影响 v1.4 的收纳与回执
             self.ctx.logger.warning(f"{LOG_PREFIX} 笔记库落库失败（已忽略）: {exc}")
@@ -3201,7 +3335,7 @@ class ClassSchedulePlugin(MaiBotPlugin):
             return
 
         await self._persist_inbox_note(
-            course_name, kind, text, images, "", source
+            course_name, kind, text, images, "", source, stream_id
         )
         count = notes.count(course_name)
         window_part = (
