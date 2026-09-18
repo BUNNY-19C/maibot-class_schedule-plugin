@@ -138,6 +138,71 @@ class PersistEndToEnd(unittest.IsolatedAsyncioTestCase):
 class RecognitionEndToEnd(unittest.IsolatedAsyncioTestCase):
     """图片笔记 → 落库 → worker 识别 → 公式库 + 回执（真队列，真线程）。"""
 
+    async def _capture_one_image(self, reply: str = _FORMULA_REPLY, image: bytes = _PNG):
+        """搭一套装好识别器的插件，发一张带「记一下」的图，返回 (plugin, db, fake)。"""
+        import shutil
+        import tempfile as _tf
+
+        from class_schedule.plugin import ClassSchedulePlugin
+        from class_schedule.store import PluginState
+        from class_schedule.study_notes import StudyNoteStore
+
+        tmp_path = Path(_tf.mkdtemp(prefix="inbox3-"))
+        self.addCleanup(shutil.rmtree, tmp_path, True)
+
+        plugin = ClassSchedulePlugin()
+        plugin._set_context(smoke.FakeCtx(tmp_path))  # type: ignore[arg-type]
+        plugin.set_plugin_config(
+            {"plugin": {"config_version": "1.0.0", "enabled": True},
+             "reply": {"style": "fixed", "ack_style": "fixed"},
+             "access": {"chat_scope": "private"}}
+        )
+        plugin._data_dir = tmp_path
+        plugin._notes = StudyNoteStore(tmp_path / "notes")
+        plugin._state = PluginState()
+        db = NotesDatabase(tmp_path / "notes.db")
+        db.initialize()
+        self.addCleanup(db.close)
+        plugin._notes_db = db
+
+        class FakeVision:
+            def __init__(self):
+                self.calls = 0
+
+            async def vision(self, **kwargs):
+                self.calls += 1
+                return {"text": reply, "prompt_tokens": 0, "completion_tokens": 0}
+
+        fake = FakeVision()
+        plugin._recognizer = FormulaRecognizer(
+            db=db, client=fake, model="vlm-primary", fallback_model="vlm-fallback"
+        )
+        plugin._pipeline = StudyPipeline(
+            db=db,
+            save_image=plugin._save_inbox_image,
+            recognizer=plugin._recognizer,
+            on_recognized=plugin._on_formula_recognized,
+            queue_size=8,
+        )
+        plugin._pipeline.start()
+        self.addAsyncCleanup(plugin._pipeline.stop)
+
+        await plugin.handle_note_capture(
+            message={
+                "session_id": "ps",
+                "message_info": {"user_info": {"user_id": "654321"}},
+                "raw_message": [
+                    {"type": "text", "data": {"text": "记一下 这张课件"}},
+                    {"type": "image", "data": {},
+                     "binary_data_base64": base64.b64encode(image).decode()},
+                ],
+            },
+            stream_id="ps",
+        )
+        for task in list(plugin._note_tasks):
+            await task
+        return plugin, db, fake
+
     async def test_image_note_recognized_by_worker(self):
         import shutil
         import tempfile as _tf
@@ -248,10 +313,43 @@ class RecognitionEndToEnd(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(db.formula_count(), 1)
         # 回归（线上实测）：命中缓存的图也必须回话——重发同一批课件图时一片安静，
         # 用户只会以为功能坏了（他回的原话是"不行"）
-        texts = [text for _stream, text in plugin.ctx.send.texts]  # type: ignore[attr-defined]
         self.assertTrue(
-            any("之前认过" in text and "半角公式" in text for text in texts), texts
+            await _wait_until(
+                lambda: any(
+                    "之前认过" in text and "半角公式" in text
+                    for _stream, text in plugin.ctx.send.texts  # type: ignore[attr-defined]
+                )
+            ),
+            [t for _s, t in plugin.ctx.send.texts],  # type: ignore[attr-defined]
         )
+
+    async def test_formula_is_written_into_the_note(self):
+        """公式要落到笔记里：/笔记、/找 与笔记文件看到的得是公式，不是图说。"""
+        plugin, db, fake = await self._capture_one_image()
+        notes = plugin._notes
+        target = notes.recent("未分类", limit=1)[0]
+        self.assertTrue(
+            await _wait_until(lambda: bool(notes.recent("未分类", limit=1)[0].formula))
+        )
+        target = notes.recent("未分类", limit=1)[0]
+        self.assertIn("半角公式", target.formula)
+        self.assertIn("\\frac{\\pi}2", target.formula)
+        # 列表里显示公式而不是"这是一张课件"的图说
+        self.assertIn("半角公式", target.display)
+        # 搜得到
+        self.assertTrue(notes.search("半角公式"))
+        self.assertTrue(notes.search("\\frac{\\pi}2"))
+        # 笔记目录里有一份可读的 .md，正文就是公式
+        body = (notes.course_dir("未分类") / f"{target.id}_{target.kind}.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("半角公式", body)
+        self.assertIn("\\frac{\\pi}2", body)
+        # /笔记 与 /找 展示的是用户真正收到的那条消息
+        await plugin.handle_notes(**smoke.private_kwargs("ps"), matched_groups={"course": "未分类"})
+        self.assertIn("半角公式", plugin.ctx.send.texts[-1][1])  # type: ignore[attr-defined]
+        await plugin.handle_note_search(**smoke.private_kwargs("ps"), matched_groups={"keyword": "半角"})
+        self.assertIn("半角公式", plugin.ctx.send.texts[-1][1])  # type: ignore[attr-defined]
 
     async def test_explicit_image_reports_failure_instead_of_silence(self):
         """用户主动发的图识别失败也要有回应：静默失败最难排查。"""

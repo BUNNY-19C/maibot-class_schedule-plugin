@@ -1500,6 +1500,7 @@ class ClassSchedulePlugin(MaiBotPlugin):
         reason: str,
         fixed_text: str = "",
         persona_text: str | None = None,
+        attach_fixed: bool = False,
     ) -> bool:
         """把一条内容送到某个会话，按用途选择交给 replyer 还是模板直发。
 
@@ -1507,9 +1508,13 @@ class ClassSchedulePlugin(MaiBotPlugin):
             facts: **给模型**的内容（事实 + 要怎么说的要求），persona 模式用这段。
             fixed_text: **给用户看**的最终文案，直发模式用这段；留空则退回 ``facts``
                 （提醒的模板文案两者合一，所以不必传）。
-            reason: 决定用哪个风格设置：提醒走 ``reply.style``，其余走 ``reply.ack_style``。
+            reason: 决定用哪个风格设置：提醒走 ``reply.style``，其余走 ``ack_style``。
             persona_text: 调用方预先算好的拟人文案。``None`` = 没预算，这里现算；
                 空串 = 已经算过但失败了，别再算一次（多会话时避免重复请求模型）。
+            attach_fixed: persona 模式下把 ``fixed_text`` **原样附在拟人文案后面**。
+                用于"里面的数据一个字都不能改"的内容——公式、LaTeX、失败原因。
+                实测踩过：宿主的模型把回执概括成"公式没错，和之前一样"，
+                公式本身一个字都没到用户手上（用户原话"不是文字描述"）。
 
         默认两种模式都直发：实测发现 persona 只保证"任务已入队"，麦麦规划完
         **可能不真的开口**且不报错，而提示语、回执、提醒都要求必定送达。
@@ -1521,6 +1526,9 @@ class ClassSchedulePlugin(MaiBotPlugin):
             # 让模型按宿主人设说一句，再直发：有风格且必定送达
             text = persona_text if persona_text is not None else await self._persona_say(facts)
             if text:
+                if attach_fixed and fixed_text:
+                    # 拟人一句 + 数据原文：既有人味，又保证公式/原因不被概括掉
+                    return await self._send_text(stream_id, f"{text}\n{fixed_text}")
                 return await self._send_text(stream_id, text)
             self.ctx.logger.info(
                 f"{LOG_PREFIX} 拟人文案生成失败，改用固定文案（reason={reason}）"
@@ -2104,8 +2112,8 @@ class ClassSchedulePlugin(MaiBotPlugin):
         for note in notes.recent(target, limit=10):
             stamp = note.created_at[5:16].replace("T", " ") if note.created_at else ""
             head = f"{stamp} [{note.kind}]"
-            body = note.text or ""
-            lines.append(f"　{head} {one_line(body, 40)}" if body else f"　{head} 🖼 图片")
+            body = note.display  # 有公式就显示公式：用户要的是公式，不是图说
+            lines.append(f"　{head} {one_line(body, 60)}" if body else f"　{head} 🖼 图片")
             if note.file and note.file.startswith("img/"):
                 lines[-1] += "（含图片）"
         message = "\n".join(lines)
@@ -2225,7 +2233,7 @@ class ClassSchedulePlugin(MaiBotPlugin):
                 stamp = note.created_at[5:16].replace("T", " ") if note.created_at else ""
                 lines.append(
                     f"　{note.course} [{note.kind}] {stamp} "
-                    f"{one_line(note.text or '🖼 图片', 30)}"
+                    f"{one_line(note.display or '🖼 图片', 60)}"
                 )
             message = "\n".join(lines)
         await self._reply(stream_id, message)
@@ -3147,7 +3155,7 @@ class ClassSchedulePlugin(MaiBotPlugin):
             self.ctx.logger.warning(f"{LOG_PREFIX} 补识别扫描图片失败: {exc}")
             return
         queued = skipped = 0
-        for course, path in files:
+        for course, path, note_ref in files:
             try:
                 data = await asyncio.to_thread(path.read_bytes)
             except OSError:
@@ -3156,16 +3164,25 @@ class ClassSchedulePlugin(MaiBotPlugin):
             if not digest:
                 continue
             try:
-                if await asyncio.to_thread(db.formula_by_image_hash, digest) is not None:
-                    skipped += 1  # 认过了
-                    continue
+                known = await asyncio.to_thread(db.formula_by_image_hash, digest)
             except Exception:
-                pass  # 查不出就当没认过，大不了多认一次（有指纹去重兜底）
+                known = None  # 查不出就当没认过，大不了多认一次（有指纹去重兜底）
+            if known is not None:
+                skipped += 1
+                # 认过的图也要把公式补写进笔记：本功能上线前认的图，公式只在库里，
+                # /笔记 与 /找 看不到（用户正是因此说"不是完整的公式"）
+                await self._attach_formula_to_note(
+                    {"course": course, "note_ref": note_ref},
+                    str(known["name"] or ""),
+                    str(known["latex_normalized"] or known["latex_raw"] or ""),
+                )
+                continue
             if self._recognizer.has_given_up(digest):
                 skipped += 1  # 自动试满次数，别再来一遍
                 continue
             if self._pipeline.enqueue({
                 "note_id": 0,
+                "note_ref": note_ref,
                 "image": data,
                 "suffix": path.suffix or ".png",
                 "course": course,
@@ -3185,17 +3202,20 @@ class ClassSchedulePlugin(MaiBotPlugin):
                 f" {skipped} 张"
             )
 
-    def _note_image_files(self) -> list[tuple[str, Path]]:
-        """笔记目录下所有可识别的图片 → [(课程名, 文件路径)]，新图在前。
+    def _note_image_files(self) -> list[tuple[str, Path, str]]:
+        """笔记目录下所有可识别的图片 → [(课程名, 文件路径, markdown 笔记 id)]，新图在前。
 
         直接扫磁盘而不是扫数据库：markdown 层的 `notes/<课程>/img/` 才是图片的
         原始层，比 SQLite 里的笔记行更全（SQLite 是后来才上线的，早先的图片
         只有文件没有行）。扫盘也是这条能力"不需要用户操作"的前提。
+
+        笔记 id 直接从文件名取：落盘时就是 ``img/<笔记 id><后缀>``，所以不用反查
+        索引就能把识别结果写回正确的那条笔记。
         """
         notes = self._notes
         if notes is None or not notes.root.exists():
             return []
-        found: list[tuple[str, Path]] = []
+        found: list[tuple[str, Path, str]] = []
         for course_dir in notes.root.iterdir():
             if not course_dir.is_dir():
                 continue
@@ -3204,7 +3224,7 @@ class ClassSchedulePlugin(MaiBotPlugin):
                 continue
             for path in image_dir.iterdir():
                 if path.is_file() and path.suffix.lower() in NOTE_IMAGE_SUFFIXES:
-                    found.append((course_dir.name, path))
+                    found.append((course_dir.name, path, path.stem))
         # 新图优先：用户刚发的课件最可能还没识别
         found.sort(key=lambda item: item[1].stat().st_mtime, reverse=True)
         return found
@@ -3225,12 +3245,21 @@ class ClassSchedulePlugin(MaiBotPlugin):
         这正是"查得到"该有的样子。
         """
         stream_id = str(job.get("stream_id") or "").strip()
-        if not stream_id:
-            return  # 补识别不回执：它是补历史，不是用户这次的操作
         course = str(job.get("course") or "")
         where = f"（归入「{course}」）" if course and course != "未分类" else ""
+        failed = str(result.get("status") or "") == "failed"
+        name = str(result.get("name") or "") or "未知公式"
+        latex = str(result.get("latex_normalized") or result.get("latex") or "")
 
-        if str(result.get("status") or "") == "failed":
+        # 先把公式写进笔记（**补识别也要写**）：/笔记、/找 与笔记文件读的是那一层。
+        # 这一步必须在 stream_id 判断之前，否则补识别认出来的公式进不了笔记。
+        if not failed and latex:
+            await self._attach_formula_to_note(job, name, latex)
+
+        if not stream_id:
+            return  # 补识别不回执：它是补历史，不是用户这次的操作
+
+        if failed:
             reason = one_line(str(result.get("error") or "模型没给出可用结果"), 60)
             await self._deliver(
                 stream_id,
@@ -3238,6 +3267,7 @@ class ClassSchedulePlugin(MaiBotPlugin):
                 "用一句话告诉 TA 这张图没认出公式、原图已经存好了。",
                 reason="formula_recognized",
                 fixed_text=f"🧮 这张图没认出公式{where}\n　{reason}",
+                attach_fixed=True,  # 失败原因也不能被概括掉
             )
             return
 
@@ -3252,14 +3282,38 @@ class ClassSchedulePlugin(MaiBotPlugin):
             tail = "。我对它没把握，已标 #待确认，你可以用 /找 核对一下"
         if result.get("degraded"):
             tail += "。主模型没认出来，这条是降级模型的结果"
+        # 公式写进笔记：/笔记、/找 与笔记文件里都能看到它，而不是只有一句图说
+        await self._attach_formula_to_note(job, name, latex)
+
         await self._deliver(
             stream_id,
             f"用户刚发的图片里的公式：{name}，LaTeX 是 {latex}{where}。"
             + ("这是之前已经认过的同一条公式。" if not result.get("created") else "")
-            + "用一句话告诉 TA，如果没把握就说明需要 TA 确认。",
+            + "用一句话告诉 TA，如果没把握就说明需要 TA 确认。"
+            "注意：公式本身会原样附在你说的话后面，你不必复述它。",
             reason="formula_recognized",
             fixed_text=f"🧮 {headline}{where}\n　{latex}{tail}",
+            attach_fixed=True,  # 公式必须原样送达：宿主的模型会把它概括掉
         )
+
+    async def _attach_formula_to_note(
+        self, job: dict[str, Any], name: str, latex: str
+    ) -> None:
+        """把识别到的公式写进对应的 markdown 笔记（索引 + 可读文件）。"""
+        notes = self._notes
+        note_ref = str(job.get("note_ref") or "").strip()
+        if notes is None or not note_ref or not latex:
+            return
+        try:
+            await asyncio.to_thread(
+                notes.attach_formula,
+                str(job.get("course") or "未分类"),
+                note_ref,
+                f"{name}：{latex}" if name else latex,
+            )
+        except Exception as exc:
+            # 写笔记失败不影响识别结果本身（公式已在库里，回执照发）
+            self.ctx.logger.warning(f"{LOG_PREFIX} 公式写入笔记失败（已忽略）: {exc}")
 
     def _save_inbox_image(self, course: str, data: bytes, suffix: str) -> str:
         """管道写原图到笔记库目录（相对 <course>/ 的路径）。"""
@@ -3279,11 +3333,13 @@ class ClassSchedulePlugin(MaiBotPlugin):
         message_id: str,
         source: str,
         stream_id: str = "",
+        markdown_ids: list[str] | None = None,
     ) -> None:
         """把一条收纳同时写进 SQLite 笔记库（v1.4 markdown 层保持不变）。
 
         图片笔记会在这里排进识别队列（worker 异步做公式识别），所以要把
-        ``stream_id`` 带下去——识别结果要回到用户所在的会话。
+        ``stream_id`` 与 ``markdown_ids`` 带下去：识别结果要回到用户所在的会话，
+        公式还要回填到对应的那条 markdown 笔记里（/笔记、/找 看的是那一层）。
         """
         if self._pipeline is None or self._notes_db is None:
             return
@@ -3306,6 +3362,7 @@ class ClassSchedulePlugin(MaiBotPlugin):
                 source_type=source_type,
                 kind=kind,
                 stream_id=stream_id,
+                note_refs=list(markdown_ids or []),
             )
         except Exception as exc:
             # 笔记库是增强层：坏了绝不影响 v1.4 的收纳与回执
@@ -3481,18 +3538,23 @@ class ClassSchedulePlugin(MaiBotPlugin):
 
         try:
             saved = 0
+            #: markdown 层每条图片笔记的 id，按图片顺序记下来：识别完成后要把公式
+            #: 回填到对应的那条（SQLite 只存第一张的路径，不能靠它反查）
+            markdown_ids: list[str] = []
             if images:
                 # 每张图一条笔记；描述文本（视觉管道生成的说明）作为第一张的
                 # 说明文字保留——可检索，但**原图才是笔记本体**，公式在图里
                 caption = text[:1000]
                 for data, suffix in images:
-                    notes.add_image_note(
+                    created_note = notes.add_image_note(
                         course_name, kind, data, suffix=suffix,
                         text=caption if saved == 0 else "", source=source,
                     )
+                    markdown_ids.append(created_note.id)
                     saved += 1
             elif text:
-                notes.add_text_note(course_name, kind, text, source=source)
+                created_text = notes.add_text_note(course_name, kind, text, source=source)
+                markdown_ids.append(created_text.id)
                 saved = 1
             else:
                 await self._deliver(
@@ -3515,7 +3577,7 @@ class ClassSchedulePlugin(MaiBotPlugin):
             return
 
         await self._persist_inbox_note(
-            course_name, kind, text, images, "", source, stream_id
+            course_name, kind, text, images, "", source, stream_id, markdown_ids
         )
         count = notes.count(course_name)
         window_part = (

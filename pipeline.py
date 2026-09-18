@@ -129,8 +129,13 @@ class StudyPipeline:
         source_type: str = "文字",
         kind: str = "",
         stream_id: str = "",
+        note_refs: list[str] | None = None,
     ) -> int:
-        """落一条笔记（同步）+ 把公式识别排进队列（异步）。返回 note id。"""
+        """落一条笔记（同步）+ 把公式识别排进队列（异步）。返回 note id。
+
+        ``note_refs`` 是 markdown 层每条笔记的 id（与 ``parsed.images`` 同序）：
+        识别完成后公式要回填到那一条，用户才在 /笔记、/找 里看得到公式本身。
+        """
         raw = (parsed.text or "").strip()
         image_rel = ""
         if parsed.images and self._save_image is not None:
@@ -153,11 +158,13 @@ class StudyPipeline:
         if kind:
             await asyncio.to_thread(self._db.attach_tag, "note", note_id, f"#{kind}")
         # 识别在队列里做：每一张图一条任务（落库只留第一张的路径，识别要全覆盖）
-        for data, suffix in parsed.images:
+        refs = list(note_refs or [])
+        for index, (data, suffix) in enumerate(parsed.images):
             if data:
                 self.enqueue(
                     {
                         "note_id": note_id,
+                        "note_ref": refs[index] if index < len(refs) else "",
                         "image": data,
                         "suffix": suffix or ".png",
                         "course": course,

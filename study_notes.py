@@ -64,6 +64,9 @@ class StudyNote:
     file: str = ""  # 相对课程目录的文件路径（文本或图片）
     created_at: str = ""
     source: str = ""  # 来源说明（聊天消息/手动）
+    #: 识别到的公式（"名称：LaTeX"），图片笔记在识别完成后回填。
+    #: 写在索引里而不是只留在 SQLite：/笔记、/找 与笔记文件读的都是这一层。
+    formula: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -73,7 +76,13 @@ class StudyNote:
             "file": self.file,
             "created_at": self.created_at,
             "source": self.source,
+            "formula": self.formula,
         }
+
+    @property
+    def display(self) -> str:
+        """列表里给这一条显示什么：有公式就显示公式，其次才是说明文字。"""
+        return self.formula or self.text
 
 
 @dataclass
@@ -128,6 +137,7 @@ class StudyNoteStore:
                     file=str(item.get("file") or ""),
                     created_at=str(item.get("created_at") or ""),
                     source=str(item.get("source") or ""),
+                    formula=str(item.get("formula") or ""),
                 )
             )
         return _CourseIndex(notes=notes)
@@ -207,6 +217,37 @@ class StudyNoteStore:
         index.notes.append(note)
         self._write_index(course_dir, index)
 
+    def attach_formula(
+        self, course: str, note_id: str, formula: str
+    ) -> StudyNote | None:
+        """把识别到的公式回填到某条笔记：索引 + 一个可读的 .md。
+
+        图片笔记原本只有一张图（``file`` 指向 ``img/…``），没有任何可读正文，
+        于是"翻笔记"翻到的只是一句图说。识别出公式后在这里补一份
+        ``<id>_<kind>.md``，让公式本身成为这条笔记的内容。
+
+        同一公式重复回填不重复追加（幂等）；笔记已被删掉则返回 ``None``。
+        """
+        text = str(formula or "").strip()[:MAX_NOTE_CHARS]
+        if not text:
+            return None
+        course_dir = self.course_dir(course)
+        index = self._load_index(course_dir)
+        target = next((item for item in index.notes if item.id == note_id), None)
+        if target is None:
+            return None
+        if text in (target.formula or ""):
+            return target  # 已经回填过，别重复写盘
+        target.formula = text
+        self._write_index(course_dir, index)
+        body = [f"# {course_folder_name(course)} · {target.kind}", "", text]
+        if target.text:
+            body += ["", "## 图片说明", "", target.text]
+        if target.file and not target.file.endswith(".md"):
+            body += ["", f"原图：{target.file}"]
+        _atomic_write(course_dir / f"{target.id}_{target.kind}.md", "\n".join(body) + "\n")
+        return target
+
     # ── 查询 ──────────────────────────────────────────────
 
     def courses(self) -> list[str]:
@@ -228,14 +269,19 @@ class StudyNoteStore:
         return len(self._load_index(self.course_dir(course)).notes)
 
     def search(self, keyword: str, *, limit: int = 10) -> list[StudyNote]:
-        """跨课程按关键词搜笔记内容（大小写不敏感的包含匹配）。"""
+        """跨课程按关键词搜笔记内容（大小写不敏感的包含匹配）。
+
+        公式也算内容：用户搜「许用应力」时，图片笔记要靠识别出的公式命中，
+        而不是靠那句"这是一张课件幻灯片"的图说。
+        """
         needle = str(keyword or "").strip().lower()
         if not needle:
             return []
         hits: list[StudyNote] = []
         for course in self.courses():
             for note in reversed(self._load_index(self.course_dir(course)).notes):
-                if needle in note.text.lower() or needle in note.course.lower():
+                haystack = f"{note.text}\n{note.formula}\n{note.course}".lower()
+                if needle in haystack:
                     hits.append(note)
                     if len(hits) >= limit:
                         return hits

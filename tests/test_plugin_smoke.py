@@ -4520,6 +4520,70 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await plugin.on_unload()
 
+    async def test_backfill_writes_formula_into_existing_notes(self):
+        """回归（线上实测）：补识别要把"已认过、但笔记里没公式"的图补写进笔记。
+
+        用户的库正是这个状态：公式在 SQLite 里，`/笔记` 与 `笔记文件` 里只有一句
+        图说，所以他回"不是完整的公式，是文字描述"。
+        """
+        from class_schedule.formula import FormulaRecognizer, image_hash
+        from class_schedule.notes_db import NotesDatabase as _Db
+
+        import shutil
+        import tempfile as _tf
+
+        # LIFO 清理：先注册目录删除（最后执行），再注册关库——Windows 上
+        # 文件被连接占用时 rmtree 会失败
+        root = Path(_tf.mkdtemp(prefix="backfill-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        if True:
+            store = StudyNoteStore(root / "notes")
+            image = b"\x89PNG-old-slide"
+            note = store.add_image_note("未分类", "笔记", image, text="这是一张课件幻灯片")
+            plugin = self.make_plugin(root, build_config(study={"api_key": "sk-test-key"}))
+            plugin._data_dir = root
+            plugin._notes = store
+            plugin._state = PluginState()
+            db = _Db(root / "notes.db")
+            db.initialize()
+            self.addCleanup(db.close)
+            plugin._notes_db = db
+            # 模拟"之前已经认过、只是没写进笔记"
+            db.upsert_formula({
+                "fingerprint": "old-fp",
+                "name": "许用应力公式",
+                "latex_raw": r"\frac{\sigma_{\lim}}{S_{\sigma}}",
+                "latex_normalized": r"\frac{\sigma_{\lim}}{S_{\sigma}}",
+                "image_hash": image_hash(image),
+            })
+
+            class NoCall:
+                async def vision(self, **kwargs):
+                    raise AssertionError("已认过的图不该再调模型")
+
+            plugin._recognizer = FormulaRecognizer(db=db, client=NoCall(), model="vlm")
+            from class_schedule.pipeline import StudyPipeline
+
+            plugin._pipeline = StudyPipeline(
+                db=db,
+                save_image=plugin._save_inbox_image,
+                recognizer=plugin._recognizer,
+                on_recognized=plugin._on_formula_recognized,
+            )
+            plugin._pipeline.start()
+            self.addAsyncCleanup(plugin._pipeline.stop)
+
+            await plugin._run_formula_backfill()
+            refreshed = store.recent("未分类", limit=1)[0]
+            self.assertIn("许用应力公式", refreshed.formula)
+            self.assertIn(r"\frac{\sigma_{\lim}}{S_{\sigma}}", refreshed.formula)
+            self.assertIn("许用应力公式", refreshed.display)
+            self.assertTrue(store.search("许用应力"))
+            body = (
+                store.course_dir("未分类") / f"{note.id}_{note.kind}.md"
+            ).read_text(encoding="utf-8")
+            self.assertIn("许用应力公式", body)
+
     async def test_no_backfill_without_recognizer(self):
         """没配 Key 就不该有补识别任务（也不能报错）。"""
         with TemporaryDirectory() as tmp:
@@ -4535,6 +4599,55 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(plugin._notes_db.formula_count(), 0)
             finally:
                 await plugin.on_unload()
+
+    async def test_persona_receipt_keeps_formula_verbatim(self):
+        """回归（线上实测）：persona 模式下公式必须原样送达。
+
+        宿主的模型会把回执概括成"公式没错，和之前一样"，LaTeX 一个字都到不了
+        用户手上（用户原话："不是文字描述"）。带数据（公式、失败原因）的回执改用
+        attach_fixed：拟人一句 + 数据原文一起发。
+        """
+        with TemporaryDirectory() as tmp:
+            plugin = self.prepare_bare(
+                Path(tmp),
+                targets=(),
+                config=build_config(
+                    access={"chat_scope": "private"},
+                    reply={"style": "fixed", "ack_style": "persona"},
+                    study={"summary_enabled": False},
+                ),
+            )
+
+            async def fake_say(facts: str) -> str:
+                return "公式没错，和之前一样。"
+
+            plugin._persona_say = fake_say  # type: ignore[assignment]
+
+            await plugin._on_formula_recognized(
+                {"stream_id": "ps", "course": "材料力学", "note_ref": ""},
+                {
+                    "status": "recognized",
+                    "created": False,
+                    "name": "许用应力公式",
+                    "latex": r"\frac{\sigma_{\lim}}{S_{\sigma}}",
+                    "latex_normalized": r"\frac{\sigma_{\lim}}{S_{\sigma}}",
+                    "low_confidence": False,
+                    "degraded": False,
+                },
+            )
+            sent = plugin.ctx.send.texts[-1][1]  # type: ignore[attr-defined]
+            self.assertIn("公式没错，和之前一样。", sent)  # 人味还在
+            self.assertIn(r"\frac{\sigma_{\lim}}{S_{\sigma}}", sent)  # 公式也在
+            self.assertIn("许用应力公式", sent)
+            self.assertIn("材料力学", sent)
+
+            # 失败回执同理：原因不能被概括掉
+            await plugin._on_formula_recognized(
+                {"stream_id": "ps", "course": "", "note_ref": ""},
+                {"status": "failed", "error": "HTTP 503 模型繁忙", "created": False},
+            )
+            sent = plugin.ctx.send.texts[-1][1]  # type: ignore[attr-defined]
+            self.assertIn("HTTP 503 模型繁忙", sent)
 
     async def test_config_update_enables_recognition_without_restart(self):
         """回归（线上实测）：Key 是后来在 WebUI 填的，热更新必须重建识别器。
