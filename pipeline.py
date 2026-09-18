@@ -17,13 +17,24 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from contextlib import suppress
 from typing import Any, Awaitable, Callable
 
+from .constants import LOG_PREFIX
 from .inbox import ParsedMessage, normalize_image_segment  # noqa: F401  (供上层判型)
+
+logger = logging.getLogger(__name__)
 
 #: 与 config.study.queue_size 默认值一致；外部没传时用这个
 DEFAULT_QUEUE_SIZE = 200
+
+#: 日志里给识别状态用的中文名（日志是异步链路唯一的现场）
+_STATUS_LABELS = {
+    "recognized": "完成",
+    "cached": "命中图片缓存",
+    "failed": "失败",
+}
 
 
 class StudyPipeline:
@@ -208,6 +219,15 @@ class StudyPipeline:
             period=str(job.get("period") or ""),
             message_id=str(job.get("message_id") or ""),
         )
+        # 每条结果都留一行日志：识别是异步的，没有日志就只剩"用户觉得没反应"
+        # （线上实测：缓存命中的图被静默处理，排查时无从下手）
+        logger.info(
+            f"{LOG_PREFIX} 识别{_STATUS_LABELS.get(str(result.get('status')), '结束')}："
+            f"{result.get('name') or '未认出'}｜课程 {job.get('course') or '未分类'}"
+            f"｜note={job.get('note_id')}"
+            + (f"｜{result.get('error')}" if result.get("status") == "failed" else "")
+        )
         hook = self._on_recognized
-        if hook is not None and str(result.get("status") or "") != "failed":
+        if hook is not None:
+            # 失败也回调：用户主动发的图静默失败，比认错更让人摸不着头脑
             await hook(job, result)

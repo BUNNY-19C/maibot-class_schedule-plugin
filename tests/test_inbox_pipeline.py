@@ -246,6 +246,84 @@ class RecognitionEndToEnd(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await _wait_until(lambda: plugin._recognizer.cached_count >= 1))
         self.assertEqual(client.calls, 1)
         self.assertEqual(db.formula_count(), 1)
+        # 回归（线上实测）：命中缓存的图也必须回话——重发同一批课件图时一片安静，
+        # 用户只会以为功能坏了（他回的原话是"不行"）
+        texts = [text for _stream, text in plugin.ctx.send.texts]  # type: ignore[attr-defined]
+        self.assertTrue(
+            any("之前认过" in text and "半角公式" in text for text in texts), texts
+        )
+
+    async def test_explicit_image_reports_failure_instead_of_silence(self):
+        """用户主动发的图识别失败也要有回应：静默失败最难排查。"""
+        import shutil
+        import tempfile as _tf
+
+        from class_schedule.llm_client import CloudError
+
+        from class_schedule.plugin import ClassSchedulePlugin
+        from class_schedule.store import PluginState
+        from class_schedule.study_notes import StudyNoteStore
+
+        tmp_path = Path(_tf.mkdtemp(prefix="inbox3f-"))
+        self.addCleanup(shutil.rmtree, tmp_path, True)
+
+        plugin = ClassSchedulePlugin()
+        plugin._set_context(smoke.FakeCtx(tmp_path))  # type: ignore[arg-type]
+        plugin.set_plugin_config(
+            {"plugin": {"config_version": "1.0.0", "enabled": True},
+             "reply": {"style": "fixed", "ack_style": "fixed"},
+             "access": {"chat_scope": "private"}}
+        )
+        plugin._data_dir = tmp_path
+        plugin._notes = StudyNoteStore(tmp_path / "notes")
+        plugin._state = PluginState()
+        db = NotesDatabase(tmp_path / "notes.db")
+        db.initialize()
+        self.addCleanup(db.close)
+        plugin._notes_db = db
+
+        class AlwaysFails:
+            async def vision(self, **kwargs):
+                raise CloudError("HTTP 503 模型繁忙")
+
+        plugin._recognizer = FormulaRecognizer(
+            db=db, client=AlwaysFails(), model="vlm", fallback_model=""
+        )
+        plugin._pipeline = StudyPipeline(
+            db=db,
+            save_image=plugin._save_inbox_image,
+            recognizer=plugin._recognizer,
+            on_recognized=plugin._on_formula_recognized,
+            queue_size=4,
+        )
+        plugin._pipeline.start()
+        self.addAsyncCleanup(plugin._pipeline.stop)
+
+        await plugin.handle_note_capture(
+            message={
+                "session_id": "ps",
+                "message_info": {"user_info": {"user_id": "654321"}},
+                "raw_message": [
+                    {"type": "text", "data": {"text": "记一下 这张没公式"}},
+                    {"type": "image", "data": {},
+                     "binary_data_base64": base64.b64encode(b"\x89PNGno-formula").decode()},
+                ],
+            },
+            stream_id="ps",
+        )
+        for task in list(plugin._note_tasks):
+            await task
+        sent = list(plugin.ctx.send.texts)  # type: ignore[attr-defined]
+
+        def said(message: str) -> bool:
+            return any(message in text for _stream, text in plugin.ctx.send.texts)  # type: ignore[attr-defined]
+
+        # 等的是"用户看得见的那句话"，不是内部计数：回执是 worker 在识别之后发的
+        self.assertTrue(await _wait_until(lambda: said("没认出公式")), sent)
+        self.assertGreaterEqual(plugin._recognizer.failed_count, 1)
+        self.assertEqual(db.formula_count(), 0)
+        # 失败按图片 hash 记了数，自动补识别才知道该不该再试
+        self.assertEqual(db.formula_failure_count(), 1)
 
 
 class ImageBytesRoundTrip(unittest.TestCase):

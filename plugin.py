@@ -3214,19 +3214,39 @@ class ClassSchedulePlugin(MaiBotPlugin):
     ) -> None:
         """公式识别完成后的回执。
 
-        只在**新公式**时说话：同一公式（指纹相同）之前存过就不再通知，
-        否则每次重发同一张图都会刷一条消息。识别失败由 /笔记库 的计数体现，
-        不当场打扰用户——原图已经收好了。
+        **用户主动发的图一定会听到回应**，三种情形都说：
+
+        - 认出新公式；
+        - 这张图之前认过（命中图片 hash 缓存）——也必须说：同一批课件图重发时
+          一片安静，用户只会以为功能坏了（线上实测踩过，用户回"不行"）；
+        - 没认出来（含图里本来没有公式）——失败静默最不可排查。
+
+        补识别（补历史图片）不带会话，因此不会刷屏。同一张图重发会再收到一次公式，
+        这正是"查得到"该有的样子。
         """
-        if not result.get("created"):
-            return
         stream_id = str(job.get("stream_id") or "").strip()
         if not stream_id:
+            return  # 补识别不回执：它是补历史，不是用户这次的操作
+        course = str(job.get("course") or "")
+        where = f"（归入「{course}」）" if course and course != "未分类" else ""
+
+        if str(result.get("status") or "") == "failed":
+            reason = one_line(str(result.get("error") or "模型没给出可用结果"), 60)
+            await self._deliver(
+                stream_id,
+                f"用户刚发的图片没能识别出公式，原因是：{reason}。"
+                "用一句话告诉 TA 这张图没认出公式、原图已经存好了。",
+                reason="formula_recognized",
+                fixed_text=f"🧮 这张图没认出公式{where}\n　{reason}",
+            )
             return
+
         name = str(result.get("name") or "") or "未知公式"
         latex = str(result.get("latex_normalized") or result.get("latex") or "")
-        course = str(job.get("course") or "")
-        note = f"（归入「{course}」）" if course and course != "未分类" else ""
+        if result.get("created"):
+            headline = f"认出公式：{name}"
+        else:
+            headline = f"这张图之前认过，公式是：{name}"
         tail = ""
         if result.get("low_confidence"):
             tail = "。我对它没把握，已标 #待确认，你可以用 /找 核对一下"
@@ -3234,10 +3254,11 @@ class ClassSchedulePlugin(MaiBotPlugin):
             tail += "。主模型没认出来，这条是降级模型的结果"
         await self._deliver(
             stream_id,
-            f"用户刚发的图片里认出一个公式：{name}，LaTeX 是 {latex}{note}。"
-            "用一句话告诉 TA 认出来了，如果没把握就说明需要 TA 确认。",
+            f"用户刚发的图片里的公式：{name}，LaTeX 是 {latex}{where}。"
+            + ("这是之前已经认过的同一条公式。" if not result.get("created") else "")
+            + "用一句话告诉 TA，如果没把握就说明需要 TA 确认。",
             reason="formula_recognized",
-            fixed_text=f"🧮 认出公式：{name}{note}\n　{latex}{tail}",
+            fixed_text=f"🧮 {headline}{where}\n　{latex}{tail}",
         )
 
     def _save_inbox_image(self, course: str, data: bytes, suffix: str) -> str:
