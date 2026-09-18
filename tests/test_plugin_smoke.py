@@ -4449,6 +4449,116 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await plugin.on_unload()
 
+    async def test_config_update_enables_recognition_without_restart(self):
+        """回归（线上实测）：Key 是后来在 WebUI 填的，热更新必须重建识别器。
+
+        只更新配置对象不重建识别器的话，填完 Key 发图也不会识别，日志里还停在
+        启动时那句"没配 Key"。
+        """
+        with TemporaryDirectory() as tmp:
+            plugin = self.make_plugin(Path(tmp), build_config(study={"api_key": ""}))
+            await plugin.on_load()
+            try:
+                self.assertIsNone(plugin._recognizer)
+                with self.assertLogs("test.class-schedule", level="INFO") as captured:
+                    await plugin.on_config_update(
+                        "self", build_config(study={"api_key": "sk-later-key"}), "1.0.1"
+                    )
+                self.assertIsNotNone(plugin._recognizer)
+                self.assertIs(plugin._pipeline.recognizer, plugin._recognizer)
+                self.assertTrue(
+                    any("公式识别已启用" in line for line in captured.output), captured.output
+                )
+                # /笔记库 也要跟着改口：不能再报"未启用"
+                self.assertNotIn("未启用", plugin._recognition_status_line())
+
+                # 反向：关掉云端开关后立刻停止识别，且管道不再收任务
+                await plugin.on_config_update(
+                    "self", build_config(study={"api_key": "sk-later-key", "cloud_enabled": False}), "1.0.2"
+                )
+                self.assertIsNone(plugin._recognizer)
+                self.assertIsNone(plugin._pipeline.recognizer)
+                self.assertFalse(plugin._pipeline.enqueue({"image": b"x"}))
+            finally:
+                await plugin.on_unload()
+
+    async def test_irrelevant_config_update_does_not_claim_recognition_change(self):
+        with TemporaryDirectory() as tmp:
+            plugin = self.make_plugin(Path(tmp), build_config(study={"api_key": ""}))
+            await plugin.on_load()
+            try:
+                with self.assertLogs("test.class-schedule", level="INFO") as captured:
+                    await plugin.on_config_update(
+                        "self", build_config(study={"api_key": "", "arm_minutes": 30}), "1.0.3"
+                    )
+                self.assertFalse(
+                    any("公式识别已启用" in line for line in captured.output), captured.output
+                )
+            finally:
+                await plugin.on_unload()
+
+    async def test_image_note_survives_caption_dedup(self):
+        """回归（线上实测）：同一张课件图重发要能再进一次识别，不能被文案去重挡掉。
+
+        图片的身份由内容 hash 判定（识别缓存），说明文字相同不代表是重复内容——
+        用户重发图想再识别一次时，若被文案去重挡住，SQLite 与识别都不会发生。
+        """
+        import shutil
+        import tempfile as _tf
+
+        from class_schedule.notes_db import NotesDatabase
+        from class_schedule.pipeline import StudyPipeline
+
+        # LIFO 清理：先注册目录删除（最后执行），再注册关库——Windows 上
+        # 文件被连接占用时 rmtree 会失败
+        tmp_path = Path(_tf.mkdtemp(prefix="cappedup-"))
+        self.addCleanup(shutil.rmtree, tmp_path, True)
+        if True:
+            plugin = self.prepare_bare(
+                tmp_path,
+                config=build_config(
+                    access={"chat_scope": "private"}, study={"summary_enabled": False}
+                ),
+            )
+            db = NotesDatabase(tmp_path / "notes.db")
+            db.initialize()
+            self.addCleanup(db.close)  # 后注册先跑：先关库再删目录
+            plugin._notes_db = db
+            plugin._pipeline = StudyPipeline(db=db, save_image=plugin._save_inbox_image)
+            plugin._pipeline.start()
+            self.addAsyncCleanup(plugin._pipeline.stop)
+
+            payload = base64.b64encode(b"\x89PNGx-caption-dedup").decode()
+            message = {
+                "session_id": "ps",
+                "message_info": {"user_info": {"user_id": "654321"}},
+                "raw_message": [
+                    {"type": "text", "data": {"text": "记一下 这张课件"}},
+                    {"type": "image", "data": {}, "binary_data_base64": payload},
+                ],
+            }
+            await plugin.handle_note_capture(message=message, stream_id="ps")
+            for task in list(plugin._note_tasks):
+                await task
+            await plugin.handle_note_capture(message=message, stream_id="ps")
+            for task in list(plugin._note_tasks):
+                await task
+            self.assertEqual(len(db.search_text("课件")), 2)
+
+            # 纯文本笔记仍然去重（老行为不变）
+            text_message = {
+                "session_id": "ps",
+                "message_info": {"user_info": {"user_id": "654321"}},
+                "raw_message": [{"type": "text", "data": {"text": "记一下 牛顿第二定律"}}],
+            }
+            await plugin.handle_note_capture(message=text_message, stream_id="ps")
+            for task in list(plugin._note_tasks):
+                await task
+            await plugin.handle_note_capture(message=text_message, stream_id="ps")
+            for task in list(plugin._note_tasks):
+                await task
+            self.assertEqual(len(db.search_text("牛顿第二定律")), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

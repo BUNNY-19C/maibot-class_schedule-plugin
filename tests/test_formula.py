@@ -494,6 +494,37 @@ class TestPipelineQueue(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pipeline.enqueued, 0)
         self.assertEqual(pipeline.queue_depth, 0)
 
+    async def test_set_recognizer_takes_effect_on_queued_jobs(self):
+        """配置热更新换识别器后，队列里排着的任务也要用新的那个（线上踩过的坑）。"""
+
+        class Counting:
+            def __init__(self):
+                self.seen: list[bytes] = []
+
+            async def recognize(self, image, **kwargs):
+                self.seen.append(image)
+                return {"status": "failed", "created": False}
+
+        old = Counting()
+        pipeline = StudyPipeline(db=self.db, recognizer=old, queue_size=8)
+        pipeline.start()
+        self.addAsyncCleanup(pipeline.stop)
+        self.assertEqual(pipeline.recognizer, old)
+
+        new = Counting()
+        pipeline.set_recognizer(new)  # 旧识别器还没跑过任何任务就被换掉
+        self.assertEqual(pipeline.recognizer, new)
+        pipeline.enqueue({"image": b"after-swap"})
+        for _ in range(200):
+            if new.seen:
+                break
+            await asyncio.sleep(0.005)
+        self.assertEqual(new.seen, [b"after-swap"])
+        self.assertEqual(old.seen, [])
+
+        pipeline.set_recognizer(None)  # 关掉后不再收任务
+        self.assertFalse(pipeline.enqueue({"image": b"nope"}))
+
 
 class TestNotesDbFormulaLookups(unittest.TestCase):
     def test_lookup_helpers(self):

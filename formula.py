@@ -483,6 +483,15 @@ class FormulaRecognizer:
 
     # ── 内部 ──────────────────────────────────────────────
 
+    @property
+    def signature(self) -> tuple[str, str, bool]:
+        """识别能力标识 ``(主模型, 降级模型, 图片缓存)``。
+
+        配置热更新后调用方拿它比一比，就知道"识别能力变没变"（只改了提前量这类
+        无关配置时不该刷日志），不必把 API Key 暴露出来比较。
+        """
+        return (self._model, self._fallback_model, self._cache_enabled)
+
     def _models(self) -> list[str]:
         models = [self._model] if self._model else []
         if self._fallback_model:

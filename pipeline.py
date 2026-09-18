@@ -61,6 +61,14 @@ class StudyPipeline:
     def recognizer(self) -> Any | None:
         return self._recognizer
 
+    def set_recognizer(self, recognizer: Any | None) -> None:
+        """换掉识别器（配置热更新用）。
+
+        worker 是**每个任务现读** ``self._recognizer`` 的，所以这里换掉之后，
+        队列里排着的与新来的任务都会用新的识别器；置 ``None`` 等于立刻停止识别。
+        """
+        self._recognizer = recognizer
+
     def start(self) -> None:
         """置运行标记并起 worker。必须在事件循环内调用（on_load 是 async）。"""
         self._started = True

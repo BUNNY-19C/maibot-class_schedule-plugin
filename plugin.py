@@ -550,11 +550,49 @@ class ClassSchedulePlugin(MaiBotPlugin):
         # 并清掉节流计时，好让数据源等改动能马上重新拉一次
         self._reload_holiday_cache()
         self._last_holiday_refresh = None
+        self._refresh_recognizer()
         self.ctx.logger.info(
             f"{LOG_PREFIX} 配置已更新（version={version}），"
             f"默认提前 {self._default_lead_minutes()} 分钟，"
             f"访问名单 {self._conf().access.mode}"
         )
+
+    def _refresh_recognizer(self) -> None:
+        """配置热更新后重建识别器，并换进正在跑的管道。
+
+        必须在热更新这里做一次：识别器是在 ``on_load`` 装配的，而 API Key 通常是
+        用户后来在 WebUI 里填的——只更新配置对象而不重建识别器，就会出现
+        "Key 明明填了、图片却一条公式都不认"（线上实测踩过：填完 Key 发图，
+        formulas 一直是 0，日志里还停在启动时那句"没配 Key"）。
+        """
+        if self._notes_db is None:
+            return
+        before = self._recognizer.signature if self._recognizer is not None else None
+        self._recognizer = self._build_recognizer(self._conf(), self._notes_db)
+        if self._pipeline is not None:
+            self._pipeline.set_recognizer(self._recognizer)
+        after = self._recognizer.signature if self._recognizer is not None else None
+        if before == after:
+            return  # 识别能力没变（例如只改了提前量），不必刷日志
+        if self._recognizer is None:
+            self.ctx.logger.info(
+                f"{LOG_PREFIX} 公式识别已停用：{self._cloud_off_reason()}"
+            )
+        else:
+            study = self._conf().study
+            self.ctx.logger.info(
+                f"{LOG_PREFIX} 公式识别已启用：模型 {study.vlm_model}"
+                f"（失败降级 {study.vlm_fallback_model or '无'}）"
+            )
+
+    def _cloud_off_reason(self) -> str:
+        """识别不可用的原因（给人看的短句，与启动告警同一套判断）。"""
+        study = self._conf().study
+        if not study.cloud_enabled:
+            return "study.cloud_enabled 已关闭"
+        if not str(study.api_key or "").strip():
+            return "没填 study.api_key"
+        return f"study.api_base_url（{study.api_base_url}）不是 https 地址"
 
     # ── 提醒主循环 ────────────────────────────────────────
 
@@ -3110,7 +3148,10 @@ class ClassSchedulePlugin(MaiBotPlugin):
         """
         if self._pipeline is None or self._notes_db is None:
             return
-        if text and self._inbox_dedup.should_skip(text):
+        # 文案去重只对**纯文本**笔记生效：图片的身份由内容 hash 判定（识别缓存与
+        # 公式指纹两层），拿"说明文字相同"去挡图片会误杀——用户重发同一张课件图
+        # 想再识别一次时，SQLite 层与识别都不会发生（线上实测踩过）。
+        if text and not images and self._inbox_dedup.should_skip(text):
             return  # 同一窗口内重复内容不再入笔记库
         parsed = ParsedMessage(
             text=text,
