@@ -371,6 +371,22 @@ class NotesDatabase:
                 )
             )
 
+    def get_note(self, note_id: int) -> sqlite3.Row | None:
+        with self._lock:
+            return self._connection().execute(
+                "SELECT * FROM notes WHERE id = ?", (int(note_id),)
+            ).fetchone()
+
+    def tags_for(self, note_id: int) -> list[str]:
+        """某条笔记的标签名列表（按置信度降序）。"""
+        with self._lock:
+            rows = self._connection().execute(
+                "SELECT t.name FROM note_tags nt JOIN tags t ON t.id = nt.tag_id"
+                " WHERE nt.note_id = ? ORDER BY nt.confidence DESC",
+                (int(note_id),),
+            ).fetchall()
+        return [str(row["name"]) for row in rows]
+
     def all_embeddings(self) -> list[tuple[int, list[float]]]:
         """全部向量（语义召回用；几千条量级直接内存算）。"""
         import array
