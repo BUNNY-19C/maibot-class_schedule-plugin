@@ -37,6 +37,10 @@ MAX_ALIASES = 6
 MAX_KNOWLEDGE_POINTS = 12
 #: 指纹长度：16 位十六进制（64 bit）在个人笔记量级不会有实际碰撞
 FINGERPRINT_LENGTH = 16
+#: 同一张图自动重试的上限。自动补识别不能无限烧钱：图里根本没有公式、
+#: 或模型反复答非所问时，试满这个次数就归为"这张图没救"，只留失败计数
+#: （用户主动重发不受这个上限约束——那是他的明确意图）。
+MAX_FAILED_ATTEMPTS = 2
 
 #: 识别结果里这些键在 SQLite 里是字符串列，统一成 str
 _TEXT_FIELDS = ("latex", "name", "category", "subcategory", "description")
@@ -568,7 +572,9 @@ class FormulaRecognizer:
             except Exception as exc:  # 客户端之外意外也要落成失败，别炸 worker
                 errors.append(f"{model}: {exc!r}")
         if parsed is None:
-            return self._failure("；".join(errors)[:300] or "识别失败")
+            result = self._failure("；".join(errors)[:300] or "识别失败")
+            await self._note_failure(digest, result["error"])
+            return result
 
         low = is_low_confidence(parsed) or parsed["confidence"] < self._threshold
         try:
@@ -583,7 +589,27 @@ class FormulaRecognizer:
                 degraded=degraded,
             )
         except Exception as exc:  # 落库失败也是"这条识别没成"，返失败而不是抛
+            await self._note_failure(digest, f"公式落库失败：{exc}")
             return self._failure(f"公式落库失败：{exc}")
+
+    async def _note_failure(self, digest: str, error: str) -> None:
+        """把失败记进库（尽力而为）：自动补识别靠它判断"这张图别再试了"。"""
+        if not digest:
+            return
+        try:
+            await asyncio.to_thread(self._db.record_formula_failure, digest, error)
+        except Exception:
+            pass  # 记不上只是失去重试上限，不能因此把失败上报流程也弄断
+
+    def has_given_up(self, digest: str) -> bool:
+        """这张图是否已经自动试满次数（调用方据此跳过，别重复付费）。"""
+        if not digest:
+            return False
+        try:
+            row = self._db.formula_failure(digest)
+        except Exception:
+            return False
+        return row is not None and int(row["attempts"] or 0) >= MAX_FAILED_ATTEMPTS
 
     # ── 内部 ──────────────────────────────────────────────
 

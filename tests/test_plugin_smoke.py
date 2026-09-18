@@ -4455,6 +4455,87 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await plugin.on_unload()
 
+    async def test_history_images_recognized_without_user_action(self):
+        """回归（用户要求）：识别是自动能力——库里已有的图片要被自己补齐，不用重发。
+
+        场景就是线上那次：图片早进库了，Key 是后来配的。插件在装载/识别刚可用时
+        扫一遍笔记目录，把"有图没公式"的排进队列；用户什么都不用做。
+        """
+        from class_schedule.formula import FormulaRecognizer
+
+        class FakeVision:
+            def __init__(self, reply: str):
+                self.calls: list[str] = []
+                self._reply = reply
+
+            async def vision(self, **kwargs):
+                self.calls.append(kwargs["model"])
+                return {"text": self._reply, "prompt_tokens": 0, "completion_tokens": 0}
+
+        reply = (
+            '{"latex": "\\\\frac{\\\\pi}{2}", "name": "半角公式", '
+            '"aliases": [], "category": "高等数学", "subcategory": "三角函数", '
+            '"knowledge_points": [], "description": "d", "confidence": 0.9}'
+        )
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # 历史图片：装载前就躺在笔记目录里（模拟 Key 配好之前收下的图）
+            image_dir = root / "notes" / "未分类" / "img"
+            image_dir.mkdir(parents=True)
+            (image_dir / "20260917_214707_79f7.png").write_bytes(b"\x89PNG-history-image")
+
+            plugin = self.make_plugin(root, build_config(study={"api_key": "sk-test-key"}))
+            fake = FakeVision(reply)
+            plugin._build_recognizer = lambda conf, db: FormulaRecognizer(  # type: ignore[assignment]
+                db=db, client=fake, model="vlm-history"
+            )
+            await plugin.on_load()
+            try:
+                db = plugin._notes_db
+                backfill = plugin._backfill_task
+                self.assertIsNotNone(backfill, "装载时就该自动排补识别")
+                await backfill
+                for _ in range(200):
+                    if db.formula_count() == 1:
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertEqual(db.formula_count(), 1, "历史图片没被自动识别")
+                self.assertEqual(len(fake.calls), 1)
+                row = db.formula_by_image_hash(
+                    __import__("class_schedule.formula", fromlist=["image_hash"]).image_hash(
+                        b"\x89PNG-history-image"
+                    )
+                )
+                self.assertEqual(row["course"], "未分类")
+                self.assertEqual(row["latex_normalized"], "\\frac{\\pi}2")
+                # 补识别是补历史，不该往会话里回执刷屏
+                texts = [text for _stream, text in plugin.ctx.send.texts]  # type: ignore[attr-defined]
+                self.assertFalse(any("认出公式" in text for text in texts), texts)
+                self.assertIn("历史图片补识别 1", plugin._recognition_status_line())
+
+                # 再触发一轮：认过的图靠 hash 缓存跳过，不再调用模型
+                await plugin._run_formula_backfill()
+                self.assertEqual(db.formula_count(), 1)
+                self.assertEqual(len(fake.calls), 1)
+            finally:
+                await plugin.on_unload()
+
+    async def test_no_backfill_without_recognizer(self):
+        """没配 Key 就不该有补识别任务（也不能报错）。"""
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_dir = root / "notes" / "未分类" / "img"
+            image_dir.mkdir(parents=True)
+            (image_dir / "a.png").write_bytes(b"\x89PNGx")
+            plugin = self.make_plugin(root, build_config(study={"api_key": ""}))
+            await plugin.on_load()
+            try:
+                self.assertIsNone(plugin._recognizer)
+                self.assertIsNone(plugin._backfill_task)
+                self.assertEqual(plugin._notes_db.formula_count(), 0)
+            finally:
+                await plugin.on_unload()
+
     async def test_config_update_enables_recognition_without_restart(self):
         """回归（线上实测）：Key 是后来在 WebUI 填的，热更新必须重建识别器。
 

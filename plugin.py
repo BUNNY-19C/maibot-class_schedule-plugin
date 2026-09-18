@@ -73,7 +73,7 @@ from .ics_parser import CourseEvent, expand_occurrences
 from .netutil import FetchError, UnsafeUrlError, fetch_bytes, fetch_ics, fetch_text
 from .study_notes import StudyNoteStore, course_folder_name
 from .inbox import InboxDeduper, ParsedMessage
-from .formula import FormulaRecognizer
+from .formula import FormulaRecognizer, image_hash
 from .llm_client import SiliconFlowClient
 from .notes_db import NotesDatabase
 from .pipeline import StudyPipeline
@@ -107,6 +107,12 @@ MAX_REMEMBERED_STREAMS = 500
 #: 节假日**下载失败**后的重试间隔（秒）。与 refresh_hours（数据过期周期）是两回事：
 #: 失败可能下一分钟就好了，而数据本身 12 小时都不会变。
 HOLIDAY_FAILURE_RETRY_SECONDS = 1800
+#: 一轮自动补识别最多排多少张图。补识别是"把历史图片补齐"的兜底，不该在
+#: 装载/改配置那一瞬间对几百张图发起调用（那是真金白银）；每轮限量、下轮继续，
+#: 加上图片 hash 缓存与失败上限，最终会收敛到"该识别的都识别了"。
+MAX_BACKFILL_PER_RUN = 30
+#: 补识别认得出的图片扩展名（与收纳落盘时用的一致）
+NOTE_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
 
 
 @dataclass(frozen=True)
@@ -193,6 +199,9 @@ class ClassSchedulePlugin(MaiBotPlugin):
         #: 云端客户端与公式识别器（阶段 3'：图片笔记 → VLM 识别）
         self._cloud_client: SiliconFlowClient | None = None
         self._recognizer: FormulaRecognizer | None = None
+        #: 自动补识别：把历史图片（还没有公式的）排队识别，单飞后台任务
+        self._backfill_task: asyncio.Task[None] | None = None
+        self._backfill_queued = 0
         self._inbox_dedup = InboxDeduper()
         #: 待重试的总结任务：key -> {course, window}（每轮 tick 重新排入，见
         #: _maybe_course_summaries——失败后不能靠"下课窗口"重试，窗口会移走）
@@ -369,6 +378,8 @@ class ClassSchedulePlugin(MaiBotPlugin):
                 queue_size=int(conf.study.queue_size),
             )
             self._pipeline.start()
+            # 装满即自动补齐历史图片的公式，不需要用户重发（见 _schedule_formula_backfill）
+            self._schedule_formula_backfill()
         except (OSError, _sqlite3.Error) as exc:
             self._notes_db = None
             self._pipeline = None
@@ -496,11 +507,14 @@ class ClassSchedulePlugin(MaiBotPlugin):
         self.ctx.logger.info(f"{LOG_PREFIX} 已卸载")
 
     async def _cancel_intake_tasks(self) -> None:
-        """取消尚未完成的后台任务（文件导入与笔记收纳），避免卸载后还在写盘/发消息。"""
+        """取消尚未完成的后台任务（文件导入、笔记收纳、补识别），避免卸载后还在写盘/发消息。"""
         pending = [task for task in self._intake_tasks if not task.done()]
         pending += [task for task in self._note_tasks if not task.done()]
         self._intake_tasks.clear()
         self._note_tasks.clear()
+        if self._backfill_task is not None and not self._backfill_task.done():
+            pending.append(self._backfill_task)
+        self._backfill_task = None
         for task in pending:
             task.cancel()
         for task in pending:
@@ -592,6 +606,8 @@ class ClassSchedulePlugin(MaiBotPlugin):
                 f"{LOG_PREFIX} 公式识别已启用：模型 {study.vlm_model}"
                 f"（失败降级 {study.vlm_fallback_model or '无'}）"
             )
+            # 刚能用起来：历史图片自动补识别，用户不必重发
+            self._schedule_formula_backfill()
 
     def _cloud_off_reason(self) -> str:
         """识别不可用的原因（给人看的短句，与启动告警同一套判断）。"""
@@ -2175,7 +2191,13 @@ class ClassSchedulePlugin(MaiBotPlugin):
             parts.append(f"排队 {pipeline.queue_depth}")
             if pipeline.dropped:
                 parts.append(f"队列满丢弃 {pipeline.dropped}")
+        if self._backfill_queued:
+            parts.append(f"历史图片补识别 {self._backfill_queued}")
         line = "🧮 公式识别：" + "、".join(parts)
+        if self._notes_db is not None:
+            failed = self._notes_db.formula_failure_count()
+            if failed:
+                line += f"\n　{failed} 张图识别失败（自动重试上限 {MAX_FAILED_ATTEMPTS} 次）"
         if recognizer.last_error:
             line += f"\n　最近失败原因：{recognizer.last_error[:100]}"
         return line
@@ -3098,6 +3120,94 @@ class ClassSchedulePlugin(MaiBotPlugin):
             fallback_model=str(study.vlm_fallback_model or "").strip(),
             image_cache_enabled=bool(study.image_cache_enabled),
         )
+
+    def _schedule_formula_backfill(self) -> None:
+        """把"有图但还没有公式"的历史图片排进识别队列（单飞后台任务）。
+
+        为什么需要它：识别是**自动能力**，不该要求用户重发图片。Key 是后来才配好的、
+        或者识别曾经失败过，都会留下"图片在库里、公式没有"的窟窿；这里在装载与
+        改配置（识别刚可用）时自动补上。已识别过的图靠图片 hash 缓存跳过，
+        自动试满次数仍失败的靠失败计数跳过，所以重复触发不会重复付费。
+        """
+        if self._recognizer is None or self._pipeline is None or self._notes is None:
+            return
+        if self._backfill_task is not None and not self._backfill_task.done():
+            return  # 单飞：上一轮还没跑完
+        self._backfill_task = asyncio.create_task(
+            self._run_formula_backfill(), name="class-schedule-formula-backfill"
+        )
+
+    async def _run_formula_backfill(self) -> None:
+        db = self._notes_db
+        if db is None or self._pipeline is None or self._recognizer is None:
+            return
+        try:
+            files = await asyncio.to_thread(self._note_image_files)
+        except OSError as exc:
+            self.ctx.logger.warning(f"{LOG_PREFIX} 补识别扫描图片失败: {exc}")
+            return
+        queued = skipped = 0
+        for course, path in files:
+            try:
+                data = await asyncio.to_thread(path.read_bytes)
+            except OSError:
+                continue  # 单张读不到就跳过，不影响其它图
+            digest = image_hash(data)
+            if not digest:
+                continue
+            try:
+                if await asyncio.to_thread(db.formula_by_image_hash, digest) is not None:
+                    skipped += 1  # 认过了
+                    continue
+            except Exception:
+                pass  # 查不出就当没认过，大不了多认一次（有指纹去重兜底）
+            if self._recognizer.has_given_up(digest):
+                skipped += 1  # 自动试满次数，别再来一遍
+                continue
+            if self._pipeline.enqueue({
+                "note_id": 0,
+                "image": data,
+                "suffix": path.suffix or ".png",
+                "course": course,
+                "week": None,
+                "period": "",
+                "message_id": "",
+                "stream_id": "",  # 补识别不回执到会话：它是补历史，不该刷屏
+                "kind": "",
+            }):
+                queued += 1
+                self._backfill_queued += 1
+            if queued >= MAX_BACKFILL_PER_RUN:
+                break
+        if queued or skipped:
+            self.ctx.logger.info(
+                f"{LOG_PREFIX} 补识别扫描：新排队 {queued} 张，跳过（认过或已放弃）"
+                f" {skipped} 张"
+            )
+
+    def _note_image_files(self) -> list[tuple[str, Path]]:
+        """笔记目录下所有可识别的图片 → [(课程名, 文件路径)]，新图在前。
+
+        直接扫磁盘而不是扫数据库：markdown 层的 `notes/<课程>/img/` 才是图片的
+        原始层，比 SQLite 里的笔记行更全（SQLite 是后来才上线的，早先的图片
+        只有文件没有行）。扫盘也是这条能力"不需要用户操作"的前提。
+        """
+        notes = self._notes
+        if notes is None or not notes.root.exists():
+            return []
+        found: list[tuple[str, Path]] = []
+        for course_dir in notes.root.iterdir():
+            if not course_dir.is_dir():
+                continue
+            image_dir = course_dir / "img"
+            if not image_dir.is_dir():
+                continue
+            for path in image_dir.iterdir():
+                if path.is_file() and path.suffix.lower() in NOTE_IMAGE_SUFFIXES:
+                    found.append((course_dir.name, path))
+        # 新图优先：用户刚发的课件最可能还没识别
+        found.sort(key=lambda item: item[1].stat().st_mtime, reverse=True)
+        return found
 
     async def _on_formula_recognized(
         self, job: dict[str, Any], result: dict[str, Any]

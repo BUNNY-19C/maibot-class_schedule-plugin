@@ -14,6 +14,7 @@ import _bootstrap  # noqa: F401  —— 注册插件包
 
 from class_schedule.formula import (
     FORMULA_PROMPT,
+    MAX_FAILED_ATTEMPTS,
     UNKNOWN_FORMULA_NAME,
     FormulaParseError,
     FormulaRecognizer,
@@ -403,6 +404,41 @@ class TestFormulaRecognizer(unittest.IsolatedAsyncioTestCase):
         self.assertIn("不被允许", result["error"])
         self.assertEqual(self.db.formula_count(), 0)
 
+    async def test_failures_are_recorded_and_bounded(self):
+        """失败按图片 hash 记数：自动补识别最多试 MAX_FAILED_ATTEMPTS 次，不再烧钱。"""
+        recognizer = self._recognizer([CloudError("网络错误")])  # 永远失败
+        digest = image_hash(b"retry-me")
+        self.assertFalse(recognizer.has_given_up(digest))
+        await recognizer.recognize(b"retry-me")
+        self.assertFalse(recognizer.has_given_up(digest))
+        await recognizer.recognize(b"retry-me")
+        self.assertTrue(recognizer.has_given_up(digest))
+        row = self.db.formula_failure(digest)
+        self.assertEqual(int(row["attempts"]), MAX_FAILED_ATTEMPTS)
+        self.assertIn("网络", row["last_error"])
+        # 失败的图不算缓存命中，也不会建公式
+        self.assertEqual(self.db.formula_count(), 0)
+        self.assertEqual(self.db.formula_failure_count(), 1)
+        # 后来成功了：公式进库，调用方以指纹/hash 缓存为准
+        recognizer._client = FakeVision([_FORMULA_JSON])
+        result = await recognizer.recognize(b"retry-me")
+        self.assertEqual(result["status"], "recognized")
+        self.assertEqual(self.db.formula_count(), 1)
+
+    async def test_failure_recording_never_breaks_the_flow(self):
+        """失败记录写不进去（DB 坏了）也不影响返回失败结果。"""
+        import sqlite3
+
+        class BrokenDb:
+            def __getattr__(self, name):
+                raise sqlite3.OperationalError(f"disk I/O error（{name}）")
+
+        client = FakeVision([CloudError("网络错误")])
+        recognizer = FormulaRecognizer(db=BrokenDb(), client=client, model="vlm")
+        result = await recognizer.recognize(b"img")
+        self.assertEqual(result["status"], "failed")
+        self.assertFalse(recognizer.has_given_up(b"img"))
+
     async def test_recognizer_does_not_block_event_loop(self):
         import time
 
@@ -583,6 +619,19 @@ class TestNotesDbFormulaLookups(unittest.TestCase):
         self.assertEqual(db.formula_by_image_hash("img-1")["id"], newer)
         db.attach_tag("formula", formula_id, "#公式")
         self.assertEqual(db.formula_tags_for(formula_id), ["#公式"])
+
+    def test_failure_table_counts_up(self):
+        db = _db_case(self)
+        self.assertIsNone(db.formula_failure(""))
+        self.assertIsNone(db.formula_failure("nope"))
+        self.assertEqual(db.formula_failure_count(), 0)
+        db.record_formula_failure("img-1", "第一次失败")
+        db.record_formula_failure("img-1", "第二次失败")
+        db.record_formula_failure("", "")  # 空 hash 不记
+        self.assertEqual(db.formula_failure_count(), 1)
+        row = db.formula_failure("img-1")
+        self.assertEqual(int(row["attempts"]), 2)
+        self.assertEqual(row["last_error"], "第二次失败")
 
 
 if __name__ == "__main__":

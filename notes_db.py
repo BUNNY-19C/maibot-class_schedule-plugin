@@ -79,6 +79,12 @@ CREATE TABLE IF NOT EXISTS formulas(
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_formulas_image_hash ON formulas(image_hash);
+CREATE TABLE IF NOT EXISTS formula_failures(
+  image_hash TEXT PRIMARY KEY,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS formula_tags(
   formula_id INTEGER NOT NULL,
   tag_id INTEGER NOT NULL,
@@ -272,6 +278,46 @@ class NotesDatabase:
         with self._lock:
             row = self._connection().execute(
                 "SELECT COUNT(*) c FROM formulas"
+            ).fetchone()
+        return int(row["c"]) if row is not None else 0
+
+    def record_formula_failure(self, image_hash: str, error: str) -> None:
+        """记一次识别失败（按图片 hash 累计次数与最后原因）。
+
+        自动补识别**不能无限重试**：一张图里根本没有公式、或模型反复答非所问时，
+        每次重载都烧一次 API Key。次数上限由调用方判断（见 formula.MAX_FAILED_ATTEMPTS）。
+        """
+        value = str(image_hash or "").strip()
+        if not value:
+            return
+        now = datetime.now().isoformat(timespec="seconds")
+        with self._lock:
+            conn = self._connection()
+            conn.execute(
+                "INSERT INTO formula_failures(image_hash, attempts, last_error, updated_at)"
+                " VALUES(?, 1, ?, ?)"
+                " ON CONFLICT(image_hash) DO UPDATE SET"
+                " attempts = attempts + 1, last_error = excluded.last_error,"
+                " updated_at = excluded.updated_at",
+                (value, str(error or "")[:300], now),
+            )
+            conn.commit()
+
+    def formula_failure(self, image_hash: str) -> sqlite3.Row | None:
+        """某张图的失败记录（没有则 ``None``）。"""
+        value = str(image_hash or "").strip()
+        if not value:
+            return None
+        with self._lock:
+            return self._connection().execute(
+                "SELECT * FROM formula_failures WHERE image_hash = ?", (value,)
+            ).fetchone()
+
+    def formula_failure_count(self) -> int:
+        """有多少张图识别失败过（含待重试的）。"""
+        with self._lock:
+            row = self._connection().execute(
+                "SELECT COUNT(*) c FROM formula_failures"
             ).fetchone()
         return int(row["c"]) if row is not None else 0
 
