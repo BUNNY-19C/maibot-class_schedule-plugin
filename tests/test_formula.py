@@ -150,6 +150,17 @@ class ParseFormulaResponseTest(unittest.TestCase):
         self.assertEqual(parsed["knowledge_points"], ["力", "加速度"])
         self.assertEqual(parsed["confidence"], 0.9)
 
+    def test_trailing_text_and_second_object_are_ignored(self):
+        """模型在对象后面又补一段话（甚至再吐一个对象）时，取第一个完整对象。"""
+        raw = (
+            '{"latex": "a+b", "name": "加法", "confidence": 0.8}\n'
+            "说明：这是加法公式（如果你还需要 {另一个} 结果，请告知）\n"
+            '{"latex": "c+d", "name": "另一个", "confidence": 0.1}'
+        )
+        parsed = parse_formula_response(raw)
+        self.assertEqual(parsed["name"], "加法")
+        self.assertEqual(parsed["latex_normalized"], "a+b")
+
     def test_unknown_name_is_low_confidence(self):
         parsed = parse_formula_response(
             json.dumps({"latex": "x=1", "name": UNKNOWN_FORMULA_NAME, "confidence": 0.9})

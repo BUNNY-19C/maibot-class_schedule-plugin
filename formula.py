@@ -297,7 +297,6 @@ def image_hash(image: bytes) -> str:
 
 # ── 识别结果解析 ──────────────────────────────────────────
 
-_JSON_BLOCK = re.compile(r"\{.*\}", re.S)
 _CODE_FENCE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.I)
 
 
@@ -336,15 +335,19 @@ def parse_formula_response(raw: str) -> dict[str, Any]:
 
     这里**只做解析不做网络**：解析规则单测得到，出问题一眼能看出是模型乱答
     还是我们读错。LaTeX 为空按失败处理——"看不清"必须是失败，不能落一条空公式。
+
+    取的是**第一个完整 JSON 对象**（``raw_decode``），而不是"第一个 { 到最后一个 }"：
+    模型常在对象后面再补一句带花括号的话，贪心匹配会把这些一起吃进来、解析失败，
+    白降级一次模型。
     """
     text = _CODE_FENCE.sub("", str(raw or "").strip())
     if not text:
         raise FormulaParseError("模型返回为空")
-    match = _JSON_BLOCK.search(text)
-    if match is None:
+    start = text.find("{")
+    if start < 0:
         raise FormulaParseError("模型返回里找不到 JSON 对象")
     try:
-        data = json.loads(match.group(0))
+        data, _end = json.JSONDecoder().raw_decode(text[start:])
     except json.JSONDecodeError as exc:
         raise FormulaParseError(f"JSON 解析失败：{exc}") from exc
     if not isinstance(data, dict):
