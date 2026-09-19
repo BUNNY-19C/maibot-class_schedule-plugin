@@ -29,7 +29,7 @@ from class_schedule.notes_db import NotesDatabase
 from class_schedule.pipeline import StudyPipeline
 
 
-class NormalizeLatexTest(unittest.TestCase):
+class TestNormalizeLatex(unittest.TestCase):
     """归一化是纯函数：同一公式的各种写法必须收敛到同一个字符串。"""
 
     def test_unicode_commands_converge(self):
@@ -94,6 +94,16 @@ class NormalizeLatexTest(unittest.TestCase):
         self.assertEqual(normalize_latex("√2"), normalize_latex(r"\sqrt{2}"))
         self.assertEqual(normalize_latex("√2"), r"\sqrt2")
 
+    def test_sqrt_with_braces_converges_too(self):
+        """回归（构造审查）：``√{2}`` 与 ``√2`` 必须同一个指纹。
+
+        旧顺序把"将符号收进 \\sqrt{}"排在剥单字符花括号之前，``√{2}`` 会先变成
+        ``\\sqrt{}{2}``、再漏成 ``\\sqrt{}2``——同一公式两个指纹，正是要防的事故。
+        """
+        self.assertEqual(normalize_latex("√{2}"), normalize_latex("√2"))
+        self.assertEqual(normalize_latex(r"\sqrt{2}"), normalize_latex("√{2}"))
+        self.assertEqual(normalize_latex("√{ab}"), normalize_latex(r"\sqrt{ab}"))
+
     def test_idempotent(self):
         """不幂等会让同一公式二次识别时算出新指纹、又存一条。"""
         samples = [
@@ -101,6 +111,7 @@ class NormalizeLatexTest(unittest.TestCase):
             "e^(iπ)+1=0",
             r"\dfrac{1}{2}",
             "1/2",
+            "√{2}",
             r"\frac{\frac{a}{b}}{c}",
             "",
             "随便一段不是公式的中文",
@@ -121,7 +132,7 @@ class NormalizeLatexTest(unittest.TestCase):
         self.assertEqual(fingerprint(normalize_latex("  ")), "")
 
 
-class FingerprintTest(unittest.TestCase):
+class TestFingerprint(unittest.TestCase):
     def test_same_formula_same_fingerprint(self):
         first = fingerprint(normalize_latex("e^{iπ}+1=0"))
         second = fingerprint(normalize_latex(r"e^{i \pi} + 1 = 0"))
@@ -139,7 +150,7 @@ class FingerprintTest(unittest.TestCase):
         self.assertEqual(image_hash(b""), "")
 
 
-class ParseFormulaResponseTest(unittest.TestCase):
+class TestParseFormulaResponse(unittest.TestCase):
     def test_plain_json(self):
         parsed = parse_formula_response(
             json.dumps(
@@ -606,16 +617,18 @@ class TestNotesDbFormulaLookups(unittest.TestCase):
         self.assertIsNone(db.formula_by_fingerprint(""))
         self.assertIsNone(db.formula_by_image_hash(""))
         self.assertEqual(db.formula_count(), 0)
-        formula_id = db.upsert_formula(
+        formula_id, created = db.upsert_formula(
             {"fingerprint": "fp-1", "name": "欧拉公式", "image_hash": "img-1"}
         )
+        self.assertTrue(created)
         self.assertEqual(db.formula_count(), 1)
         self.assertEqual(db.formula_by_fingerprint("fp-1")["id"], formula_id)
         self.assertEqual(db.formula_by_image_hash("img-1")["id"], formula_id)
         # 同一张图再识别一次（新指纹）时返回最新那条，而不是最旧的
-        newer = db.upsert_formula(
+        newer, second_created = db.upsert_formula(
             {"fingerprint": "fp-2", "name": "欧拉公式(修正)", "image_hash": "img-1"}
         )
+        self.assertTrue(second_created)
         self.assertEqual(db.formula_by_image_hash("img-1")["id"], newer)
         db.attach_tag("formula", formula_id, "#公式")
         self.assertEqual(db.formula_tags_for(formula_id), ["#公式"])

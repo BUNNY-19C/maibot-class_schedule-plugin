@@ -16,6 +16,7 @@ import asyncio
 import functools
 import base64
 import binascii
+import hashlib
 import logging
 import sqlite3 as _sqlite3
 import re
@@ -72,8 +73,8 @@ from .holidays import (
 from .ics_parser import CourseEvent, expand_occurrences
 from .netutil import FetchError, UnsafeUrlError, fetch_bytes, fetch_ics, fetch_text
 from .study_notes import StudyNoteStore, course_folder_name
-from .inbox import InboxDeduper, ParsedMessage
-from .formula import FormulaRecognizer, image_hash
+from .inbox import InboxDeduper, ParsedMessage, normalize_image_segment
+from .formula import MAX_FAILED_ATTEMPTS, FormulaRecognizer, image_hash
 from .llm_client import SiliconFlowClient
 from .notes_db import NotesDatabase
 from .pipeline import StudyPipeline
@@ -199,6 +200,8 @@ class ClassSchedulePlugin(MaiBotPlugin):
         #: 云端客户端与公式识别器（阶段 3'：图片笔记 → VLM 识别）
         self._cloud_client: SiliconFlowClient | None = None
         self._recognizer: FormulaRecognizer | None = None
+        #: 云端配置的身份指纹（_cloud_signature），变了才重建识别器
+        self._cloud_signature_seen: tuple | None = None
         #: 自动补识别：把历史图片（还没有公式的）排队识别，单飞后台任务
         self._backfill_task: asyncio.Task[None] | None = None
         self._backfill_queued = 0
@@ -354,6 +357,12 @@ class ClassSchedulePlugin(MaiBotPlugin):
         self._notes = StudyNoteStore(self._data_dir / "notes")
         # 阶段 2'/3'：SQLite 笔记库 + 管道 + 公式识别 worker（建表放线程里，别卡加载）
         try:
+            if self._backfill_task is not None and not self._backfill_task.done():
+                # 先收掉旧的补识别任务：它抓着旧连接，下面马上要关库了
+                self._backfill_task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await self._backfill_task
+            self._backfill_task = None
             if self._pipeline is not None:
                 # 重复 on_load（热重载）先收掉上一批 worker：否则它们的队列还在被
                 # 消费，而下面马上要关掉旧连接，会撞上"Cannot operate on a closed database"
@@ -370,15 +379,15 @@ class ClassSchedulePlugin(MaiBotPlugin):
             await asyncio.to_thread(db.initialize)
             self._notes_db = db
             self._recognizer = self._build_recognizer(conf, db)
+            self._cloud_signature_seen = self._cloud_signature(conf.study)
             self._pipeline = StudyPipeline(
                 db=db,
-                save_image=self._save_inbox_image,
                 recognizer=self._recognizer,
                 on_recognized=self._on_formula_recognized,
                 queue_size=int(conf.study.queue_size),
             )
             self._pipeline.start()
-            # 装满即自动补齐历史图片的公式，不需要用户重发（见 _schedule_formula_backfill）
+            # 装完即自动补齐历史图片的公式，不需要用户重发（见 _schedule_formula_backfill）
             self._schedule_formula_backfill()
         except (OSError, _sqlite3.Error) as exc:
             self._notes_db = None
@@ -580,22 +589,28 @@ class ClassSchedulePlugin(MaiBotPlugin):
         )
 
     def _refresh_recognizer(self) -> None:
-        """配置热更新后重建识别器，并换进正在跑的管道。
+        """配置热更新后按需重建识别器，并换进正在跑的管道。
 
         必须在热更新这里做一次：识别器是在 ``on_load`` 装配的，而 API Key 通常是
         用户后来在 WebUI 里填的——只更新配置对象而不重建识别器，就会出现
         "Key 明明填了、图片却一条公式都不认"（线上实测踩过：填完 Key 发图，
         formulas 一直是 0，日志里还停在启动时那句"没配 Key"）。
+
+        但**无关配置变了不重建**（否则每保存一次设置就把识别计数清零、重新装配）：
+        云端配置的身份指纹没变就直接返回。
         """
         if self._notes_db is None:
             return
-        before = self._recognizer.signature if self._recognizer is not None else None
+        new_signature = self._cloud_signature(self._conf().study)
+        if new_signature == self._cloud_signature_seen:
+            return  # 云端配置没变（例如只改了提前量），识别器与计数原样保留
+        was_available = self._recognizer is not None
+        self._cloud_signature_seen = new_signature
         self._recognizer = self._build_recognizer(self._conf(), self._notes_db)
         if self._pipeline is not None:
             self._pipeline.set_recognizer(self._recognizer)
-        after = self._recognizer.signature if self._recognizer is not None else None
-        if before == after:
-            return  # 识别能力没变（例如只改了提前量），不必刷日志
+        if (self._recognizer is not None) == was_available:
+            return  # 可用性没翻转（例如只是换了个 Key/模型），不刷日志
         if self._recognizer is None:
             self.ctx.logger.info(
                 f"{LOG_PREFIX} 公式识别已停用：{self._cloud_off_reason()}"
@@ -608,6 +623,20 @@ class ClassSchedulePlugin(MaiBotPlugin):
             )
             # 刚能用起来：历史图片自动补识别，用户不必重发
             self._schedule_formula_backfill()
+
+    @staticmethod
+    def _cloud_signature(study: Any) -> tuple:
+        """云端识别配置的身份指纹：变了才重建识别器，不变的保存不打扰它。"""
+        key = str(study.api_key or "").strip()
+        return (
+            bool(study.cloud_enabled),
+            hashlib.sha256(key.encode("utf-8")).hexdigest()[:12] if key else "",
+            str(study.api_base_url or "").strip(),
+            str(study.vlm_model or "").strip(),
+            str(study.vlm_fallback_model or "").strip(),
+            bool(study.image_cache_enabled),
+            int(study.cloud_timeout_seconds),
+        )
 
     def _cloud_off_reason(self) -> str:
         """识别不可用的原因（给人看的短句，与启动告警同一套判断）。"""
@@ -1521,6 +1550,11 @@ class ClassSchedulePlugin(MaiBotPlugin):
         """
         conf = self._conf()
         style = self._reply_style_for(reason)
+        if attach_fixed and fixed_text and style == "proactive":
+            # proactive 把措辞交给模型自由发挥，而 attach_fixed 的意思恰恰是
+            # "里面的数据一个字都不能改"——两者冲突时数据赢（线上踩过：宿主的模型
+            # 把公式概括掉，一个字都没到用户手上）
+            style = "fixed"
 
         if style == "persona":
             # 让模型按宿主人设说一句，再直发：有风格且必定送达
@@ -2165,20 +2199,23 @@ class ClassSchedulePlugin(MaiBotPlugin):
         if db is None:
             message = "ℹ️ 笔记库未启用（初始化失败时不影响提醒与 markdown 收纳）"
         else:
-            counts = db.status_counts()
+            # sqlite 一律进线程：命令处理器跑在事件循环上，这是全仓的硬纪律
+            def _counts() -> tuple[dict[str, int], int, int]:
+                return db.status_counts(), len(db.all_embeddings()), db.formula_count()
+
+            counts, vectors, formula_total = await asyncio.to_thread(_counts)
             total = sum(counts.values())
             detail = "、".join(f"{k} {v}" for k, v in sorted(counts.items())) or "空"
-            vectors = len(db.all_embeddings())
             lines = [
                 f"🗂 笔记库共 {total} 条（{detail}）；向量 {vectors} 条；"
-                f"公式 {db.formula_count()} 条"
+                f"公式 {formula_total} 条"
             ]
-            lines.append(self._recognition_status_line())
+            lines.append(await self._recognition_status_line())
             message = "\n".join(lines)
         await self._reply(stream_id, message)
         return True, message, 1
 
-    def _recognition_status_line(self) -> str:
+    async def _recognition_status_line(self) -> str:
         """识别链路的可见状态：可用/降级原因、累计识别数、队列积压与丢弃。
 
         "丢弃"必须有出口：队列满时用户只会看到"图片记下了但没识别"，
@@ -2203,7 +2240,7 @@ class ClassSchedulePlugin(MaiBotPlugin):
             parts.append(f"历史图片补识别 {self._backfill_queued}")
         line = "🧮 公式识别：" + "、".join(parts)
         if self._notes_db is not None:
-            failed = self._notes_db.formula_failure_count()
+            failed = await asyncio.to_thread(self._notes_db.formula_failure_count)
             if failed:
                 line += f"\n　{failed} 张图识别失败（自动重试上限 {MAX_FAILED_ATTEMPTS} 次）"
         if recognizer.last_error:
@@ -3045,6 +3082,34 @@ class ClassSchedulePlugin(MaiBotPlugin):
                     return occurrence.display_name, (occurrence.start, end)
         return "", None
 
+    def _study_capture_gate(
+        self, kwargs: dict[str, Any], *, need_images: bool = False
+    ) -> tuple[Any, Any, str] | None:
+        """收纳类 hook 的共同准入闸门：开关 → 消息 → 会话 → 适用范围 → 名单。
+
+        before_process 抢图与 after_process 收纳的判定条件本来就一模一样（只差
+        图片开关）。各写一份的后果是改一处忘另一处，出现"图抢到了但不收纳"这类
+        极难查的错位，所以合成一处。放行时返回 ``(message, identity, stream_id)``。
+        """
+        conf = self._conf()
+        if not conf.plugin.enabled or not conf.study.enabled:
+            return None
+        if need_images and not conf.study.allow_images:
+            return None
+        message = kwargs.get("message")
+        if message is None:
+            return None
+        identity = identity_from_kwargs(kwargs)
+        stream_id = str(identity.stream_id or "").strip()
+        if not stream_id:
+            return None
+        # 笔记比课表更私人：与文件导入同一道适用范围 + 名单闸门
+        if self._scope_denial(identity) is not None:
+            return None
+        if conf.access.apply_to_commands and self._evaluate(identity).denied:
+            return None
+        return message, identity, stream_id
+
     @HookHandler(
         "chat.receive.before_process",
         name="study_note_image_grab",
@@ -3065,20 +3130,11 @@ class ClassSchedulePlugin(MaiBotPlugin):
         收纳的后台任务里。只有「已处于等待内容状态」或「消息以触发词开头」
         才会暂存，避免为每张无关图片浪费内存。
         """
+        gated = self._study_capture_gate(kwargs, need_images=True)
+        if gated is None:
+            return
+        message, _identity, stream_id = gated
         conf = self._conf()
-        if not conf.plugin.enabled or not conf.study.enabled or not conf.study.allow_images:
-            return
-        message = kwargs.get("message")
-        if message is None:
-            return
-        identity = identity_from_kwargs(kwargs)
-        stream_id = str(identity.stream_id or "").strip()
-        if not stream_id:
-            return
-        if self._scope_denial(identity) is not None:
-            return
-        if conf.access.apply_to_commands and self._evaluate(identity).denied:
-            return
 
         text = self._extract_message_text(message)
         armed = stream_id in self._awaiting_note
@@ -3177,7 +3233,7 @@ class ClassSchedulePlugin(MaiBotPlugin):
                     str(known["latex_normalized"] or known["latex_raw"] or ""),
                 )
                 continue
-            if self._recognizer.has_given_up(digest):
+            if await asyncio.to_thread(self._recognizer.has_given_up, digest):
                 skipped += 1  # 自动试满次数，别再来一遍
                 continue
             if self._pipeline.enqueue({
@@ -3271,8 +3327,6 @@ class ClassSchedulePlugin(MaiBotPlugin):
             )
             return
 
-        name = str(result.get("name") or "") or "未知公式"
-        latex = str(result.get("latex_normalized") or result.get("latex") or "")
         if result.get("created"):
             headline = f"认出公式：{name}"
         else:
@@ -3282,8 +3336,6 @@ class ClassSchedulePlugin(MaiBotPlugin):
             tail = "。我对它没把握，已标 #待确认，你可以用 /找 核对一下"
         if result.get("degraded"):
             tail += "。主模型没认出来，这条是降级模型的结果"
-        # 公式写进笔记：/笔记、/找 与笔记文件里都能看到它，而不是只有一句图说
-        await self._attach_formula_to_note(job, name, latex)
 
         await self._deliver(
             stream_id,
@@ -3315,15 +3367,6 @@ class ClassSchedulePlugin(MaiBotPlugin):
             # 写笔记失败不影响识别结果本身（公式已在库里，回执照发）
             self.ctx.logger.warning(f"{LOG_PREFIX} 公式写入笔记失败（已忽略）: {exc}")
 
-    def _save_inbox_image(self, course: str, data: bytes, suffix: str) -> str:
-        """管道写原图到笔记库目录（相对 <course>/ 的路径）。"""
-        if self._notes is None or not data:
-            return ""
-        try:
-            return self._notes.save_raw_image(course, data, suffix or ".png")
-        except OSError:
-            return ""
-
     async def _persist_inbox_note(
         self,
         course: str,
@@ -3334,12 +3377,14 @@ class ClassSchedulePlugin(MaiBotPlugin):
         source: str,
         stream_id: str = "",
         markdown_ids: list[str] | None = None,
+        image_path: str = "",
     ) -> None:
         """把一条收纳同时写进 SQLite 笔记库（v1.4 markdown 层保持不变）。
 
         图片笔记会在这里排进识别队列（worker 异步做公式识别），所以要把
         ``stream_id`` 与 ``markdown_ids`` 带下去：识别结果要回到用户所在的会话，
         公式还要回填到对应的那条 markdown 笔记里（/笔记、/找 看的是那一层）。
+        原图路径直接沿用 markdown 层落盘的那份（``image_path``），不再另存一份。
         """
         if self._pipeline is None or self._notes_db is None:
             return
@@ -3363,6 +3408,7 @@ class ClassSchedulePlugin(MaiBotPlugin):
                 kind=kind,
                 stream_id=stream_id,
                 note_refs=list(markdown_ids or []),
+                image_path=image_path,
             )
         except Exception as exc:
             # 笔记库是增强层：坏了绝不影响 v1.4 的收纳与回执
@@ -3395,21 +3441,11 @@ class ClassSchedulePlugin(MaiBotPlugin):
         ``chat.receive.before_process`` 抢下——宿主在 process() 阶段生成描述后
         会立刻清空原图字节，after_process 这边已经拿不到了。
         """
+        gated = self._study_capture_gate(kwargs)
+        if gated is None:
+            return
+        message, identity, stream_id = gated
         conf = self._conf()
-        if not conf.plugin.enabled or not conf.study.enabled:
-            return
-        message = kwargs.get("message")
-        if message is None:
-            return
-        identity = identity_from_kwargs(kwargs)
-        stream_id = str(identity.stream_id or "").strip()
-        if not stream_id:
-            return
-        # 笔记比课表更私人：与文件导入同一道适用范围 + 名单闸门
-        if self._scope_denial(identity) is not None:
-            return
-        if conf.access.apply_to_commands and self._evaluate(identity).denied:
-            return
 
         text = self._extract_message_text(message)
         if text.startswith("/"):
@@ -3538,9 +3574,11 @@ class ClassSchedulePlugin(MaiBotPlugin):
 
         try:
             saved = 0
-            #: markdown 层每条图片笔记的 id，按图片顺序记下来：识别完成后要把公式
-            #: 回填到对应的那条（SQLite 只存第一张的路径，不能靠它反查）
+            # markdown 层每条图片笔记的 id，按图片顺序记下来：识别完成后要把公式
+            # 回填到对应的那条（SQLite 只记第一张的路径，不能靠它反查）
             markdown_ids: list[str] = []
+            #: 第一张图在 markdown 层的落盘路径，SQLite 层直接沿用（不再另存一份）
+            first_image_path = ""
             if images:
                 # 每张图一条笔记；描述文本（视觉管道生成的说明）作为第一张的
                 # 说明文字保留——可检索，但**原图才是笔记本体**，公式在图里
@@ -3551,6 +3589,8 @@ class ClassSchedulePlugin(MaiBotPlugin):
                         text=caption if saved == 0 else "", source=source,
                     )
                     markdown_ids.append(created_note.id)
+                    if not first_image_path:
+                        first_image_path = created_note.file
                     saved += 1
             elif text:
                 created_text = notes.add_text_note(course_name, kind, text, source=source)
@@ -3577,7 +3617,8 @@ class ClassSchedulePlugin(MaiBotPlugin):
             return
 
         await self._persist_inbox_note(
-            course_name, kind, text, images, "", source, stream_id, markdown_ids
+            course_name, kind, text, images, "", source, stream_id,
+            markdown_ids, first_image_path,
         )
         count = notes.count(course_name)
         window_part = (
@@ -3638,18 +3679,13 @@ class ClassSchedulePlugin(MaiBotPlugin):
             seg_type = str(node.get("type") or "").strip().lower()
             data = node.get("data")
             if seg_type in ("image", "emoji"):
-                payload = data if isinstance(data, dict) else {}
+                # 提取规则与 inbox.normalize_image_segment 是同一处来源，别各写一份
+                b64, url = normalize_image_segment(node)
                 candidate: dict[str, str] = {}
-                for key in ("binary_data_base64", "base64", "base64_data", "data_base64"):
-                    value = node.get(key) or payload.get(key)
-                    if value:
-                        candidate["base64"] = str(value).strip()
-                        break
-                for key in ("url", "image_url", "file_url"):
-                    value = node.get(key) or payload.get(key)
-                    if value:
-                        candidate["url"] = str(value).strip()
-                        break
+                if b64:
+                    candidate["base64"] = b64
+                if url:
+                    candidate["url"] = url
                 if candidate:
                     found.append(candidate)
                 return

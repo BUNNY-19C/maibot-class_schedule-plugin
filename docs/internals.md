@@ -68,6 +68,12 @@ data/plugins/github.BUNNY-19C.class-schedule/
 
 图片笔记走三段,核心取舍是"**落库同步、识别异步**":
 
+**一张图只存一份**:markdown 层的 ``notes/<课程>/img/`` 是唯一副本,SQLite 笔记行的
+``image_path`` 直接记它的路径。早期实现里管道还会再 ``save_raw_image`` 存一份,
+于是每张图两份文件、多出来的那份连索引都不引用(线上清出 17 个文件其实只有 2 张图)。
+``StudyNoteStore`` 也因此加了 ``threading.RLock``:索引是"读-改-写",而回填公式的
+后台线程与收纳所在的事件循环会并发写同一份 ``index.json``,没锁就会静默丢更新。
+
 | 阶段 | 在哪做 | 失败会怎样 |
 | --- | --- | --- |
 | 解析归一化(文字/图片/链接/文件) | `inbox.parse_message` | 解析不出内容就提示用户重发,不静默丢 |
@@ -144,7 +150,7 @@ data/plugins/github.BUNNY-19C.class-schedule/
 
 ## 开发与测试
 
-679 项单元测试,只用标准库 `unittest`,不需要额外安装依赖:
+684 项单元测试,只用标准库 `unittest`,不需要额外安装依赖:
 
 ```bash
 cd maibot_plugin_class_schedule

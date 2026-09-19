@@ -25,6 +25,7 @@ import json
 import os
 import re
 import tempfile
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -95,13 +96,15 @@ class _CourseIndex:
 class StudyNoteStore:
     """按课程目录管理学习笔记。
 
-    线程模型：所有写操作都在调用方的线程/事件循环里串行发生
-    （插件侧经 asyncio 锁串行化），本类内部不再加锁——与 CourseRepository
-    不同，这里没有 to_thread 并发路径，避免过度设计。
+    线程模型：这里会同时被事件循环（收纳/移动）与 ``asyncio.to_thread`` 的后台
+    线程（识别完成回填公式、补识别）写入，索引又是"读-改-写"，所以加了
+    ``threading.Lock`` 串行化——与 :class:`NotesDatabase` 同一纪律。
     """
 
     def __init__(self, root: Path) -> None:
         self.root = Path(root)
+        # 可重入：move_latest 持锁期间还会调 _append（它也拿锁）
+        self._lock = threading.RLock()
 
     # ── 路径 ──────────────────────────────────────────────
 
@@ -213,9 +216,10 @@ class StudyNoteStore:
         return note
 
     def _append(self, course_dir: Path, note: StudyNote) -> None:
-        index = self._load_index(course_dir)
-        index.notes.append(note)
-        self._write_index(course_dir, index)
+        with self._lock:
+            index = self._load_index(course_dir)
+            index.notes.append(note)
+            self._write_index(course_dir, index)
 
     def attach_formula(
         self, course: str, note_id: str, formula: str
@@ -232,21 +236,22 @@ class StudyNoteStore:
         if not text:
             return None
         course_dir = self.course_dir(course)
-        index = self._load_index(course_dir)
-        target = next((item for item in index.notes if item.id == note_id), None)
-        if target is None:
-            return None
-        if text in (target.formula or ""):
-            return target  # 已经回填过，别重复写盘
-        target.formula = text
-        self._write_index(course_dir, index)
-        body = [f"# {course_folder_name(course)} · {target.kind}", "", text]
-        if target.text:
-            body += ["", "## 图片说明", "", target.text]
-        if target.file and not target.file.endswith(".md"):
-            body += ["", f"原图：{target.file}"]
-        _atomic_write(course_dir / f"{target.id}_{target.kind}.md", "\n".join(body) + "\n")
-        return target
+        with self._lock:
+            index = self._load_index(course_dir)
+            target = next((item for item in index.notes if item.id == note_id), None)
+            if target is None:
+                return None
+            if text in (target.formula or ""):
+                return target  # 已经回填过，别重复写盘
+            target.formula = text
+            self._write_index(course_dir, index)
+            body = [f"# {course_folder_name(course)} · {target.kind}", "", text]
+            if target.text:
+                body += ["", "## 图片说明", "", target.text]
+            if target.file and not target.file.endswith(".md"):
+                body += ["", f"原图：{target.file}"]
+            _atomic_write(course_dir / f"{target.id}_{target.kind}.md", "\n".join(body) + "\n")
+            return target
 
     # ── 查询 ──────────────────────────────────────────────
 
@@ -293,24 +298,25 @@ class StudyNoteStore:
         """把 from 课目录里**最近一条**笔记挪到 to 课目录（人工纠正归属）。"""
         src_dir = self.course_dir(from_course)
         dst_dir = self.course_dir(to_course)
-        index = self._load_index(src_dir)
-        if not index.notes:
-            return None
-        note = index.notes.pop()
-        self._write_index(src_dir, index)
-        note.course = course_folder_name(to_course)
-        dst_dir.mkdir(parents=True, exist_ok=True)
-        if note.file:
-            src_file = src_dir / note.file
-            dst_file = dst_dir / note.file
-            dst_file.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                os.replace(src_file, dst_file)
-            except OSError:
-                # 文件挪不动（被手动删了等）也保留索引记录，文本仍在
-                note.file = ""
-        self._append(dst_dir, note)
-        return note
+        with self._lock:
+            index = self._load_index(src_dir)
+            if not index.notes:
+                return None
+            note = index.notes.pop()
+            self._write_index(src_dir, index)
+            note.course = course_folder_name(to_course)
+            dst_dir.mkdir(parents=True, exist_ok=True)
+            if note.file:
+                src_file = src_dir / note.file
+                dst_file = dst_dir / note.file
+                dst_file.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    os.replace(src_file, dst_file)
+                except OSError:
+                    # 文件挪不动（被手动删了等）也保留索引记录，文本仍在
+                    note.file = ""
+            self._append(dst_dir, note)
+            return note
 
     def last_of(self, course: str) -> StudyNote | None:
         notes = self._load_index(self.course_dir(course)).notes
@@ -353,20 +359,6 @@ class StudyNoteStore:
         target = self.summaries_dir(course) / f"{day}.md"
         _atomic_write(target, str(markdown))
         return target
-
-
-    def save_raw_image(self, course: str, data: bytes, suffix: str = ".png") -> str:
-        """保存一张原图到 <课程>/img/ 并返回相对路径（管道用，不建索引）。"""
-        import secrets
-        from datetime import datetime as _dt
-
-        if not data:
-            raise ValueError("图片内容为空")
-        folder = self._img_dir(self.course_dir(course))
-        folder.mkdir(parents=True, exist_ok=True)
-        name = f"{_dt.now().strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(2)}{suffix}"
-        _atomic_bytes(folder / name, data)
-        return f"img/{name}"
 
     def summaries(self, course: str) -> list[str]:
         """该课已有哪些课后总结（按日期排序，新的在后）。"""

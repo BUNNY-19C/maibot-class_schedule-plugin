@@ -42,9 +42,6 @@ FINGERPRINT_LENGTH = 16
 #: （用户主动重发不受这个上限约束——那是他的明确意图）。
 MAX_FAILED_ATTEMPTS = 2
 
-#: 识别结果里这些键在 SQLite 里是字符串列，统一成 str
-_TEXT_FIELDS = ("latex", "name", "category", "subcategory", "description")
-
 FORMULA_PROMPT = """你是公式识别助手。看这张图片，找出里面手写或印刷的数学公式，并按下面的 JSON 结构回答。
 
 要求：
@@ -146,10 +143,12 @@ def normalize_latex(raw: str) -> str:
     text = re.sub(r"_\(([^()]*)\)", r"_{\1}", text)
     text = re.sub(r"\^(\w|\\[A-Za-z]+)", r"^{\1}", text)
     text = re.sub(r"_(\w|\\[A-Za-z]+)", r"_{\1}", text)
-    # 6. √ 映射成 \sqrt{} 后把紧随的单个符号收进括号：√2 → \sqrt{2}
-    text = re.sub(r"\\sqrt\{\}(\\[A-Za-z]+|[A-Za-z0-9])", r"\\sqrt{\1}", text)
-    # 7. 去掉只包一个字符的括号（\sqrt{2}→\sqrt2）。^ 与 _ 的括号是语义，不动
+    # 6. 去掉只包一个字符的括号（\sqrt{2}→\sqrt2）。^ 与 _ 的括号是语义，不动
     text = _strip_single_char_braces(text)
+    # 7. √ 映射成 \sqrt{} 后把紧随的符号/括号组收进根号：√2→\sqrt{2}、√{ab}→\sqrt{ab}
+    #    必须在剥单字符花括号之后：``√{2}`` 先变成 \sqrt{}2，这一步才收得到它；
+    #    放前面的话 \sqrt{}{2} 会原样漏过去（同一公式两个指纹，线上踩过）
+    text = _repair_sqrt(text)
     # 8. 分式归一：\frac 家族统一成 \frac{A}{B}（参数补花括号），裸除法也并进来
     text = _normalize_fracs(text)
     # 9. a/b → \frac{a}{b}：让 1/2 与 \frac{1}{2} 得到同一个指纹
@@ -183,8 +182,8 @@ def _strip_spacing(text: str) -> str:
     """去掉排版空白，但把"宏名后必须保留的分界空格"留成占位符。
 
     占位符**不能在这里换回空格**：后面的分式改写会把操作数搬进花括号，
-    那时它已经不在宏名后面了，留着就会被当成内容写进 `\\frac{ b}c`（还会不幂等）。
-    统一交给 :func:`_drop_stray_placeholders` 在最后收拾。
+    那时它已经不在宏名后面了，留着就会被当成内容写进 ``\\frac{ b}c``（还会不幂等）。
+    统一交给 ``_drop_stray_placeholders`` 在最后收拾。
     """
     text = _MACRO_SPACE_BEFORE_LETTER.sub(r"\1" + _PLACEHOLDER, text)
     return re.sub(r"\s+", "", text)
@@ -197,6 +196,33 @@ def _strip_single_char_braces(text: str) -> str:
     所以那里不动。
     """
     return re.sub(r"(?<![\^_]){([^{}])}", r"\1", text)
+
+
+def _repair_sqrt(text: str) -> str:
+    """把 ``\\sqrt{}``（由 ``√`` 映射而来）与紧随的操作数合回 ``\\sqrt{操作数}``。
+
+    用函数而不是正则：紧随的既可能是单字符（``√2``）、宏（``√\\pi``），也可能
+    已经是一个括号组（``√{ab}``）。三种都要收成同一个形状，否则同一公式两个指纹。
+    后面什么都没有时原样留着——宁可留一段没归一化的文本，也不吞掉内容。
+    """
+    marker = r"\sqrt{}"
+    if marker not in text:
+        return text
+    out: list[str] = []
+    index = 0
+    while index < len(text):
+        if text.startswith(marker, index):
+            index += len(marker)
+            content, after = _take_group(text, index)
+            if content is not None:
+                out.append(r"\sqrt{" + content + "}")
+                index = after
+                continue
+            out.append(marker)
+            continue
+        out.append(text[index])
+        index += 1
+    return "".join(out)
 
 
 def _single_token(text: str, index: int) -> str | None:
@@ -279,11 +305,16 @@ def _atom_end(text: str, index: int) -> int:
                     break
     else:
         end = index + 1
-    while end < len(text) and text[end] in "^_":
-        suffix = _atom_end(text, end + 1)
-        if suffix <= end + 1:
-            break  # ^ 后面什么都没有，别把它吃进来
-        end = suffix
+    # 连续上下标链（x^2^{3}_i）逐个往下吃，但设个硬上限：病态的长链会把递归
+    # 变成栈溢出，上限之外原样截断（这串本来也不会是合法公式）
+    for _ in range(16):
+        if end < len(text) and text[end] in "^_":
+            suffix = _atom_end(text, end + 1)
+            if suffix <= end + 1:
+                break  # ^ 后面什么都没有，别把它吃进来
+            end = suffix
+        else:
+            break
     return end
 
 
@@ -613,15 +644,6 @@ class FormulaRecognizer:
 
     # ── 内部 ──────────────────────────────────────────────
 
-    @property
-    def signature(self) -> tuple[str, str, bool]:
-        """识别能力标识 ``(主模型, 降级模型, 图片缓存)``。
-
-        配置热更新后调用方拿它比一比，就知道"识别能力变没变"（只改了提前量这类
-        无关配置时不该刷日志），不必把 API Key 暴露出来比较。
-        """
-        return (self._model, self._fallback_model, self._cache_enabled)
-
     def _models(self) -> list[str]:
         models = [self._model] if self._model else []
         if self._fallback_model:
@@ -658,7 +680,10 @@ class FormulaRecognizer:
             "latex": str(row["latex_normalized"] or row["latex_raw"] or ""),
             "latex_normalized": str(row["latex_normalized"] or ""),
             "confidence": float(row["confidence"] or 0.0),
-            "low_confidence": str(row["name"] or "") == UNKNOWN_FORMULA_NAME,
+            "low_confidence": (
+                str(row["name"] or "") == UNKNOWN_FORMULA_NAME
+                or float(row["confidence"] or 0.0) < self._threshold
+            ),
             "degraded": False,
             "created": False,
             "error": "",
@@ -677,14 +702,9 @@ class FormulaRecognizer:
         degraded: bool,
     ) -> dict[str, Any]:
         fingerprint_value = parsed["fingerprint"]
-        existing = None
-        try:
-            existing = await asyncio.to_thread(
-                self._db.formula_by_fingerprint, fingerprint_value
-            )
-        except Exception:
-            pass
-        formula_id = await asyncio.to_thread(
+        # created 直接由 SQL 层带出来：先查一遍再插是把同一判断做了两次，
+        # 而且查失败（吞异常）时会误报"新公式"
+        formula_id, created = await asyncio.to_thread(
             self._db.upsert_formula,
             {
                 "fingerprint": fingerprint_value,
@@ -720,7 +740,7 @@ class FormulaRecognizer:
             "confidence": parsed["confidence"],
             "low_confidence": low_confidence,
             "degraded": degraded,
-            "created": existing is None,
+            "created": created,
             "error": "",
         }
 

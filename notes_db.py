@@ -208,8 +208,14 @@ class NotesDatabase:
             conn.commit()
             return note_id
 
-    def upsert_formula(self, fields: dict[str, Any]) -> int:
-        """按 fingerprint 落公式：同指纹不重复建（hash 缓存的落库形态）。"""
+    def upsert_formula(self, fields: dict[str, Any]) -> tuple[int, bool]:
+        """按 fingerprint 落公式，返回 ``(formula_id, created)``。
+
+        同一指纹不重复建（hash 缓存的落库形态）。指纹相同、**图片不同**时把
+        ``image_hash`` 更新成最新那张：同页课件拍两次的字节不一样，靠这个 hash
+        把最近那次也缓存住，否则每拍一次就再付一次识别费。代价是旧字节重发时会
+        重新识别一次（旧 hash 不再是缓存键；个人量级下不值得为此再加一张副表）。
+        """
         fingerprint = str(fields.get("fingerprint") or "").strip()
         if not fingerprint:
             raise ValueError("公式缺少 fingerprint")
@@ -222,10 +228,18 @@ class NotesDatabase:
         with self._lock:
             conn = self._connection()
             existing = conn.execute(
-                "SELECT id FROM formulas WHERE fingerprint = ?", (fingerprint,)
+                "SELECT id, image_hash FROM formulas WHERE fingerprint = ?",
+                (fingerprint,),
             ).fetchone()
             if existing is not None:
-                return int(existing["id"])
+                new_digest = str(fields.get("image_hash") or "").strip()
+                if new_digest and new_digest != str(existing["image_hash"] or ""):
+                    conn.execute(
+                        "UPDATE formulas SET image_hash = ? WHERE id = ?",
+                        (new_digest, int(existing["id"])),
+                    )
+                    conn.commit()
+                return int(existing["id"]), False
             values = [fields.get(col, None if col == "week" else "") for col in columns]
             cursor = conn.execute(
                 f"INSERT INTO formulas(fingerprint, created_at, {', '.join(columns)})"
@@ -246,7 +260,7 @@ class NotesDatabase:
                     ),
                 )
             conn.commit()
-            return formula_id
+            return formula_id, True
 
     def formula_by_fingerprint(self, fingerprint: str) -> sqlite3.Row | None:
         """按指纹取公式（判断"这条是不是新公式"，决定要不要回执给用户）。"""

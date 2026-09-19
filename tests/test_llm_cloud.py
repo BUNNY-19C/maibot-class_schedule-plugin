@@ -3,7 +3,6 @@
 import json
 import unittest
 from pathlib import Path
-from tempfile import TemporaryDirectory
 
 import _bootstrap  # noqa: F401  —— 注册插件包
 
@@ -168,12 +167,31 @@ class TestNotesDatabase(unittest.TestCase):
     def test_formula_dedup_by_fingerprint(self):
         tmp = self._tmpdir()
         db = self._db(Path(tmp))
-        first = db.upsert_formula({"fingerprint": "fp-1", "name": "欧拉公式"})
-        second = db.upsert_formula({"fingerprint": "fp-1", "name": "改名也一样"})
+        first, first_created = db.upsert_formula({"fingerprint": "fp-1", "name": "欧拉公式"})
+        second, second_created = db.upsert_formula({"fingerprint": "fp-1", "name": "改名也一样"})
         self.assertEqual(first, second)
+        self.assertTrue(first_created)
+        self.assertFalse(second_created)
         self.assertEqual(db.search_formulas("欧拉")[0]["name"], "欧拉公式")
         with self.assertRaises(ValueError):
             db.upsert_formula({"fingerprint": "  "})
+
+    def test_upsert_updates_image_hash_for_new_bytes(self):
+        """同一公式（同指纹）换一张图重拍：最新图片的 hash 要进缓存，否则每拍一次付一次钱。"""
+        tmp = self._tmpdir()
+        db = self._db(Path(tmp))
+        formula_id, created = db.upsert_formula(
+            {"fingerprint": "fp-1", "name": "欧拉公式", "image_hash": "hash-A"}
+        )
+        self.assertTrue(created)
+        same_id, created = db.upsert_formula(
+            {"fingerprint": "fp-1", "name": "欧拉公式", "image_hash": "hash-B"}
+        )
+        self.assertFalse(created)
+        self.assertEqual(same_id, formula_id)
+        self.assertEqual(db.formula_by_image_hash("hash-B")["id"], formula_id)
+        # 旧字节不再是缓存键（为简化不再留多份，详见 upsert_formula 的说明）
+        self.assertIsNone(db.formula_by_image_hash("hash-A"))
 
     def test_attach_tag_reuses_tag_rows(self):
         tmp = self._tmpdir()
@@ -189,8 +207,6 @@ class TestNotesDatabase(unittest.TestCase):
             db.attach_tag("unknown-table", 1, "#x")
 
     def test_embedding_roundtrip_and_cosine(self):
-        import array
-
         tmp = self._tmpdir()
         db = self._db(Path(tmp))
         note = db.add_note(source_type="文字", raw_content="x")

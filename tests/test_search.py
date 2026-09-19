@@ -1,9 +1,8 @@
 """混合检索引擎测试：查询解析、过滤、降级路径。"""
 
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
-from tempfile import TemporaryDirectory
 
 import _bootstrap  # noqa: F401  —— 注册插件包
 
@@ -66,7 +65,15 @@ class TestHybridSearch(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["semantic_error"], "")
 
     async def test_course_and_time_filters(self):
-        self.db.add_note(source_type="文字", raw_content="拉格朗日中值", course="高等数学")
+        note = self.db.add_note(source_type="文字", raw_content="拉格朗日中值", course="高等数学")
+        # add_note 的时间戳取真实 now()，而本用例按固定的 NOW 判"今天"：不钉住
+        # created_at，跨过午夜再跑就会莫名查不到（本机时间过零点后实测踩到）
+        conn = self.db._connection()  # noqa: SLF001  —— 测试里钉时间，不动公开 API
+        conn.execute(
+            "UPDATE notes SET created_at = ? WHERE id = ?",
+            (NOW.isoformat(timespec="seconds"), note),
+        )
+        conn.commit()
         searcher = HybridSearcher(self.db)
         result = await searcher.search(
             "上周三 拉格朗日", courses=["高等数学"], now=NOW

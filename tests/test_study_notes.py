@@ -182,5 +182,67 @@ class TestSearchAndMove(unittest.TestCase):
             self.assertEqual(store.count("高等数学"), 1)
 
 
+class TestAttachFormula(unittest.TestCase):
+    """识别结果回填笔记这一层的规矩。"""
+
+    def test_writes_index_field_and_readable_file(self):
+        with TemporaryDirectory() as tmp:
+            store = StudyNoteStore(Path(tmp) / "notes")
+            note = store.add_image_note(
+                "高等数学", "笔记", b"\x89PNGx", text="这是一张课件幻灯片"
+            )
+            done = store.attach_formula("高等数学", note.id, "欧拉公式：e^{i\\pi}+1=0")
+            self.assertIsNotNone(done)
+            self.assertIn("欧拉公式", done.formula)
+            self.assertIn("欧拉公式", done.display)  # 列表显示公式而不是图说
+            body = (
+                store.course_dir("高等数学") / f"{note.id}_{note.kind}.md"
+            ).read_text(encoding="utf-8")
+            self.assertIn("e^{i\\pi}+1=0", body)
+            self.assertIn("这是一张课件幻灯片", body)  # 图说降级为"图片说明"
+            self.assertIn(note.file, body)  # 还指向原图
+            # 幂等：同一条公式重复回填不再写盘
+            again = store.attach_formula("高等数学", note.id, "欧拉公式：e^{i\\pi}+1=0")
+            self.assertEqual(again.formula, done.formula)
+            # 搜索能命中公式；查不到笔记/空公式时返回 None
+            self.assertTrue(store.search("欧拉公式"))
+            self.assertIsNone(store.attach_formula("高等数学", "不存在", "x"))
+            self.assertIsNone(store.attach_formula("高等数学", note.id, "  "))
+
+
+class TestConcurrentWrites(unittest.TestCase):
+    """识别回填与收纳会并发写同一份索引（后台线程 + 事件循环），不能互相覆盖。"""
+
+    def test_threads_do_not_lose_notes_or_formulas(self):
+        import threading
+
+        with TemporaryDirectory() as tmp:
+            store = StudyNoteStore(Path(tmp) / "notes")
+            store.add_text_note("高等数学", "笔记", "第一条")
+            errors: list[BaseException] = []
+
+            def worker(index: int) -> None:
+                try:
+                    note = store.add_text_note("高等数学", "公式", f"第{index}条")
+                    store.attach_formula("高等数学", note.id, f"公式{index}：x={index}")
+                except BaseException as exc:  # noqa: BLE001  —— 线程里的异常要能断言
+                    errors.append(exc)
+
+            threads = [
+                threading.Thread(target=worker, args=(index,)) for index in range(10)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+            self.assertEqual(errors, [])
+            # 无锁的"读-改-写"会丢更新：这里必须 1 + 10 条都在，且公式一个不落
+            self.assertEqual(store.count("高等数学"), 11)
+            notes = store.recent("高等数学", limit=50)
+            filled = [note for note in notes if note.formula.startswith("公式")]
+            self.assertEqual(len(filled), 10)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -15,8 +15,8 @@
     python tools/dedupe_note_images.py --root <插件数据目录>/notes            # 预览
     python tools/dedupe_note_images.py --root <插件数据目录>/notes --apply    # 执行
 
-移走的文件连同 `manifest.json`（记录了每个文件的来源与 hash）放在
-`notes/_trash_<时间>/`，确认无误后整个目录删掉即可；恢复就是搬回来。
+移走的文件连同 ``manifest.json``（记录了每个文件的来源与 hash）放在
+``notes/_trash_<时间>/``，确认无误后整个目录删掉即可；恢复就是搬回来。
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -104,11 +105,18 @@ def main() -> int:
     referenced = {
         f"{course}/{note.get('file')}" for _d, course, note in loose
     }
+    #: 保留笔记引用的文件**绝对不动**：两条笔记共享同一文件时（手工编辑过索引
+    #: 才会出现），移走非保留那份会把保留笔记的唯一副本也带走
+    kept_paths = {root / course / str(note["file"]) for course, note in keep.values()}
     plan: list[tuple[str, Path, str]] = []
     for digest, course, note in loose:
         if str(note.get("id")) in keep_ids:
             continue
-        plan.append(("重复笔记的图", root / course / str(note["file"]), digest))
+        path = root / course / str(note["file"])
+        if path in kept_paths:
+            print(f"  ! {course}/{note['file']} 同时被保留笔记引用，跳过（共享文件）")
+            continue
+        plan.append(("重复笔记的图", path, digest))
     for path in sorted(root.glob("*/img/*")):
         rel = f"{path.parent.parent.name}/{path.parent.name}/{path.name}"
         if rel in referenced:
@@ -130,7 +138,6 @@ def main() -> int:
 
     trash = root / f"_trash_{time.strftime('%Y%m%d_%H%M%S')}"
     moved = []
-    import shutil
 
     for reason, path, digest in plan:
         target = trash / path.relative_to(root)

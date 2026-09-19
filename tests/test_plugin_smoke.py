@@ -4451,7 +4451,7 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
             await plugin.on_load()
             try:
                 plugin._pipeline.dropped = 7
-                self.assertIn("队列满丢弃 7", plugin._recognition_status_line())
+                self.assertIn("队列满丢弃 7", await plugin._recognition_status_line())
             finally:
                 await plugin.on_unload()
 
@@ -4461,7 +4461,7 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
         场景就是线上那次：图片早进库了，Key 是后来配的。插件在装载/识别刚可用时
         扫一遍笔记目录，把"有图没公式"的排进队列；用户什么都不用做。
         """
-        from class_schedule.formula import FormulaRecognizer
+        from class_schedule.formula import FormulaRecognizer, image_hash
 
         class FakeVision:
             def __init__(self, reply: str):
@@ -4501,17 +4501,13 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
                     await asyncio.sleep(0.01)
                 self.assertEqual(db.formula_count(), 1, "历史图片没被自动识别")
                 self.assertEqual(len(fake.calls), 1)
-                row = db.formula_by_image_hash(
-                    __import__("class_schedule.formula", fromlist=["image_hash"]).image_hash(
-                        b"\x89PNG-history-image"
-                    )
-                )
+                row = db.formula_by_image_hash(image_hash(b"\x89PNG-history-image"))
                 self.assertEqual(row["course"], "未分类")
                 self.assertEqual(row["latex_normalized"], "\\frac{\\pi}2")
                 # 补识别是补历史，不该往会话里回执刷屏
                 texts = [text for _stream, text in plugin.ctx.send.texts]  # type: ignore[attr-defined]
                 self.assertFalse(any("认出公式" in text for text in texts), texts)
-                self.assertIn("历史图片补识别 1", plugin._recognition_status_line())
+                self.assertIn("历史图片补识别 1", await plugin._recognition_status_line())
 
                 # 再触发一轮：认过的图靠 hash 缓存跳过，不再调用模型
                 await plugin._run_formula_backfill()
@@ -4526,63 +4522,60 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
         用户的库正是这个状态：公式在 SQLite 里，`/笔记` 与 `笔记文件` 里只有一句
         图说，所以他回"不是完整的公式，是文字描述"。
         """
-        from class_schedule.formula import FormulaRecognizer, image_hash
-        from class_schedule.notes_db import NotesDatabase as _Db
-
         import shutil
         import tempfile as _tf
+
+        from class_schedule.formula import FormulaRecognizer, image_hash
+        from class_schedule.notes_db import NotesDatabase
+        from class_schedule.pipeline import StudyPipeline
 
         # LIFO 清理：先注册目录删除（最后执行），再注册关库——Windows 上
         # 文件被连接占用时 rmtree 会失败
         root = Path(_tf.mkdtemp(prefix="backfill-"))
         self.addCleanup(shutil.rmtree, root, True)
-        if True:
-            store = StudyNoteStore(root / "notes")
-            image = b"\x89PNG-old-slide"
-            note = store.add_image_note("未分类", "笔记", image, text="这是一张课件幻灯片")
-            plugin = self.make_plugin(root, build_config(study={"api_key": "sk-test-key"}))
-            plugin._data_dir = root
-            plugin._notes = store
-            plugin._state = PluginState()
-            db = _Db(root / "notes.db")
-            db.initialize()
-            self.addCleanup(db.close)
-            plugin._notes_db = db
-            # 模拟"之前已经认过、只是没写进笔记"
-            db.upsert_formula({
-                "fingerprint": "old-fp",
-                "name": "许用应力公式",
-                "latex_raw": r"\frac{\sigma_{\lim}}{S_{\sigma}}",
-                "latex_normalized": r"\frac{\sigma_{\lim}}{S_{\sigma}}",
-                "image_hash": image_hash(image),
-            })
+        store = StudyNoteStore(root / "notes")
+        image = b"\x89PNG-old-slide"
+        note = store.add_image_note("未分类", "笔记", image, text="这是一张课件幻灯片")
+        plugin = self.make_plugin(root, build_config(study={"api_key": "sk-test-key"}))
+        plugin._data_dir = root
+        plugin._notes = store
+        plugin._state = PluginState()
+        db = NotesDatabase(root / "notes.db")
+        db.initialize()
+        self.addCleanup(db.close)
+        plugin._notes_db = db
+        # 模拟"之前已经认过、只是没写进笔记"
+        db.upsert_formula({
+            "fingerprint": "old-fp",
+            "name": "许用应力公式",
+            "latex_raw": r"\frac{\sigma_{\lim}}{S_{\sigma}}",
+            "latex_normalized": r"\frac{\sigma_{\lim}}{S_{\sigma}}",
+            "image_hash": image_hash(image),
+        })
 
-            class NoCall:
-                async def vision(self, **kwargs):
-                    raise AssertionError("已认过的图不该再调模型")
+        class NoCall:
+            async def vision(self, **kwargs):
+                raise AssertionError("已认过的图不该再调模型")
 
-            plugin._recognizer = FormulaRecognizer(db=db, client=NoCall(), model="vlm")
-            from class_schedule.pipeline import StudyPipeline
+        plugin._recognizer = FormulaRecognizer(db=db, client=NoCall(), model="vlm")
+        plugin._pipeline = StudyPipeline(
+            db=db,
+            recognizer=plugin._recognizer,
+            on_recognized=plugin._on_formula_recognized,
+        )
+        plugin._pipeline.start()
+        self.addAsyncCleanup(plugin._pipeline.stop)
 
-            plugin._pipeline = StudyPipeline(
-                db=db,
-                save_image=plugin._save_inbox_image,
-                recognizer=plugin._recognizer,
-                on_recognized=plugin._on_formula_recognized,
-            )
-            plugin._pipeline.start()
-            self.addAsyncCleanup(plugin._pipeline.stop)
-
-            await plugin._run_formula_backfill()
-            refreshed = store.recent("未分类", limit=1)[0]
-            self.assertIn("许用应力公式", refreshed.formula)
-            self.assertIn(r"\frac{\sigma_{\lim}}{S_{\sigma}}", refreshed.formula)
-            self.assertIn("许用应力公式", refreshed.display)
-            self.assertTrue(store.search("许用应力"))
-            body = (
-                store.course_dir("未分类") / f"{note.id}_{note.kind}.md"
-            ).read_text(encoding="utf-8")
-            self.assertIn("许用应力公式", body)
+        await plugin._run_formula_backfill()
+        refreshed = store.recent("未分类", limit=1)[0]
+        self.assertIn("许用应力公式", refreshed.formula)
+        self.assertIn(r"\frac{\sigma_{\lim}}{S_{\sigma}}", refreshed.formula)
+        self.assertIn("许用应力公式", refreshed.display)
+        self.assertTrue(store.search("许用应力"))
+        body = (
+            store.course_dir("未分类") / f"{note.id}_{note.kind}.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("许用应力公式", body)
 
     async def test_no_backfill_without_recognizer(self):
         """没配 Key 就不该有补识别任务（也不能报错）。"""
@@ -4649,6 +4642,37 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
             sent = plugin.ctx.send.texts[-1][1]  # type: ignore[attr-defined]
             self.assertIn("HTTP 503 模型繁忙", sent)
 
+    async def test_proactive_receipt_still_sends_formula_verbatim(self):
+        """proactive 模式下 attach_fixed 也不能形同虚设（构造审查抓出来的洞）。
+
+        proactive 是把措辞整个交给主链路开口、fixed_text 根本没有代码去发——
+        带数据的回执走这条路会永远丢掉公式。所以两者冲突时降级为直发。
+        """
+        with TemporaryDirectory() as tmp:
+            plugin = self.make_plugin(
+                Path(tmp),
+                build_config(
+                    access={"chat_scope": "private"},
+                    reply={"style": "fixed", "ack_style": "proactive"},
+                ),
+            )
+            await plugin._on_formula_recognized(
+                {"stream_id": "ps", "course": "未分类", "note_ref": ""},
+                {
+                    "status": "recognized",
+                    "created": True,
+                    "name": "欧拉公式",
+                    "latex": "e^{i\\pi}+1=0",
+                    "latex_normalized": "e^{i\\pi}+1=0",
+                    "low_confidence": False,
+                    "degraded": False,
+                },
+            )
+            self.assertEqual(plugin.ctx.maisaka.calls, [])  # 没有交给 replyer
+            self.assertEqual(plugin._pending_proactive, [])  # 也没登记发言验证
+            sent = plugin.ctx.send.texts[-1][1]  # type: ignore[attr-defined]
+            self.assertIn("e^{i\\pi}+1=0", sent)  # 公式原样送达
+
     async def test_config_update_enables_recognition_without_restart(self):
         """回归（线上实测）：Key 是后来在 WebUI 填的，热更新必须重建识别器。
 
@@ -4670,7 +4694,7 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
                     any("公式识别已启用" in line for line in captured.output), captured.output
                 )
                 # /笔记库 也要跟着改口：不能再报"未启用"
-                self.assertNotIn("未启用", plugin._recognition_status_line())
+                self.assertNotIn("未启用", await plugin._recognition_status_line())
 
                 # 反向：关掉云端开关后立刻停止识别，且管道不再收任务
                 await plugin.on_config_update(
@@ -4713,51 +4737,50 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
         # 文件被连接占用时 rmtree 会失败
         tmp_path = Path(_tf.mkdtemp(prefix="cappedup-"))
         self.addCleanup(shutil.rmtree, tmp_path, True)
-        if True:
-            plugin = self.prepare_bare(
-                tmp_path,
-                config=build_config(
-                    access={"chat_scope": "private"}, study={"summary_enabled": False}
-                ),
-            )
-            db = NotesDatabase(tmp_path / "notes.db")
-            db.initialize()
-            self.addCleanup(db.close)  # 后注册先跑：先关库再删目录
-            plugin._notes_db = db
-            plugin._pipeline = StudyPipeline(db=db, save_image=plugin._save_inbox_image)
-            plugin._pipeline.start()
-            self.addAsyncCleanup(plugin._pipeline.stop)
+        plugin = self.prepare_bare(
+            tmp_path,
+            config=build_config(
+                access={"chat_scope": "private"}, study={"summary_enabled": False}
+            ),
+        )
+        db = NotesDatabase(tmp_path / "notes.db")
+        db.initialize()
+        self.addCleanup(db.close)  # 后注册先跑：先关库再删目录
+        plugin._notes_db = db
+        plugin._pipeline = StudyPipeline(db=db)
+        plugin._pipeline.start()
+        self.addAsyncCleanup(plugin._pipeline.stop)
 
-            payload = base64.b64encode(b"\x89PNGx-caption-dedup").decode()
-            message = {
-                "session_id": "ps",
-                "message_info": {"user_info": {"user_id": "654321"}},
-                "raw_message": [
-                    {"type": "text", "data": {"text": "记一下 这张课件"}},
-                    {"type": "image", "data": {}, "binary_data_base64": payload},
-                ],
-            }
-            await plugin.handle_note_capture(message=message, stream_id="ps")
-            for task in list(plugin._note_tasks):
-                await task
-            await plugin.handle_note_capture(message=message, stream_id="ps")
-            for task in list(plugin._note_tasks):
-                await task
-            self.assertEqual(len(db.search_text("课件")), 2)
+        payload = base64.b64encode(b"\x89PNGx-caption-dedup").decode()
+        message = {
+            "session_id": "ps",
+            "message_info": {"user_info": {"user_id": "654321"}},
+            "raw_message": [
+                {"type": "text", "data": {"text": "记一下 这张课件"}},
+                {"type": "image", "data": {}, "binary_data_base64": payload},
+            ],
+        }
+        await plugin.handle_note_capture(message=message, stream_id="ps")
+        for task in list(plugin._note_tasks):
+            await task
+        await plugin.handle_note_capture(message=message, stream_id="ps")
+        for task in list(plugin._note_tasks):
+            await task
+        self.assertEqual(len(db.search_text("课件")), 2)
 
-            # 纯文本笔记仍然去重（老行为不变）
-            text_message = {
-                "session_id": "ps",
-                "message_info": {"user_info": {"user_id": "654321"}},
-                "raw_message": [{"type": "text", "data": {"text": "记一下 牛顿第二定律"}}],
-            }
-            await plugin.handle_note_capture(message=text_message, stream_id="ps")
-            for task in list(plugin._note_tasks):
-                await task
-            await plugin.handle_note_capture(message=text_message, stream_id="ps")
-            for task in list(plugin._note_tasks):
-                await task
-            self.assertEqual(len(db.search_text("牛顿第二定律")), 1)
+        # 纯文本笔记仍然去重（老行为不变）
+        text_message = {
+            "session_id": "ps",
+            "message_info": {"user_info": {"user_id": "654321"}},
+            "raw_message": [{"type": "text", "data": {"text": "记一下 牛顿第二定律"}}],
+        }
+        await plugin.handle_note_capture(message=text_message, stream_id="ps")
+        for task in list(plugin._note_tasks):
+            await task
+        await plugin.handle_note_capture(message=text_message, stream_id="ps")
+        for task in list(plugin._note_tasks):
+            await task
+        self.assertEqual(len(db.search_text("牛顿第二定律")), 1)
 
 
 if __name__ == "__main__":

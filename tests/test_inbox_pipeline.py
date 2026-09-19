@@ -82,57 +82,56 @@ class PersistEndToEnd(unittest.IsolatedAsyncioTestCase):
         # 文件被连接占用时 rmtree 会失败
         tmp_path = Path(_tf.mkdtemp(prefix="inbox2-"))
         self.addCleanup(shutil.rmtree, tmp_path, True)
-        if True:
-            plugin = ClassSchedulePlugin()
-            plugin._set_context(smoke.FakeCtx(tmp_path))  # type: ignore[arg-type]
-            plugin.set_plugin_config(
-                {"plugin": {"config_version": "1.0.0", "enabled": True},
-                 "reply": {"style": "fixed", "ack_style": "fixed"},
-                 "access": {"chat_scope": "private"}}
+        plugin = ClassSchedulePlugin()
+        plugin._set_context(smoke.FakeCtx(tmp_path))  # type: ignore[arg-type]
+        plugin.set_plugin_config(
+            {"plugin": {"config_version": "1.0.0", "enabled": True},
+             "reply": {"style": "fixed", "ack_style": "fixed"},
+             "access": {"chat_scope": "private"}}
+        )
+        plugin._data_dir = tmp_path
+        plugin._notes = StudyNoteStore(tmp_path / "notes")
+        plugin._state = PluginState()
+        db = NotesDatabase(tmp_path / "notes.db")
+        db.initialize()
+        self.addCleanup(db.close)  # 后注册先跑：先关库再删目录
+        plugin._notes_db = db
+        plugin._pipeline = StudyPipeline(db=db)
+        plugin._pipeline.start()
+
+        async def capture(text: str) -> None:
+            await plugin.handle_note_capture(
+                message={
+                    "session_id": "ps",
+                    "message_info": {"user_info": {"user_id": "654321"}},
+                    "raw_message": [{"type": "text", "data": {"text": text}}],
+                },
+                stream_id="ps",
             )
-            plugin._data_dir = tmp_path
-            plugin._notes = StudyNoteStore(tmp_path / "notes")
-            plugin._state = PluginState()
-            db = NotesDatabase(tmp_path / "notes.db")
-            db.initialize()
-            self.addCleanup(db.close)  # 后注册先跑：先关库再删目录
-            plugin._notes_db = db
-            plugin._pipeline = StudyPipeline(db=db, save_image=plugin._save_inbox_image)
-            plugin._pipeline.start()
+            for task in list(plugin._note_tasks):
+                await task
 
-            async def capture(text: str) -> None:
-                await plugin.handle_note_capture(
-                    message={
-                        "session_id": "ps",
-                        "message_info": {"user_info": {"user_id": "654321"}},
-                        "raw_message": [{"type": "text", "data": {"text": text}}],
-                    },
-                    stream_id="ps",
-                )
-                for task in list(plugin._note_tasks):
-                    await task
+        await capture("记一下 欧拉公式 e^iπ+1=0")
+        rows = db.search_text("欧拉")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["course"], "未分类")
+        tags = db.tags_for(rows[0]["id"])
+        # 触发词「记一下」不含"公式"，kind=笔记 与 v1.4 行为一致
+        self.assertIn("#笔记", tags)
+        self.assertIn("#文字", tags)
+        self.assertIn("#未分类", tags)
+        # markdown 层同时存在（v1.4 行为没被管道破坏）
+        self.assertEqual(plugin._notes.count("未分类"), 1)
 
-            await capture("记一下 欧拉公式 e^iπ+1=0")
-            rows = db.search_text("欧拉")
-            self.assertEqual(len(rows), 1)
-            self.assertEqual(rows[0]["course"], "未分类")
-            tags = db.tags_for(rows[0]["id"])
-            # 触发词「记一下」不含"公式"，kind=笔记 与 v1.4 行为一致
-            self.assertIn("#笔记", tags)
-            self.assertIn("#文字", tags)
-            self.assertIn("#未分类", tags)
-            # markdown 层同时存在（v1.4 行为没被管道破坏）
-            self.assertEqual(plugin._notes.count("未分类"), 1)
+        # 重复内容：SQLite 层去重，markdown 层维持原行为
+        await capture("记一下 欧拉公式 e^iπ+1=0")
+        self.assertEqual(len(db.search_text("欧拉")), 1)
+        self.assertEqual(plugin._notes.count("未分类"), 2)
 
-            # 重复内容：SQLite 层去重，markdown 层维持原行为
-            await capture("记一下 欧拉公式 e^iπ+1=0")
-            self.assertEqual(len(db.search_text("欧拉")), 1)
-            self.assertEqual(plugin._notes.count("未分类"), 2)
-
-            # 落库异常不能打断主路径：pipeline 置 None 后再来一条照常归档
-            plugin._pipeline = None
-            await capture("记一下 牛顿第二定律")
-            self.assertEqual(plugin._notes.count("未分类"), 3)
+        # 落库异常不能打断主路径：pipeline 置 None 后再来一条照常归档
+        plugin._pipeline = None
+        await capture("记一下 牛顿第二定律")
+        self.assertEqual(plugin._notes.count("未分类"), 3)
 
 
 class RecognitionEndToEnd(unittest.IsolatedAsyncioTestCase):
@@ -179,7 +178,6 @@ class RecognitionEndToEnd(unittest.IsolatedAsyncioTestCase):
         )
         plugin._pipeline = StudyPipeline(
             db=db,
-            save_image=plugin._save_inbox_image,
             recognizer=plugin._recognizer,
             on_recognized=plugin._on_formula_recognized,
             queue_size=8,
@@ -244,7 +242,6 @@ class RecognitionEndToEnd(unittest.IsolatedAsyncioTestCase):
         )
         plugin._pipeline = StudyPipeline(
             db=db,
-            save_image=plugin._save_inbox_image,
             recognizer=plugin._recognizer,
             on_recognized=plugin._on_formula_recognized,
             queue_size=8,
@@ -325,9 +322,8 @@ class RecognitionEndToEnd(unittest.IsolatedAsyncioTestCase):
 
     async def test_formula_is_written_into_the_note(self):
         """公式要落到笔记里：/笔记、/找 与笔记文件看到的得是公式，不是图说。"""
-        plugin, db, fake = await self._capture_one_image()
+        plugin, db, _fake = await self._capture_one_image()
         notes = plugin._notes
-        target = notes.recent("未分类", limit=1)[0]
         self.assertTrue(
             await _wait_until(lambda: bool(notes.recent("未分类", limit=1)[0].formula))
         )
@@ -350,6 +346,11 @@ class RecognitionEndToEnd(unittest.IsolatedAsyncioTestCase):
         self.assertIn("半角公式", plugin.ctx.send.texts[-1][1])  # type: ignore[attr-defined]
         await plugin.handle_note_search(**smoke.private_kwargs("ps"), matched_groups={"keyword": "半角"})
         self.assertIn("半角公式", plugin.ctx.send.texts[-1][1])  # type: ignore[attr-defined]
+        # 回归（构造审查）：一张图只落一份文件。SQLite 笔记记的就是 markdown 层
+        # 那份；旧实现管道又调 save_raw_image 存了第二份，制造出索引没引用的孤儿副本
+        sqlite_note = db.search_text("课件")[0]
+        self.assertEqual(sqlite_note["image_path"], target.file)
+        self.assertEqual(len(list((notes.course_dir("未分类") / "img").iterdir())), 1)
 
     async def test_explicit_image_reports_failure_instead_of_silence(self):
         """用户主动发的图识别失败也要有回应：静默失败最难排查。"""
@@ -389,7 +390,6 @@ class RecognitionEndToEnd(unittest.IsolatedAsyncioTestCase):
         )
         plugin._pipeline = StudyPipeline(
             db=db,
-            save_image=plugin._save_inbox_image,
             recognizer=plugin._recognizer,
             on_recognized=plugin._on_formula_recognized,
             queue_size=4,

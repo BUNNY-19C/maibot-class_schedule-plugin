@@ -10,9 +10,8 @@ import hashlib
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Iterable
+from typing import Any
 
-from .constants import LOG_PREFIX
 from .file_intake import extract_file_candidates
 
 MAX_RAW_CHARS = 8000

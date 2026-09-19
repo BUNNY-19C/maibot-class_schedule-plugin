@@ -9,7 +9,7 @@
   绝不阻塞入站消息——识别是增强层，丢一条识别远好过卡住聊天；
 - **worker 不碰事件循环**：所有 sqlite/HTTP 调用都在 ``asyncio.to_thread`` 里，
   且**不在持锁处 await**（重建前踩过自调用死锁），所以 worker 内部可以安全地
-  调回本研究管道/数据库；
+  调回本管道/数据库；
 - **停机丢的是识别、不是笔记**：``stop`` 取消 worker，队列里未处理的识别任务
   随卸载消失（下次同样内容会重新入队，指纹去重保证不会存两条）。
 """
@@ -22,7 +22,7 @@ from contextlib import suppress
 from typing import Any, Awaitable, Callable
 
 from .constants import LOG_PREFIX
-from .inbox import ParsedMessage, normalize_image_segment  # noqa: F401  (供上层判型)
+from .inbox import ParsedMessage
 
 logger = logging.getLogger(__name__)
 
@@ -43,24 +43,19 @@ class StudyPipeline:
         *,
         db: Any,
         worker_count: int = 1,
-        save_image: Callable[[str, bytes, str], str] | None = None,
-        persist_interval_seconds: int = 10,
         recognizer: Any | None = None,
         on_recognized: Callable[[dict[str, Any], dict[str, Any]], Awaitable[None]] | None = None,
         queue_size: int = DEFAULT_QUEUE_SIZE,
     ) -> None:
         self._db = db
         self._worker_count = max(1, int(worker_count))
-        self._save_image = save_image
         self._started = False
-        self._persist_interval = max(0, int(persist_interval_seconds))
-        self._last_persist = 0.0
         self._recognizer = recognizer
         self._on_recognized = on_recognized
         self._queue_size = max(1, int(queue_size))
         self._queue: asyncio.Queue[dict[str, Any] | None] | None = None
         self._workers: list[asyncio.Task[None]] = []
-        #: 计数：入队/识别完成/被丢弃/异常。丢弃数是"队列太小"的唯一证据
+        #: 计数：入队/识别完成/被丢弃。丢弃数是"队列太小"的唯一证据
         self.enqueued = 0
         self.completed = 0
         self.dropped = 0
@@ -130,18 +125,19 @@ class StudyPipeline:
         kind: str = "",
         stream_id: str = "",
         note_refs: list[str] | None = None,
+        image_path: str = "",
     ) -> int:
         """落一条笔记（同步）+ 把公式识别排进队列（异步）。返回 note id。
 
         ``note_refs`` 是 markdown 层每条笔记的 id（与 ``parsed.images`` 同序）：
         识别完成后公式要回填到那一条，用户才在 /笔记、/找 里看得到公式本身。
+
+        ``image_path`` 是原图在笔记目录里的相对路径——由 markdown 层提供。
+        这里**不再自己存图**：同一张图存两份曾是重复构造，还会制造索引没引用的
+        孤儿副本（线上清理过一次才知道心疼）。
         """
         raw = (parsed.text or "").strip()
-        image_rel = ""
-        if parsed.images and self._save_image is not None:
-            data, suffix = parsed.images[0]
-            if data:
-                image_rel = self._save_image(course, data, suffix)
+        image_rel = str(image_path or "")
         note_id = await asyncio.to_thread(
             self._db.add_note,
             source_type=source_type,

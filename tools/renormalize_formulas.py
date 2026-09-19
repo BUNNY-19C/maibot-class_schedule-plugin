@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 import sqlite3
 import sys
 import types
@@ -56,6 +57,12 @@ def main() -> int:
         "SELECT id, name, latex_raw, latex_normalized, fingerprint FROM formulas ORDER BY id"
     ))
     print(f"公式共 {len(rows)} 条；{'写入模式' if args.apply else '预览模式（加 --apply 才写）'}")
+    if args.apply and rows:
+        # 写之前先留一份底：规则是"整理层可重新生成"，但它说的是按**对**的规则重生，
+        # 不是按错规则再错一遍还能回去
+        backup = path.with_suffix(path.suffix + ".bak")
+        shutil.copy2(path, backup)
+        print(f"已备份到 {backup}")
 
     taken = {str(row["fingerprint"]): int(row["id"]) for row in rows}
     changed = same = conflicted = 0
