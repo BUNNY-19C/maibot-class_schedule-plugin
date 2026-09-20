@@ -516,8 +516,9 @@ class TestFormulaRecognizer(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.db.formula_count(), 0)
 
     async def test_failures_are_recorded_and_bounded(self):
-        """失败按图片 hash 记数：自动补识别最多试 MAX_FAILED_ATTEMPTS 次，不再烧钱。"""
-        recognizer = self._recognizer([CloudError("网络错误")])  # 永远失败
+        """模型"答不出"这类失败按图片 hash 记数：自动补识别最多试
+        MAX_FAILED_ATTEMPTS 次就不再烧钱。"""
+        recognizer = self._recognizer([CloudError("HTTP 400 模型不接受这张图")])  # 永远失败
         digest = image_hash(b"retry-me")
         self.assertFalse(recognizer.has_given_up(digest))
         await recognizer.recognize(b"retry-me")
@@ -526,7 +527,7 @@ class TestFormulaRecognizer(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(recognizer.has_given_up(digest))
         row = self.db.formula_failure(digest)
         self.assertEqual(int(row["attempts"]), MAX_FAILED_ATTEMPTS)
-        self.assertIn("网络", row["last_error"])
+        self.assertIn("400", row["last_error"])
         # 失败的图不算缓存命中，也不会建公式
         self.assertEqual(self.db.formula_count(), 0)
         self.assertEqual(self.db.formula_failure_count(), 1)
@@ -536,6 +537,20 @@ class TestFormulaRecognizer(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "recognized")
         self.assertEqual(self.db.formula_count(), 1)
 
+    async def test_transient_timeout_does_not_consume_the_budget(self):
+        """拥塞/超时不计入放弃预算：线上两张图就是被 30 秒读超时判了"没救"。"""
+        recognizer = self._recognizer(
+            [CloudError("云端调用失败（已重试 2 次）：请求超时/中断: The read operation timed out")]
+        )
+        digest = image_hash(b"slow-slide")
+        for _ in range(MAX_FAILED_ATTEMPTS + 2):
+            result = await recognizer.recognize(b"slow-slide")
+            self.assertEqual(result["status"], "failed")
+            self.assertTrue(result["transient"], "超时应当被认成可重试的失败")
+        self.assertFalse(recognizer.has_given_up(digest), "超时不该把这行判死刑")
+        self.assertEqual(self.db.formula_failure_count(), 0)
+        self.assertEqual(recognizer.failed_count, MAX_FAILED_ATTEMPTS + 2)
+
     async def test_failure_recording_never_breaks_the_flow(self):
         """失败记录写不进去（DB 坏了）也不影响返回失败结果。"""
         import sqlite3
@@ -544,7 +559,7 @@ class TestFormulaRecognizer(unittest.IsolatedAsyncioTestCase):
             def __getattr__(self, name):
                 raise sqlite3.OperationalError(f"disk I/O error（{name}）")
 
-        client = FakeVision([CloudError("网络错误")])
+        client = FakeVision([CloudError("HTTP 400 模型不接受这张图")])
         recognizer = FormulaRecognizer(db=BrokenDb(), client=client, model="vlm")
         result = await recognizer.recognize(b"img")
         self.assertEqual(result["status"], "failed")

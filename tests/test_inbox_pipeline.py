@@ -434,7 +434,7 @@ class RecognitionEndToEnd(unittest.IsolatedAsyncioTestCase):
 
         class AlwaysFails:
             async def vision(self, **kwargs):
-                raise CloudError("HTTP 503 模型繁忙")
+                raise CloudError("HTTP 400 模型不接受这张图")
 
         plugin._recognizer = FormulaRecognizer(
             db=db, client=AlwaysFails(), model="vlm", fallback_model=""

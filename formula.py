@@ -44,6 +44,19 @@ FINGERPRINT_LENGTH = 16
 #: 或模型反复答非所问时，试满这个次数就归为"这张图没救"，只留失败计数
 #: （用户主动重发不受这个上限约束——那是他的明确意图）。
 MAX_FAILED_ATTEMPTS = 2
+#: 基础设施类失败（排队拥塞、网络抖动、限流）：**不计入**上面的预算。
+#: 线上实测两张图就是被 30 秒读超时判了"死刑"——拥塞是会自己好的，把它记成
+#: "这图没救"等于永久丢掉课件上的公式。
+_TRANSIENT_MARKS = (
+    "超时", "timeout", "timed out", "网络请求失败", "网络错误",
+    "连接", "http 503", "http 429", "http 502", "http 504",
+)
+
+
+def looks_transient(error: str) -> bool:
+    """这条失败是不是"过一会儿再试就可能成"的基础设施问题。"""
+    lowered = str(error or "").lower()
+    return any(mark in lowered for mark in _TRANSIENT_MARKS)
 
 FORMULA_PROMPT = """你是公式识别助手。看这张图片，把里面**所有**手写或印刷的数学公式逐条识别出来，按下面的 JSON 结构回答。
 
@@ -379,7 +392,7 @@ def _starts_break_macro(text: str, index: int) -> bool:
 
 
 def _operand_end(text: str, index: int) -> int | None:
-    """读一个操作数（一个或多个相邻原子）；读不出内容返回 ``None``。
+    r"""读一个操作数（一个或多个相邻原子）；读不出内容返回 ``None``。
 
     相邻原子算同一个操作数（``kT``、``\sigma_{\lim}``、``(a)(b)``），这在数学上
     是安全的：括起来只会更明确，不会改变结合关系。
@@ -696,7 +709,11 @@ class FormulaRecognizer:
                 errors.append(f"{model}: {exc!r}")
         if parsed is None:
             result = self._failure("；".join(errors)[:300] or "识别失败")
-            await self._note_failure(digest, result["error"])
+            if looks_transient(result["error"]):
+                # 拥塞/超时不算"这张图没救"：不写失败计数，下次装载还会试
+                result["transient"] = True
+            else:
+                await self._note_failure(digest, result["error"])
             return result
         if not parsed:
             # 模型说"这张图确实没有公式"：不记失败（免得把重试预算吃光），
@@ -756,6 +773,7 @@ class FormulaRecognizer:
             "status": "failed",
             "formulas": [],
             "degraded": False,
+            "transient": False,
             "error": reason,
         }
 

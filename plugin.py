@@ -3172,9 +3172,9 @@ class ClassSchedulePlugin(MaiBotPlugin):
             key,
             base_url=str(study.api_base_url or "").strip(),
             # 一条多公式的 JSON 是不流式的：模型没算完，socket 上就没有任何字节，
-            # 读超时因此是"整次调用的上限"。实测收 7 条公式要 285 秒，配置默认的
-            # 30 秒会把识别整条打死（HTTP 408/读超时），所以识别这条链路有下限。
-            timeout_seconds=max(90, int(study.cloud_timeout_seconds)),
+            # 读超时因此等于"整次调用的上限"。实测收 6 条要 111 秒、7 条要 285 秒，
+            # 配置默认的 30 秒会把识别整条打死，所以这条链路有 240 秒下限
+            timeout_seconds=max(240, int(study.cloud_timeout_seconds)),
         )
         if not client.configured:
             return None  # 缺 Key 或不是 https：装配期就能判定，不必等到调用
@@ -3321,11 +3321,12 @@ class ClassSchedulePlugin(MaiBotPlugin):
 
         if status == "failed":
             reason = one_line(str(result.get("error") or "模型没给出可用结果"), 60)
+            again = "（云端拥塞，稍后会自动再试）" if result.get("transient") else ""
             await self._deliver(
                 stream_id,
                 f"图片识别失败：{reason}",
                 reason="formula_recognized",
-                fixed_text=f"🧮 这张图没认出公式{where}\n　{reason}",
+                fixed_text=f"🧮 这张图没认出公式{where}\n　{reason}{again}",
                 verbatim=True,
             )
             return

@@ -4443,7 +4443,7 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
                 await plugin.on_unload()
 
     async def test_recognition_timeout_has_a_floor(self):
-        """识别这条链路的超时有 90 秒下限：真实 A/B 里收 7 条公式要了 285 秒。
+        """识别这条链路的超时有 240 秒下限：真实 A/B 里收 6 条公式要了 111 秒。
 
         多公式的返回不是流式的，模型算完之前 socket 上一个字节都没有，所以配置的
         30 秒会变成"整次调用的上限"并把识别整条打死。
@@ -4457,7 +4457,7 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
             try:
                 self.assertIsNotNone(plugin._cloud_client)
                 # 客户端私有字段：测试里直接读，避免为一个下限再开一层公开 API
-                self.assertGreaterEqual(plugin._cloud_client._timeout, 90)
+                self.assertGreaterEqual(plugin._cloud_client._timeout, 240)
             finally:
                 await plugin.on_unload()
 
@@ -4688,6 +4688,14 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
             )
             sent = plugin.ctx.send.texts[-1][1]  # type: ignore[attr-defined]
             self.assertIn("HTTP 503 模型繁忙", sent)
+            self.assertNotIn("稍后会自动再试", sent)  # 没标 transient 就不许给空头承诺
+
+            await plugin._on_formula_recognized(
+                {"stream_id": "ps", "course": "", "note_ref": ""},
+                {"status": "failed", "error": "读超时", "transient": True, "formulas": []},
+            )
+            sent = plugin.ctx.send.texts[-1][1]  # type: ignore[attr-defined]
+            self.assertIn("稍后会自动再试", sent)  # 拥塞要说清楚：这张图没被放弃
 
             # 图里没有公式也要说一声（原来会静默，像坏了）
             await plugin._on_formula_recognized(

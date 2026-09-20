@@ -163,7 +163,7 @@ data/plugins/github.BUNNY-19C.class-schedule/
 
 ## 开发与测试
 
-693 项单元测试,只用标准库 `unittest`,不需要额外安装依赖:
+694 项单元测试,只用标准库 `unittest`,不需要额外安装依赖:
 
 ```bash
 cd maibot_plugin_class_schedule
