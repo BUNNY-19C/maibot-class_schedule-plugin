@@ -3142,7 +3142,7 @@ class ClassSchedulePlugin(MaiBotPlugin):
         if not armed and not triggered:
             return
 
-        candidates = self._find_image_segments(message)
+        candidates = self._dedupe_image_candidates(self._find_image_segments(message))
         if not candidates:
             return
         self._note_images[stream_id] = {
@@ -3457,7 +3457,9 @@ class ClassSchedulePlugin(MaiBotPlugin):
         stashed_images = (
             stashed["images"] if stashed and now <= stashed["deadline"] else []
         )
-        image_candidates = [*stashed_images, *self._find_image_segments(message)]
+        image_candidates = self._dedupe_image_candidates(
+            [*stashed_images, *self._find_image_segments(message)]
+        )
 
         # 1) 等待内容状态：上一条只发了触发词，这一条就是内容
         pending = self._awaiting_note.pop(stream_id, None)
@@ -3517,6 +3519,34 @@ class ClassSchedulePlugin(MaiBotPlugin):
             reason="note_capture",
             fixed_text=f"📝 好，接下来这条消息我会帮你记下来（{minutes} 分钟内有效）。",
         )
+
+    @staticmethod
+    def _dedupe_image_candidates(
+        candidates: list[dict[str, str]],
+    ) -> list[dict[str, str]]:
+        """按内容去重图片候选（同一张图只留第一次出现的那份）。
+
+        必须去重：before_process 抢下来的暂存图与 after_process 从消息里再提出来的
+        是**同一张**——实测 SnowLuma 在 after_process 阶段仍带着 binary_data_base64，
+        于是每张图被收两遍、生成两条笔记；用户随后 /归到 只搬走最近一条，另一条
+        永远留在「未分类」，识别任务也白白翻倍（连失败重试预算都被同一张图吃满）。
+        """
+        seen: set[str] = set()
+        unique: list[dict[str, str]] = []
+        for candidate in candidates:
+            b64 = str(candidate.get("base64") or "")
+            url = str(candidate.get("url") or "")
+            if b64:
+                key = hashlib.sha256(b64.encode("utf-8")).hexdigest()[:16]
+            elif url:
+                key = f"url:{url}"
+            else:
+                key = f"empty:{len(unique)}"  # 空候选各自保留，交给下游按失败处理
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(candidate)
+        return unique
 
     def _spawn_note_capture(
         self,

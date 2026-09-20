@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import _bootstrap  # noqa: F401  —— 注册插件包
@@ -137,8 +138,18 @@ class PersistEndToEnd(unittest.IsolatedAsyncioTestCase):
 class RecognitionEndToEnd(unittest.IsolatedAsyncioTestCase):
     """图片笔记 → 落库 → worker 识别 → 公式库 + 回执（真队列，真线程）。"""
 
-    async def _capture_one_image(self, reply: str = _FORMULA_REPLY, image: bytes = _PNG):
-        """搭一套装好识别器的插件，发一张带「记一下」的图，返回 (plugin, db, fake)。"""
+    async def _capture_one_image(
+        self,
+        reply: str = _FORMULA_REPLY,
+        image: bytes = _PNG,
+        *,
+        with_stash: bool = False,
+    ):
+        """搭一套装好识别器的插件，发一张带「记一下」的图，返回 (plugin, db, fake)。
+
+        ``with_stash=True`` 时先塞进 before_process 抢到的同一张图（复现线上：宿主在
+        after_process 仍带着原图字节，同一张图于是有两个来源）。
+        """
         import shutil
         import tempfile as _tf
 
@@ -184,6 +195,13 @@ class RecognitionEndToEnd(unittest.IsolatedAsyncioTestCase):
         )
         plugin._pipeline.start()
         self.addAsyncCleanup(plugin._pipeline.stop)
+
+        if with_stash:
+            # before_process 抢图的结果：与下面消息里那张是同一张图
+            plugin._note_images["ps"] = {
+                "deadline": datetime.now() + timedelta(minutes=5),
+                "images": [{"base64": base64.b64encode(image).decode()}],
+            }
 
         await plugin.handle_note_capture(
             message={
@@ -351,6 +369,39 @@ class RecognitionEndToEnd(unittest.IsolatedAsyncioTestCase):
         sqlite_note = db.search_text("课件")[0]
         self.assertEqual(sqlite_note["image_path"], target.file)
         self.assertEqual(len(list((notes.course_dir("未分类") / "img").iterdir())), 1)
+
+    async def test_same_image_from_stash_and_message_captured_once(self):
+        """回归（线上实测）：before_process 暂存的图与消息里的同一张，只能收一次。
+
+        SnowLuma 在 after_process 仍带着 binary_data_base64，两个来源直接拼接会让
+        每张图存两遍、生成两条笔记、排两个识别任务；用户接着 /归到 只搬走最近一条，
+        另一条永远留在「未分类」——库里每个时间点都成对出现就是这么来的。
+        """
+        plugin, db, fake = await self._capture_one_image(with_stash=True)
+        notes = plugin._notes
+        for _ in range(200):
+            if fake.calls >= 1:
+                break
+            await asyncio.sleep(0.01)
+        self.assertEqual(notes.count("未分类"), 1, "同一张图被收了两遍")
+        self.assertEqual(len(list((notes.course_dir("未分类") / "img").iterdir())), 1)
+        self.assertEqual(len(db.search_text("课件")), 1)
+        self.assertEqual(fake.calls, 1, "识别任务被排了两遍")
+        self.assertEqual(db.formula_count(), 1)
+
+    def test_dedupe_image_candidates(self):
+        """去重函数本体：base64 相同算同一张；只有 URL 时按 URL 去重。"""
+        from class_schedule.plugin import ClassSchedulePlugin
+
+        same = {"base64": "QUJDRA=="}
+        dedupe = ClassSchedulePlugin._dedupe_image_candidates
+        self.assertEqual(dedupe([same, dict(same), {"url": "https://x/y.jpg"}]),
+                         [same, {"url": "https://x/y.jpg"}])
+        self.assertEqual(
+            len(dedupe([{"url": "https://x/y.jpg"}, {"url": "https://x/y.jpg"}])), 1
+        )
+        # 两个空候选都保留，交给下游按"读不到图"处理，不在这里悄悄丢内容
+        self.assertEqual(len(dedupe([{}, {}])), 2)
 
     async def test_explicit_image_reports_failure_instead_of_silence(self):
         """用户主动发的图识别失败也要有回应：静默失败最难排查。"""
