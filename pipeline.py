@@ -33,6 +33,7 @@ DEFAULT_QUEUE_SIZE = 200
 _STATUS_LABELS = {
     "recognized": "完成",
     "cached": "命中图片缓存",
+    "no_formula": "图里没有公式",
     "failed": "失败",
 }
 
@@ -224,9 +225,12 @@ class StudyPipeline:
         )
         # 每条结果都留一行日志：识别是异步的，没有日志就只剩"用户觉得没反应"
         # （线上实测：缓存命中的图被静默处理，排查时无从下手）
+        names = "、".join(
+            str(item.get("name") or "?") for item in result.get("formulas") or []
+        )
         logger.info(
             f"{LOG_PREFIX} 识别{_STATUS_LABELS.get(str(result.get('status')), '结束')}："
-            f"{result.get('name') or '未认出'}｜课程 {job.get('course') or '未分类'}"
+            f"{names or '未认出'}｜课程 {job.get('course') or '未分类'}"
             f"｜note={job.get('note_id')}"
             + (f"｜{result.get('error')}" if result.get("status") == "failed" else "")
         )

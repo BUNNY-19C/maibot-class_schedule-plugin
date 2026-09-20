@@ -155,33 +155,76 @@ class TestParseFormulaResponse(unittest.TestCase):
         parsed = parse_formula_response(
             json.dumps(
                 {
-                    "latex": r"\dfrac{\pi}{2}",
-                    "name": "半角公式",
-                    "aliases": ["α/2 公式"],
-                    "category": "高等数学",
-                    "subcategory": "三角函数",
-                    "knowledge_points": ["半角", "三角函数"],
-                    "description": "由 π/2 推出的公式",
-                    "confidence": 0.9,
+                    "formulas": [
+                        {
+                            "latex": r"\dfrac{\pi}{2}",
+                            "name": "半角公式",
+                            "aliases": ["α/2 公式"],
+                            "category": "高等数学",
+                            "subcategory": "三角函数",
+                            "knowledge_points": ["半角", "三角函数"],
+                            "description": "由 π/2 推出的公式",
+                            "confidence": 0.9,
+                        }
+                    ]
                 },
                 ensure_ascii=False,
             )
         )
-        self.assertEqual(parsed["name"], "半角公式")
-        self.assertEqual(parsed["latex"], r"\dfrac{\pi}{2}")  # 原文保留
-        self.assertEqual(parsed["latex_normalized"], normalize_latex(r"\frac{\pi}{2}"))
-        self.assertEqual(parsed["aliases"], ["α/2 公式"])
-        self.assertEqual(parsed["confidence"], 0.9)
-        self.assertFalse(is_low_confidence(parsed))
+        self.assertEqual(len(parsed), 1)
+        entry = parsed[0]
+        self.assertEqual(entry["name"], "半角公式")
+        self.assertEqual(entry["latex"], r"\dfrac{\pi}{2}")  # 原文保留
+        self.assertEqual(entry["latex_normalized"], normalize_latex(r"\frac{\pi}{2}"))
+        self.assertEqual(entry["aliases"], ["α/2 公式"])
+        self.assertEqual(entry["confidence"], 0.9)
+        self.assertFalse(is_low_confidence(entry))
+
+    def test_all_formulas_in_one_image_are_kept(self):
+        """回归（准确率）：一页课件几条公式就收几条，不再只挑"最主要的那一条"。"""
+        parsed = parse_formula_response(
+            json.dumps(
+                {
+                    "formulas": [
+                        {"latex": r"\sigma_{b}=\frac{F}{A}", "name": "应力公式", "confidence": 0.9},
+                        {"latex": r"F=ma", "name": "牛顿第二定律", "confidence": 0.95},
+                        {"latex": r"\tau=\frac{T}{W_{p}}", "name": "切应力公式", "confidence": 0.8},
+                    ]
+                },
+                ensure_ascii=False,
+            )
+        )
+        self.assertEqual(
+            [item["name"] for item in parsed], ["应力公式", "牛顿第二定律", "切应力公式"]
+        )
+        self.assertEqual(len({item["fingerprint"] for item in parsed}), 3)
+
+    def test_duplicated_formula_in_answer_is_collapsed(self):
+        parsed = parse_formula_response(
+            json.dumps(
+                {
+                    "formulas": [
+                        {"latex": r"\frac{1}{2}", "name": "半", "confidence": 0.9},
+                        {"latex": "1/2", "name": "半(别名)", "confidence": 0.9},
+                    ]
+                },
+                ensure_ascii=False,
+            )
+        )
+        self.assertEqual(len(parsed), 1)
+
+    def test_empty_array_means_no_formula(self):
+        """模型明确说"图里没有公式"是合法结果，不是解析失败。"""
+        self.assertEqual(parse_formula_response('{"formulas": []}'), [])
 
     def test_fenced_and_noisy_response(self):
         """模型经常套一层 ```json 和解释文字，必须能读出来。"""
         raw = "好的，这是识别结果：\n```json\n" + json.dumps(
-            {"latex": "a^2+b^2=c^2", "name": "勾股定理", "confidence": 0.95}
+            {"formulas": [{"latex": "a^2+b^2=c^2", "name": "勾股定理", "confidence": 0.95}]}
         ) + "\n```\n希望对你有帮助。"
         parsed = parse_formula_response(raw)
-        self.assertEqual(parsed["name"], "勾股定理")
-        self.assertEqual(parsed["latex_normalized"], "a^{2}+b^{2}=c^{2}")
+        self.assertEqual(parsed[0]["name"], "勾股定理")
+        self.assertEqual(parsed[0]["latex_normalized"], "a^{2}+b^{2}=c^{2}")
 
     def test_tolerates_string_lists_and_percent_confidence(self):
         parsed = parse_formula_response(
@@ -196,44 +239,45 @@ class TestParseFormulaResponse(unittest.TestCase):
                 ensure_ascii=False,
             )
         )
-        self.assertEqual(parsed["aliases"], ["牛顿二定律", "F=ma 定律"])
-        self.assertEqual(parsed["knowledge_points"], ["力", "加速度"])
-        self.assertEqual(parsed["confidence"], 0.9)
+        self.assertEqual(len(parsed), 1)  # 没按数组包的旧形状也能读
+        self.assertEqual(parsed[0]["aliases"], ["牛顿二定律", "F=ma 定律"])
+        self.assertEqual(parsed[0]["knowledge_points"], ["力", "加速度"])
+        self.assertEqual(parsed[0]["confidence"], 0.9)
 
     def test_trailing_text_and_second_object_are_ignored(self):
-        """模型在对象后面又补一段话（甚至再吐一个对象）时，取第一个完整对象。"""
+        """模型在对象后面又补一段话（甚至再吐一个对象）时，取第一个完整值。"""
         raw = (
-            '{"latex": "a+b", "name": "加法", "confidence": 0.8}\n'
+            '{"formulas": [{"latex": "a+b", "name": "加法", "confidence": 0.8}]}\n'
             "说明：这是加法公式（如果你还需要 {另一个} 结果，请告知）\n"
             '{"latex": "c+d", "name": "另一个", "confidence": 0.1}'
         )
         parsed = parse_formula_response(raw)
-        self.assertEqual(parsed["name"], "加法")
-        self.assertEqual(parsed["latex_normalized"], "a+b")
+        self.assertEqual([item["name"] for item in parsed], ["加法"])
 
     def test_unknown_name_is_low_confidence(self):
         parsed = parse_formula_response(
-            json.dumps({"latex": "x=1", "name": UNKNOWN_FORMULA_NAME, "confidence": 0.9})
+            json.dumps({"formulas": [{"latex": "x=1", "name": UNKNOWN_FORMULA_NAME, "confidence": 0.9}]})
         )
-        self.assertTrue(is_low_confidence(parsed))
+        self.assertTrue(is_low_confidence(parsed[0]))
         # 名称缺失也按未知处理，不能编名字
-        parsed = parse_formula_response(json.dumps({"latex": "x=1", "confidence": 0.9}))
-        self.assertEqual(parsed["name"], UNKNOWN_FORMULA_NAME)
-        self.assertTrue(is_low_confidence(parsed))
+        parsed = parse_formula_response(json.dumps({"formulas": [{"latex": "x=1", "confidence": 0.9}]}))
+        self.assertEqual(parsed[0]["name"], UNKNOWN_FORMULA_NAME)
+        self.assertTrue(is_low_confidence(parsed[0]))
 
     def test_unusable_responses_raise(self):
-        for raw in ("", "   ", "我看不清这张图", json.dumps({"name": "欧拉公式"}), "[1,2]"):
+        for raw in ("", "   ", "我看不清这张图", '{"latex": "", "confidence": 0}'):
             with self.assertRaises(FormulaParseError, msg=raw):
                 parse_formula_response(raw)
 
     def test_prompt_asks_for_the_contract_we_parse(self):
-        """提示词与解析器是一份契约：键名必须对齐，否则模型答对了也白搭。"""
+        """提示词与解析器是一份契约：键名与"要全部公式"的要求必须对齐。"""
         for key in (
-            "latex", "name", "aliases", "category", "subcategory",
+            "formulas", "latex", "name", "aliases", "category", "subcategory",
             "knowledge_points", "description", "confidence",
         ):
             self.assertIn(key, FORMULA_PROMPT)
         self.assertIn(UNKNOWN_FORMULA_NAME, FORMULA_PROMPT)
+        self.assertIn("不要只挑", FORMULA_PROMPT)  # 覆盖率的关键一句
 
 
 class FakeVision:
@@ -298,9 +342,10 @@ class TestFormulaRecognizer(unittest.IsolatedAsyncioTestCase):
             b"\x89PNGx", course="高等数学", week=3, period="第3节", message_id="m1"
         )
         self.assertEqual(result["status"], "recognized")
-        self.assertTrue(result["created"])
-        self.assertEqual(result["name"], "半角公式")
-        self.assertFalse(result["low_confidence"])
+        entry = result["formulas"][0]
+        self.assertTrue(entry["created"])
+        self.assertEqual(entry["name"], "半角公式")
+        self.assertFalse(entry["low_confidence"])
         self.assertFalse(result["degraded"])
         row = self.db.formula_by_fingerprint(fingerprint(normalize_latex(r"\frac{\pi}{2}")))
         self.assertIsNotNone(row)
@@ -311,16 +356,41 @@ class TestFormulaRecognizer(unittest.IsolatedAsyncioTestCase):
         self.assertIn("#公式", tags)
         self.assertIn("#高等数学", tags)
         self.assertNotIn("#待确认", tags)
-        # 发给模型的是图片字节与提示词，不是本地路径
+        # 发给模型的是图片字节与提示词，不是本地路径；温度必须是 0（要可复现）
         self.assertEqual(self.client.calls[0]["model"], "vlm-primary")
         self.assertIn("公式识别", self.client.calls[0]["prompt"])
+        self.assertEqual(self.client.calls[0]["temperature"], 0.0)
+
+    async def test_several_formulas_in_one_image_all_get_stored(self):
+        """回归（准确率/覆盖率）：一页课件几条就存几条，各自打标各自可查。"""
+        reply = json.dumps(
+            {
+                "formulas": [
+                    {"latex": r"\sigma_{b}=\frac{F}{A}", "name": "应力公式", "confidence": 0.9},
+                    {"latex": "F=ma", "name": "牛顿第二定律", "confidence": 0.95},
+                    {"latex": "?", "name": UNKNOWN_FORMULA_NAME, "confidence": 0.2},
+                ]
+            },
+            ensure_ascii=False,
+        )
+        recognizer = self._recognizer([reply])
+        result = await recognizer.recognize(b"\x89PNGthree", course="机械设计")
+        self.assertEqual(len(result["formulas"]), 3)
+        self.assertEqual(self.db.formula_count(), 3)
+        self.assertTrue(result["formulas"][2]["low_confidence"])
+        tagged = self.db.formula_tags_for(int(result["formulas"][2]["formula_id"]))
+        self.assertIn("#待确认", tagged)
+        # 前两条不该被标成待确认
+        self.assertNotIn(
+            "#待确认", self.db.formula_tags_for(int(result["formulas"][1]["formula_id"]))
+        )
 
     async def test_same_formula_twice_is_not_duplicated(self):
         """不同图片、同一个公式 → 只有一条公式记录（指纹去重）。"""
         recognizer = self._recognizer([_FORMULA_JSON])
         await recognizer.recognize(b"image-one")
         second = await recognizer.recognize(b"image-two")
-        self.assertFalse(second["created"])  # 第二个只是"又见到"
+        self.assertFalse(second["formulas"][0]["created"])  # 第二个只是"又见到"
         self.assertEqual(self.db.formula_count(), 1)
 
     async def test_image_hash_cache_skips_model(self):
@@ -328,9 +398,21 @@ class TestFormulaRecognizer(unittest.IsolatedAsyncioTestCase):
         first = await recognizer.recognize(b"same-bytes")
         second = await recognizer.recognize(b"same-bytes")
         self.assertEqual(second["status"], "cached")
-        self.assertEqual(second["formula_id"], first["formula_id"])
+        self.assertEqual(
+            second["formulas"][0]["formula_id"], first["formulas"][0]["formula_id"]
+        )
         self.assertEqual(len(self.client.calls), 1)  # 第二次没有再调模型
         self.assertEqual(recognizer.cached_count, 1)
+
+    async def test_no_formula_image_is_not_a_failure(self):
+        """模型说"这张图没有公式"：不算失败、不吃自动重试预算，也不留公式行。"""
+        recognizer = self._recognizer(['{"formulas": []}'])
+        result = await recognizer.recognize(b"\x89PNGblank")
+        self.assertEqual(result["status"], "no_formula")
+        self.assertEqual(result["formulas"], [])
+        self.assertEqual(recognizer.failed_count, 0)
+        self.assertEqual(self.db.formula_failure_count(), 0)
+        self.assertEqual(self.db.formula_count(), 0)
 
     async def test_cache_can_be_disabled(self):
         recognizer = self._recognizer([_FORMULA_JSON], image_cache_enabled=False)
@@ -358,7 +440,7 @@ class TestFormulaRecognizer(unittest.IsolatedAsyncioTestCase):
         recognizer = self._recognizer([CloudError("网络错误"), CloudError("网络错误")])
         result = await recognizer.recognize(b"img")
         self.assertEqual(result["status"], "failed")
-        self.assertEqual(result["formula_id"], 0)
+        self.assertEqual(result["formulas"], [])
         self.assertIn("vlm-primary", result["error"])
         self.assertIn("vlm-fallback", result["error"])
         self.assertEqual(self.db.formula_count(), 0)
@@ -376,8 +458,9 @@ class TestFormulaRecognizer(unittest.IsolatedAsyncioTestCase):
         )
         recognizer = self._recognizer([low])
         result = await recognizer.recognize(b"img", course="未分类")
-        self.assertTrue(result["low_confidence"])
-        tags = self.db.formula_tags_for(result["formula_id"])
+        entry = result["formulas"][0]
+        self.assertTrue(entry["low_confidence"])
+        tags = self.db.formula_tags_for(int(entry["formula_id"]))
         self.assertIn("#待确认", tags)
         self.assertNotIn("#未分类", tags)  # 未分类不加课程标签
 

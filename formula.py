@@ -35,6 +35,8 @@ LOW_CONFIDENCE_THRESHOLD = 0.6
 #: 别名/知识点上限：识别结果偶尔会吐出十几条近义词，截断避免标签表被灌爆
 MAX_ALIASES = 6
 MAX_KNOWLEDGE_POINTS = 12
+#: 一张图最多收几条公式。一页课件常常有 2~4 条；上限只为防模型把整页拆成碎式子
+MAX_FORMULAS_PER_IMAGE = 8
 #: 指纹长度：16 位十六进制（64 bit）在个人笔记量级不会有实际碰撞
 FINGERPRINT_LENGTH = 16
 #: 同一张图自动重试的上限。自动补识别不能无限烧钱：图里根本没有公式、
@@ -42,29 +44,37 @@ FINGERPRINT_LENGTH = 16
 #: （用户主动重发不受这个上限约束——那是他的明确意图）。
 MAX_FAILED_ATTEMPTS = 2
 
-FORMULA_PROMPT = """你是公式识别助手。看这张图片，找出里面手写或印刷的数学公式，并按下面的 JSON 结构回答。
+FORMULA_PROMPT = """你是公式识别助手。看这张图片，把里面**所有**手写或印刷的数学公式逐条识别出来，按下面的 JSON 结构回答。
 
 要求：
-1. 只输出一个 JSON 对象。不要 Markdown 代码块，不要任何解释文字，不要注释。
-2. latex 填公式的 LaTeX 源码，**不要**加 $ 或 \\[ \\] 定界符。图片里有多个公式时，
-   只填最完整、最主要的那一个。
-3. name 填中文标准名称（如「欧拉公式」「勾股定理」「分部积分公式」）。
-   **没有把握就填「未知公式」**，绝对不要编造名称。
-4. aliases 填常见别名，数组，最多 5 个，没有就给空数组。
-5. category 填学科大类（如「高等数学」），subcategory 填细分（如「级数」）；
-   不确定就填空字符串。
-6. knowledge_points 填这条公式涉及的知识点，数组，最多 8 个。
-7. description 用一句话说明公式的含义或用途。
-8. confidence 是 0 到 1 之间的小数，表示你对 latex 与名称的把握；不确定就给低分。
+1. 只输出一个 JSON 对象。不要 Markdown 代码块，不要解释文字，不要注释。
+2. 顶层是 ``{"formulas": [ ... ]}``，数组里每个元素是一条公式。图片里有几条就写几条
+   （最多 8 条）。**不要只挑最主要的那一条**，也不要把两条公式合成一条。
+3. 逐字照抄图片里的式子：不化简、不改记号、不补推导步骤；上下标、分式、根号、
+   希腊字母、微分号都按原样。实在看不清的局部用 ``?`` 占位并把 confidence 压低，
+   **绝对不要**用你猜的公式填空。
+4. 每条公式的字段：
+   - latex：LaTeX 源码，不要加 $ 或 \\[ \\] 定界符
+   - name：中文标准名称（如「欧拉公式」「带传动中心距计算公式」）；
+     **没有把握就填「未知公式」**，绝不要编名字
+   - aliases：常见别名数组，最多 5 个，没有给空数组
+   - category / subcategory：学科大类 / 细分；不确定给空字符串
+   - knowledge_points：这条公式涉及的知识点，数组，最多 8 个
+   - description：一句话说明含义或用途
+   - confidence：0 到 1 的小数，表示你对 latex 与名称的把握；不确定就给低分
+5. 只有图片里**确实一个公式都没有**时，才返回 ``{"formulas": []}``。
+   有公式但看不清时照样给出能读出的 latex 并压低 confidence，不要返回空数组。
 
 输出示例：
-{"latex": "e^{i\\pi}+1=0", "name": "欧拉公式", "aliases": ["欧拉恒等式"],
- "category": "高等数学", "subcategory": "复变函数",
- "knowledge_points": ["复数指数", "三角函数"],
- "description": "把五个基本数学常数联系在一起的恒等式", "confidence": 0.95}
-
-如果图片里没有公式、或者字迹看不清，就返回：
-{"latex": "", "name": "未知公式", "confidence": 0.0}
+{"formulas": [
+  {"latex": "e^{i\\\\pi}+1=0", "name": "欧拉公式", "aliases": ["欧拉恒等式"],
+   "category": "高等数学", "subcategory": "复变函数",
+   "knowledge_points": ["复数指数", "三角函数"],
+   "description": "把五个基本数学常数联系在一起的恒等式", "confidence": 0.95},
+  {"latex": "F=ma", "name": "牛顿第二定律", "aliases": [], "category": "力学",
+   "subcategory": "", "knowledge_points": ["力", "加速度"],
+   "description": "合外力等于质量乘以加速度", "confidence": 0.9}
+]}
 """
 
 
@@ -469,40 +479,17 @@ def _as_confidence(value: Any) -> float:
     return max(0.0, min(1.0, number))
 
 
-def parse_formula_response(raw: str) -> dict[str, Any]:
-    """把模型的回答解析成规范化字典；不可用时抛 :class:`FormulaParseError`。
-
-    这里**只做解析不做网络**：解析规则单测得到，出问题一眼能看出是模型乱答
-    还是我们读错。LaTeX 为空按失败处理——"看不清"必须是失败，不能落一条空公式。
-
-    取的是**第一个完整 JSON 对象**（``raw_decode``），而不是"第一个 { 到最后一个 }"：
-    模型常在对象后面再补一句带花括号的话，贪心匹配会把这些一起吃进来、解析失败，
-    白降级一次模型。
-    """
-    text = _CODE_FENCE.sub("", str(raw or "").strip())
-    if not text:
-        raise FormulaParseError("模型返回为空")
-    start = text.find("{")
-    if start < 0:
-        raise FormulaParseError("模型返回里找不到 JSON 对象")
-    try:
-        data, _end = json.JSONDecoder().raw_decode(text[start:])
-    except json.JSONDecodeError as exc:
-        raise FormulaParseError(f"JSON 解析失败：{exc}") from exc
-    if not isinstance(data, dict):
-        raise FormulaParseError("模型返回的 JSON 不是对象")
-
+def _parse_item(data: dict[str, Any]) -> dict[str, Any] | None:
+    """规范化单条公式；LaTeX 为空时返回 ``None``（不落空公式）。"""
     latex_raw = str(data.get("latex") or "").strip()
     normalized = normalize_latex(latex_raw)
     if not normalized:
-        raise FormulaParseError("识别结果没有 LaTeX（可能图片里没有公式）")
-
-    name = str(data.get("name") or "").strip() or UNKNOWN_FORMULA_NAME
+        return None
     return {
         "latex": latex_raw,
         "latex_normalized": normalized,
         "fingerprint": fingerprint(normalized),
-        "name": name,
+        "name": str(data.get("name") or "").strip() or UNKNOWN_FORMULA_NAME,
         "aliases": _as_text_list(data.get("aliases"), limit=MAX_ALIASES),
         "category": str(data.get("category") or "").strip(),
         "subcategory": str(data.get("subcategory") or "").strip(),
@@ -512,6 +499,58 @@ def parse_formula_response(raw: str) -> dict[str, Any]:
         "description": str(data.get("description") or "").strip(),
         "confidence": _as_confidence(data.get("confidence")),
     }
+
+
+def parse_formula_response(raw: str) -> list[dict[str, Any]]:
+    """把模型的回答解析成规范化公式**列表**；结构不可用时抛 :class:`FormulaParseError`。
+
+    返回空列表是合法结果，意思是"这张图里确实没有公式"（提示词要求模型只有在这种
+    情况下才返回 ``{"formulas": []}``）。但 ``{"latex": ""}`` 这种旧 bail-out 形状
+    含义模糊（更可能是"放弃了"），按解析失败处理，让降级模型再试一次。
+
+    这里**只做解析不做网络**：解析规则单测得到，出问题一眼能看出是模型乱答还是我们
+    读错。取的是**第一个完整 JSON 值**（``raw_decode``）而不是"第一个 { 到最后一个 }"：
+    模型常在对象后面补一句带花括号的话，贪心匹配会连它一起吃进来、解析失败。
+    """
+    text = _CODE_FENCE.sub("", str(raw or "").strip())
+    if not text:
+        raise FormulaParseError("模型返回为空")
+    starts = [position for position in (text.find("{"), text.find("[")) if position >= 0]
+    if not starts:
+        raise FormulaParseError("模型返回里找不到 JSON 结构")
+    start = min(starts)
+    try:
+        data, _end = json.JSONDecoder().raw_decode(text[start:])
+    except json.JSONDecodeError as exc:
+        raise FormulaParseError(f"JSON 解析失败：{exc}") from exc
+
+    if isinstance(data, dict) and isinstance(data.get("formulas"), list):
+        items: list[Any] = data["formulas"]
+    elif isinstance(data, list):
+        items = list(data)
+    elif isinstance(data, dict):
+        items = [data]  # 模型没按数组包：当成一条处理
+    else:
+        raise FormulaParseError("模型返回的 JSON 结构无法理解")
+
+    parsed: list[dict[str, Any]] = []
+    gave_up = False  # 出现过 {"latex": ""} 这种"我放弃了"的形状
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        entry = _parse_item(item)
+        if entry is None:
+            if "latex" in item:
+                gave_up = True
+            continue
+        if any(existing["fingerprint"] == entry["fingerprint"] for existing in parsed):
+            continue  # 同一条公式被写了两遍
+        parsed.append(entry)
+        if len(parsed) >= MAX_FORMULAS_PER_IMAGE:
+            break
+    if not parsed and gave_up and isinstance(data, dict):
+        raise FormulaParseError("识别结果没有 LaTeX（模型放弃了这一张）")
+    return parsed
 
 
 def is_low_confidence(parsed: dict[str, Any]) -> bool:
@@ -526,10 +565,10 @@ def is_low_confidence(parsed: dict[str, Any]) -> bool:
 
 
 class FormulaRecognizer:
-    """图片 → 公式记录。缓存优先、失败降级、低置信打标。
+    """图片 → 公式记录。缓存优先、失败降级、低置信打标、**一张图认全部公式**。
 
-    ``db`` 需要 ``formula_by_image_hash`` / ``formula_by_fingerprint`` /
-    ``upsert_formula`` / ``attach_tag``；``client`` 需要 ``vision``。
+    ``db`` 需要 ``formula_by_image_hash`` / ``upsert_formula`` / ``attach_tag`` /
+    ``record_formula_failure``；``client`` 需要 ``vision``。
     """
 
     def __init__(
@@ -542,7 +581,8 @@ class FormulaRecognizer:
         image_cache_enabled: bool = True,
         low_confidence_threshold: float = LOW_CONFIDENCE_THRESHOLD,
         prompt: str = FORMULA_PROMPT,
-        max_tokens: int = 1200,
+        max_tokens: int = 2000,
+        temperature: float = 0.0,
     ) -> None:
         self._db = db
         self._client = client
@@ -553,6 +593,8 @@ class FormulaRecognizer:
         self._threshold = float(low_confidence_threshold)
         self._prompt = prompt
         self._max_tokens = max(256, int(max_tokens))
+        # 识别要可复现：同一张图问两次不该给出两种式子，所以默认温度为 0
+        self._temperature = max(0.0, min(1.0, float(temperature)))
         #: 累计计数（/笔记库 展示用，也是"到底有没有在跑"的证据）
         self.recognized_count = 0
         self.cached_count = 0
@@ -569,10 +611,17 @@ class FormulaRecognizer:
         period: str = "",
         message_id: str = "",
     ) -> dict[str, Any]:
-        """识别一张图；**不抛异常**——失败以 ``status="failed"`` 返回。
+        """识别一张图里的全部公式；**不抛异常**，失败以 ``status="failed"`` 返回。
 
-        识别是增强层，抛异常会让上层 worker 反复重启任务，用户却看不到任何
-        有用信息。失败原因放进 ``error`` 供日志与 /笔记库 排障。
+        返回 ``{"status", "formulas": [...], "degraded", "error"}``，status 四种：
+
+        - ``recognized``：认出了公式并已落库（``formulas`` 里是每一条，含 created 标记）；
+        - ``cached``：这张图之前认过，直接给回已有公式（不再调模型、不再花钱）；
+        - ``no_formula``：模型明确说图里没有公式（不算失败，不吃自动重试预算）；
+        - ``failed``：调用失败或返回读不出来（已按顺序试过降级模型）。
+
+        识别是增强层，抛异常会让上层 worker 反复重启任务、用户什么也看不到；
+        失败原因放进 ``error`` 供日志与 /笔记库 排障。
         """
         if not image:
             return self._failure("空图片")
@@ -583,7 +632,7 @@ class FormulaRecognizer:
                 self.cached_count += 1
                 return cached
 
-        parsed: dict[str, Any] | None = None
+        parsed: list[dict[str, Any]] | None = None
         errors: list[str] = []
         degraded = False
         for index, model in enumerate(self._models()):
@@ -594,6 +643,7 @@ class FormulaRecognizer:
                     prompt=self._prompt,
                     image_suffix=suffix or ".png",
                     max_tokens=self._max_tokens,
+                    temperature=self._temperature,
                 )
                 parsed = parse_formula_response(response.get("text") or "")
                 degraded = index > 0
@@ -606,8 +656,16 @@ class FormulaRecognizer:
             result = self._failure("；".join(errors)[:300] or "识别失败")
             await self._note_failure(digest, result["error"])
             return result
+        if not parsed:
+            # 模型说"这张图确实没有公式"：不记失败（免得把重试预算吃光），
+            # 但也不留结果——所以同一条图再发还会问一次模型，这是有意的取舍
+            return {
+                "status": "no_formula",
+                "formulas": [],
+                "degraded": degraded,
+                "error": "",
+            }
 
-        low = is_low_confidence(parsed) or parsed["confidence"] < self._threshold
         try:
             return await self._store(
                 parsed,
@@ -616,7 +674,6 @@ class FormulaRecognizer:
                 week=week,
                 period=period,
                 message_id=message_id,
-                low_confidence=low,
                 degraded=degraded,
             )
         except Exception as exc:  # 落库失败也是"这条识别没成"，返失败而不是抛
@@ -655,15 +712,23 @@ class FormulaRecognizer:
         self.last_error = reason
         return {
             "status": "failed",
-            "formula_id": 0,
-            "name": "",
-            "latex": "",
-            "latex_normalized": "",
-            "confidence": 0.0,
-            "low_confidence": False,
+            "formulas": [],
             "degraded": False,
-            "created": False,
             "error": reason,
+        }
+
+    def _entry(self, row: Any, *, created: bool = False) -> dict[str, Any]:
+        """把库里一行（或解析结果）整理成回执/写笔记要用的统一结构。"""
+        return {
+            "formula_id": int(row["id"]) if "id" in row.keys() else 0,
+            "name": str(row["name"] or ""),
+            "latex": str(row["latex_normalized"] or row["latex_raw"] or ""),
+            "confidence": float(row["confidence"] or 0.0),
+            "low_confidence": (
+                str(row["name"] or "") == UNKNOWN_FORMULA_NAME
+                or float(row["confidence"] or 0.0) < self._threshold
+            ),
+            "created": created,
         }
 
     async def _lookup_image(self, digest: str) -> dict[str, Any] | None:
@@ -675,72 +740,66 @@ class FormulaRecognizer:
             return None
         return {
             "status": "cached",
-            "formula_id": int(row["id"]),
-            "name": str(row["name"] or ""),
-            "latex": str(row["latex_normalized"] or row["latex_raw"] or ""),
-            "latex_normalized": str(row["latex_normalized"] or ""),
-            "confidence": float(row["confidence"] or 0.0),
-            "low_confidence": (
-                str(row["name"] or "") == UNKNOWN_FORMULA_NAME
-                or float(row["confidence"] or 0.0) < self._threshold
-            ),
+            "formulas": [self._entry(row)],
             "degraded": False,
-            "created": False,
             "error": "",
         }
 
     async def _store(
         self,
-        parsed: dict[str, Any],
+        parsed: list[dict[str, Any]],
         *,
         digest: str,
         course: str,
         week: int | None,
         period: str,
         message_id: str,
-        low_confidence: bool,
         degraded: bool,
     ) -> dict[str, Any]:
-        fingerprint_value = parsed["fingerprint"]
-        # created 直接由 SQL 层带出来：先查一遍再插是把同一判断做了两次，
-        # 而且查失败（吞异常）时会误报"新公式"
-        formula_id, created = await asyncio.to_thread(
-            self._db.upsert_formula,
-            {
-                "fingerprint": fingerprint_value,
-                "latex_raw": parsed["latex"],
-                "latex_normalized": parsed["latex_normalized"],
-                "name": parsed["name"],
-                "aliases": "、".join(parsed["aliases"]),
-                "category": parsed["category"],
-                "subcategory": parsed["subcategory"],
-                "description": parsed["description"],
-                "confidence": parsed["confidence"],
-                "image_hash": digest,
-                "course": course,
-                "week": week,
-                "period": period,
-                "source_message_id": message_id,
-            },
-        )
-        for tag, source in self._tags(course, low_confidence):
-            try:
-                await asyncio.to_thread(
-                    self._db.attach_tag, "formula", formula_id, tag, source=source
-                )
-            except Exception:
-                continue  # 标签失败不影响公式本身
-        self.recognized_count += 1
+        entries: list[dict[str, Any]] = []
+        for item in parsed:
+            # created 直接由 SQL 层带出来：先查一遍再插是把同一判断做了两次，
+            # 而且查失败（吞异常）时会误报"新公式"
+            formula_id, created = await asyncio.to_thread(
+                self._db.upsert_formula,
+                {
+                    "fingerprint": item["fingerprint"],
+                    "latex_raw": item["latex"],
+                    "latex_normalized": item["latex_normalized"],
+                    "name": item["name"],
+                    "aliases": "、".join(item["aliases"]),
+                    "category": item["category"],
+                    "subcategory": item["subcategory"],
+                    "description": item["description"],
+                    "confidence": item["confidence"],
+                    "image_hash": digest,
+                    "course": course,
+                    "week": week,
+                    "period": period,
+                    "source_message_id": message_id,
+                },
+            )
+            low = is_low_confidence(item) or item["confidence"] < self._threshold
+            for tag, source in self._tags(course, low):
+                try:
+                    await asyncio.to_thread(
+                        self._db.attach_tag, "formula", formula_id, tag, source=source
+                    )
+                except Exception:
+                    continue  # 标签失败不影响公式本身
+            self.recognized_count += 1
+            entries.append({
+                "formula_id": formula_id,
+                "name": item["name"],
+                "latex": item["latex_normalized"],
+                "confidence": item["confidence"],
+                "low_confidence": low,
+                "created": created,
+            })
         return {
             "status": "recognized",
-            "formula_id": formula_id,
-            "name": parsed["name"],
-            "latex": parsed["latex"],
-            "latex_normalized": parsed["latex_normalized"],
-            "confidence": parsed["confidence"],
-            "low_confidence": low_confidence,
+            "formulas": entries,
             "degraded": degraded,
-            "created": created,
             "error": "",
         }
 

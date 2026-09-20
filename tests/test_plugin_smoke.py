@@ -4593,12 +4593,13 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await plugin.on_unload()
 
-    async def test_persona_receipt_keeps_formula_verbatim(self):
-        """回归（线上实测）：persona 模式下公式必须原样送达。
+    async def test_formula_receipt_bypasses_model_in_persona_mode(self):
+        """回归（线上实测）：公式回执完全不经过模型。
 
-        宿主的模型会把回执概括成"公式没错，和之前一样"，LaTeX 一个字都到不了
-        用户手上（用户原话："不是文字描述"）。带数据（公式、失败原因）的回执改用
-        attach_fixed：拟人一句 + 数据原文一起发。
+        两个坑都是真人真事：① persona 把公式概括成"公式没错，和之前一样"，LaTeX
+        一个字都到不了用户手上；② 插件现编拟人句时模型**没看到那张图**，会凭空
+        描述图片内容（"那个矩形波例题喵…上课别摸鱼"），和主链路对同一条消息的
+        回复撞车，用户看到的就是重复发言。所以带数据的回执一律直发原文。
         """
         with TemporaryDirectory() as tmp:
             plugin = self.prepare_bare(
@@ -4611,43 +4612,61 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
                 ),
             )
 
-            async def fake_say(facts: str) -> str:
-                return "公式没错，和之前一样。"
+            async def must_not_be_called(facts: str) -> str:
+                raise AssertionError("带原文数据的回执不该再问模型")
 
-            plugin._persona_say = fake_say  # type: ignore[assignment]
+            plugin._persona_say = must_not_be_called  # type: ignore[assignment]
 
             await plugin._on_formula_recognized(
                 {"stream_id": "ps", "course": "材料力学", "note_ref": ""},
                 {
                     "status": "recognized",
-                    "created": False,
-                    "name": "许用应力公式",
-                    "latex": r"\frac{\sigma_{\lim}}{S_{\sigma}}",
-                    "latex_normalized": r"\frac{\sigma_{\lim}}{S_{\sigma}}",
-                    "low_confidence": False,
                     "degraded": False,
+                    "error": "",
+                    "formulas": [
+                        {
+                            "name": "许用应力公式",
+                            "latex": r"[\sigma]=\frac{\sigma_{\lim}}{S_{\sigma}}",
+                            "confidence": 0.98,
+                            "low_confidence": False,
+                            "created": False,
+                        },
+                        {
+                            "name": "交变应力参数关系公式",
+                            "latex": r"\sigma_{m}=\frac{\sigma_{max}+\sigma_{min}}2",
+                            "confidence": 0.4,
+                            "low_confidence": True,
+                            "created": True,
+                        },
+                    ],
                 },
             )
+            self.assertEqual(len(plugin.ctx.send.texts), 1)  # type: ignore[attr-defined]
             sent = plugin.ctx.send.texts[-1][1]  # type: ignore[attr-defined]
-            self.assertIn("公式没错，和之前一样。", sent)  # 人味还在
-            self.assertIn(r"\frac{\sigma_{\lim}}{S_{\sigma}}", sent)  # 公式也在
-            self.assertIn("许用应力公式", sent)
+            self.assertIn(r"\frac{\sigma_{\lim}}{S_{\sigma}}", sent)
+            self.assertIn(r"\frac{\sigma_{max}+\sigma_{min}}2", sent)  # 两条都列出
+            self.assertIn("2 条", sent)
             self.assertIn("材料力学", sent)
+            self.assertIn("待确认", sent)  # 没把握的那条要标出来
+            self.assertNotIn("和之前一样", sent)  # 没有任何模型编的话
 
-            # 失败回执同理：原因不能被概括掉
+            # 失败回执同理：原因直发，不问模型
             await plugin._on_formula_recognized(
                 {"stream_id": "ps", "course": "", "note_ref": ""},
-                {"status": "failed", "error": "HTTP 503 模型繁忙", "created": False},
+                {"status": "failed", "error": "HTTP 503 模型繁忙", "formulas": []},
             )
             sent = plugin.ctx.send.texts[-1][1]  # type: ignore[attr-defined]
             self.assertIn("HTTP 503 模型繁忙", sent)
 
-    async def test_proactive_receipt_still_sends_formula_verbatim(self):
-        """proactive 模式下 attach_fixed 也不能形同虚设（构造审查抓出来的洞）。
+            # 图里没有公式也要说一声（原来会静默，像坏了）
+            await plugin._on_formula_recognized(
+                {"stream_id": "ps", "course": "", "note_ref": ""},
+                {"status": "no_formula", "error": "", "formulas": []},
+            )
+            self.assertIn("没有公式", plugin.ctx.send.texts[-1][1])  # type: ignore[attr-defined]
 
-        proactive 是把措辞整个交给主链路开口、fixed_text 根本没有代码去发——
-        带数据的回执走这条路会永远丢掉公式。所以两者冲突时降级为直发。
-        """
+    async def test_formula_receipt_bypasses_replyer_in_proactive_mode(self):
+        """proactive 下同样直发：那条路把措辞交给主链路，数据根本没人发。"""
         with TemporaryDirectory() as tmp:
             plugin = self.make_plugin(
                 Path(tmp),
@@ -4660,15 +4679,18 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
                 {"stream_id": "ps", "course": "未分类", "note_ref": ""},
                 {
                     "status": "recognized",
-                    "created": True,
-                    "name": "欧拉公式",
-                    "latex": "e^{i\\pi}+1=0",
-                    "latex_normalized": "e^{i\\pi}+1=0",
-                    "low_confidence": False,
                     "degraded": False,
+                    "error": "",
+                    "formulas": [{
+                        "name": "欧拉公式",
+                        "latex": "e^{i\\pi}+1=0",
+                        "confidence": 0.95,
+                        "low_confidence": False,
+                        "created": True,
+                    }],
                 },
             )
-            self.assertEqual(plugin.ctx.maisaka.calls, [])  # 没有交给 replyer
+            self.assertEqual(plugin.ctx.maisaka.calls, [])  # 没交给 replyer
             self.assertEqual(plugin._pending_proactive, [])  # 也没登记发言验证
             sent = plugin.ctx.send.texts[-1][1]  # type: ignore[attr-defined]
             self.assertIn("e^{i\\pi}+1=0", sent)  # 公式原样送达

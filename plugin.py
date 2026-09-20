@@ -1529,7 +1529,7 @@ class ClassSchedulePlugin(MaiBotPlugin):
         reason: str,
         fixed_text: str = "",
         persona_text: str | None = None,
-        attach_fixed: bool = False,
+        verbatim: bool = False,
     ) -> bool:
         """把一条内容送到某个会话，按用途选择交给 replyer 还是模板直发。
 
@@ -1540,29 +1540,28 @@ class ClassSchedulePlugin(MaiBotPlugin):
             reason: 决定用哪个风格设置：提醒走 ``reply.style``，其余走 ``ack_style``。
             persona_text: 调用方预先算好的拟人文案。``None`` = 没预算，这里现算；
                 空串 = 已经算过但失败了，别再算一次（多会话时避免重复请求模型）。
-            attach_fixed: persona 模式下把 ``fixed_text`` **原样附在拟人文案后面**。
-                用于"里面的数据一个字都不能改"的内容——公式、LaTeX、失败原因。
-                实测踩过：宿主的模型把回执概括成"公式没错，和之前一样"，
-                公式本身一个字都没到用户手上（用户原话"不是文字描述"）。
+            verbatim: **只发 ``fixed_text`` 原文，完全不经过模型**。用于内容里带着
+                "一个字都不能改"的数据（公式 LaTeX、失败原因）。两条理由都是线上
+                实测踩出来的：① persona 会把公式概括成"和之前一样"，数据根本发不出去；
+                ② 插件现编拟人句时模型**看不到那张图**，会凭空描述图片内容，
+                和主链路对同一条消息的回复撞车，用户看到的是重复发言。
 
         默认两种模式都直发：实测发现 persona 只保证"任务已入队"，麦麦规划完
         **可能不真的开口**且不报错，而提示语、回执、提醒都要求必定送达。
         """
         conf = self._conf()
         style = self._reply_style_for(reason)
-        if attach_fixed and fixed_text and style == "proactive":
-            # proactive 把措辞交给模型自由发挥，而 attach_fixed 的意思恰恰是
-            # "里面的数据一个字都不能改"——两者冲突时数据赢（线上踩过：宿主的模型
-            # 把公式概括掉，一个字都没到用户手上）
-            style = "fixed"
+        if verbatim and fixed_text:
+            if style != "fixed":
+                self.ctx.logger.debug(
+                    f"{LOG_PREFIX} 该回执带原文数据，不经模型直发（style={style}→fixed）"
+                )
+            return await self._send_text(stream_id, fixed_text)
 
         if style == "persona":
             # 让模型按宿主人设说一句，再直发：有风格且必定送达
             text = persona_text if persona_text is not None else await self._persona_say(facts)
             if text:
-                if attach_fixed and fixed_text:
-                    # 拟人一句 + 数据原文：既有人味，又保证公式/原因不被概括掉
-                    return await self._send_text(stream_id, f"{text}\n{fixed_text}")
                 return await self._send_text(stream_id, text)
             self.ctx.logger.info(
                 f"{LOG_PREFIX} 拟人文案生成失败，改用固定文案（reason={reason}）"
@@ -2227,7 +2226,7 @@ class ClassSchedulePlugin(MaiBotPlugin):
             return "🧮 公式识别：未启用（缺 API Key 或地址不是 https，见启动日志）"
         recognizer = self._recognizer
         parts = [
-            f"识别成功 {recognizer.recognized_count}",
+            f"认出的公式 {recognizer.recognized_count} 条",
             f"图片缓存命中 {recognizer.cached_count}",
             f"失败 {recognizer.failed_count}",
         ]
@@ -3229,8 +3228,12 @@ class ClassSchedulePlugin(MaiBotPlugin):
                 # /笔记 与 /找 看不到（用户正是因此说"不是完整的公式"）
                 await self._attach_formula_to_note(
                     {"course": course, "note_ref": note_ref},
-                    str(known["name"] or ""),
-                    str(known["latex_normalized"] or known["latex_raw"] or ""),
+                    [{
+                        "name": str(known["name"] or ""),
+                        "latex": str(
+                            known["latex_normalized"] or known["latex_raw"] or ""
+                        ),
+                    }],
                 )
                 continue
             if await asyncio.to_thread(self._recognizer.has_given_up, digest):
@@ -3288,80 +3291,89 @@ class ClassSchedulePlugin(MaiBotPlugin):
     async def _on_formula_recognized(
         self, job: dict[str, Any], result: dict[str, Any]
     ) -> None:
-        """公式识别完成后的回执。
+        """公式识别完成后的回执（一条消息列全这张图认出的所有公式）。
 
-        **用户主动发的图一定会听到回应**，三种情形都说：
+        **用户主动发的图一定有回应**，四种 status 都说：认出新公式、之前认过
+        （命中图片缓存，线上实测过：这时一片安静用户就以为功能坏了）、图里没有
+        公式、以及失败（静默失败最不可排查）。
 
-        - 认出新公式；
-        - 这张图之前认过（命中图片 hash 缓存）——也必须说：同一批课件图重发时
-          一片安静，用户只会以为功能坏了（线上实测踩过，用户回"不行"）；
-        - 没认出来（含图里本来没有公式）——失败静默最不可排查。
-
-        补识别（补历史图片）不带会话，因此不会刷屏。同一张图重发会再收到一次公式，
-        这正是"查得到"该有的样子。
+        一律 `verbatim` 直发原文，**不经过任何模型**：插件拿 `llm.generate` 现编
+        拟人句时模型看不到那张图，会凭空描述图片内容（线上出现过"那个矩形波例题
+        喵…上课别摸鱼"），还会和主链路对同一条消息的回复撞车变成重复发言。
+        补识别（补历史图片）不带会话，因此不刷屏。
         """
         stream_id = str(job.get("stream_id") or "").strip()
         course = str(job.get("course") or "")
         where = f"（归入「{course}」）" if course and course != "未分类" else ""
-        failed = str(result.get("status") or "") == "failed"
-        name = str(result.get("name") or "") or "未知公式"
-        latex = str(result.get("latex_normalized") or result.get("latex") or "")
+        status = str(result.get("status") or "")
+        formulas = list(result.get("formulas") or [])
 
         # 先把公式写进笔记（**补识别也要写**）：/笔记、/找 与笔记文件读的是那一层。
         # 这一步必须在 stream_id 判断之前，否则补识别认出来的公式进不了笔记。
-        if not failed and latex:
-            await self._attach_formula_to_note(job, name, latex)
+        if formulas:
+            await self._attach_formula_to_note(job, formulas)
 
         if not stream_id:
             return  # 补识别不回执：它是补历史，不是用户这次的操作
 
-        if failed:
+        if status == "failed":
             reason = one_line(str(result.get("error") or "模型没给出可用结果"), 60)
             await self._deliver(
                 stream_id,
-                f"用户刚发的图片没能识别出公式，原因是：{reason}。"
-                "用一句话告诉 TA 这张图没认出公式、原图已经存好了。",
+                f"图片识别失败：{reason}",
                 reason="formula_recognized",
                 fixed_text=f"🧮 这张图没认出公式{where}\n　{reason}",
-                attach_fixed=True,  # 失败原因也不能被概括掉
+                verbatim=True,
+            )
+            return
+        if status == "no_formula":
+            await self._deliver(
+                stream_id,
+                "图片里没有公式",
+                reason="formula_recognized",
+                fixed_text=f"🧮 这张图里没有公式{where}（原图已存好）",
+                verbatim=True,
             )
             return
 
-        if result.get("created"):
-            headline = f"认出公式：{name}"
-        else:
-            headline = f"这张图之前认过，公式是：{name}"
-        tail = ""
-        if result.get("low_confidence"):
-            tail = "。我对它没把握，已标 #待确认，你可以用 /找 核对一下"
+        headline = "认出公式" if any(item.get("created") for item in formulas) else "这张图之前认过，公式是"
+        lines = [f"🧮 {headline}{where}（{len(formulas)} 条）"]
+        for item in formulas:
+            mark = "　⚠️没把握，已标 #待确认" if item.get("low_confidence") else ""
+            lines.append(f"　{item.get('name') or '未知公式'}｜{item.get('latex')}{mark}")
         if result.get("degraded"):
-            tail += "。主模型没认出来，这条是降级模型的结果"
-
+            lines.append("　（主模型没认出来，这条是降级模型的结果）")
         await self._deliver(
             stream_id,
-            f"用户刚发的图片里的公式：{name}，LaTeX 是 {latex}{where}。"
-            + ("这是之前已经认过的同一条公式。" if not result.get("created") else "")
-            + "用一句话告诉 TA，如果没把握就说明需要 TA 确认。"
-            "注意：公式本身会原样附在你说的话后面，你不必复述它。",
+            f"识别到 {len(formulas)} 条公式",
             reason="formula_recognized",
-            fixed_text=f"🧮 {headline}{where}\n　{latex}{tail}",
-            attach_fixed=True,  # 公式必须原样送达：宿主的模型会把它概括掉
+            fixed_text="\n".join(lines),
+            verbatim=True,  # 公式一个字都不能被模型改写或概括掉
         )
 
     async def _attach_formula_to_note(
-        self, job: dict[str, Any], name: str, latex: str
+        self, job: dict[str, Any], formulas: list[dict[str, Any]]
     ) -> None:
-        """把识别到的公式写进对应的 markdown 笔记（索引 + 可读文件）。"""
+        """把识别到的公式写进对应的 markdown 笔记（索引 + 可读文件）。
+
+        一张图认出的多条公式合成一段文本（每条一行）写进同一条笔记——用户翻笔记
+        时要看到的是式子本身，不是一句"这是一张课件幻灯片"的图说。
+        """
         notes = self._notes
         note_ref = str(job.get("note_ref") or "").strip()
-        if notes is None or not note_ref or not latex:
+        lines = [
+            f"{item.get('name') or '未知公式'}：{item.get('latex')}"
+            for item in formulas
+            if str(item.get("latex") or "").strip()
+        ]
+        if notes is None or not note_ref or not lines:
             return
         try:
             await asyncio.to_thread(
                 notes.attach_formula,
                 str(job.get("course") or "未分类"),
                 note_ref,
-                f"{name}：{latex}" if name else latex,
+                "\n".join(lines),
             )
         except Exception as exc:
             # 写笔记失败不影响识别结果本身（公式已在库里，回执照发）

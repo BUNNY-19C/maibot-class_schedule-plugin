@@ -93,8 +93,13 @@ class SiliconFlowClient:
         prompt: str,
         image_suffix: str = "png",
         max_tokens: int = 2000,
+        temperature: float = 0.3,
     ) -> dict[str, Any]:
-        """图片 + 提示词（公式识别用）。图片以 data URL 内嵌，不发本地路径。"""
+        """图片 + 提示词（公式识别用）。图片以 data URL 内嵌，不发本地路径。
+
+        ``temperature`` 透传给对话：识别要的是**可复现的照抄**，调用方一般给 0，
+        默认值保持 0.3 是因为这个客户端也被写文案一类用途共用。
+        """
         mime = "image/jpeg" if image_suffix in (".jpg", ".jpeg") else f"image/{image_suffix.lstrip('.')}"
         messages = [
             {
@@ -105,7 +110,9 @@ class SiliconFlowClient:
                 ],
             }
         ]
-        return await self.chat(model=model, messages=messages, max_tokens=max_tokens)
+        return await self.chat(
+            model=model, messages=messages, max_tokens=max_tokens, temperature=temperature
+        )
 
     async def embed(self, *, model: str, texts: list[str]) -> list[list[float]]:
         """批量向量化。返回与输入同序的向量列表。"""
