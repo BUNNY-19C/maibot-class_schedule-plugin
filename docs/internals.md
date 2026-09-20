@@ -126,6 +126,10 @@ data/plugins/github.BUNNY-19C.class-schedule/
   同一个公式只存一条。归一化是纯规则表(`formula.normalize_latex`),必须是
   **幂等**的——不幂等就会在二次识别时算出新指纹、又存一条(有专门的用例钉住)。
 
+剥单字符花括号时有一处**不能**剥：带字母参数的重音类宏（``\hat{s}`` 剥了就成
+``\hats``，未定义控制序列、渲染不出来）。另外 ``\hat s`` 与模型粘出的 ``\hats`` 都会
+统一成 ``\hat{s}``，三种写法同一个指纹。
+
 一条纪律:**所有 sqlite 调用都在 `asyncio.to_thread` 里,且不在持锁处 await 回自己**
 (重建前踩过自调用死锁);worker 与命令路径都遵守。
 
@@ -159,7 +163,7 @@ data/plugins/github.BUNNY-19C.class-schedule/
 
 ## 开发与测试
 
-691 项单元测试,只用标准库 `unittest`,不需要额外安装依赖:
+693 项单元测试,只用标准库 `unittest`,不需要额外安装依赖:
 
 ```bash
 cd maibot_plugin_class_schedule

@@ -55,8 +55,9 @@ FORMULA_PROMPT = """你是公式识别助手。看这张图片，把里面**所�
    不要收推导的中间步骤、"令 x=y" 这类变量代换说明、图注或编号文字。
    图片里写"左式""右式"时，把它指代的**完整式子**写出来，不要输出"左="这种。
 4. 逐字照抄图片里的式子：不化简、不改记号、不补推导步骤；上下标、分式、根号、
-   希腊字母、微分号都按原样。实在看不清的局部用 ``?`` 占位并把 confidence 压低，
-   **绝对不要**用你猜的公式填空。
+   希腊字母、微分号都按原样。带参数的记号一律写花括号（``\\hat{s}``、``\\vec{a}``、
+   ``\\frac{a}{b}``），不要写成 ``\\hats`` 这种会粘成别的宏的形式。
+   实在看不清的局部用 ``?`` 占位并把 confidence 压低，**绝对不要**用你猜的公式填空。
 5. 每条公式的字段：
    - latex：LaTeX 源码，不要加 $ 或 \\[ \\] 定界符
    - name：中文标准名称（如「欧拉公式」「带传动中心距计算公式」）；
@@ -170,6 +171,9 @@ def normalize_latex(raw: str) -> str:
     # 10. 分式改写会把占位空格搬离它原本的宏名，先收拾干净（只有紧跟宏名的才是
     #     "必须保留的分界空格"，其余是残留，删掉）
     text = _drop_stray_placeholders(text)
+    # 10.5 重音类宏的字母参数一律补上花括号（\hat s / \hats → \hat{s}）：
+    #      既是为了同一写法一个指纹，也是为了存下来的 LaTeX 能渲染
+    text = _brace_accent_args(text)
     # 11. 最后再收一次单字符花括号：上一步补出来的 {2} 要变回 2，才与 \frac{1}{2}
     #     那条路合流。必须在清占位符之后做，否则残留占位符会把括号撑成"多字符"
     text = _strip_single_char_braces(text)
@@ -203,13 +207,47 @@ def _strip_spacing(text: str) -> str:
     return re.sub(r"\s+", "", text)
 
 
+#: 带**字母**参数的重音/装饰类宏。这类宏的花括号不能剥：``\hat{s}`` 去掉括号就变成
+#: ``\hats``——未定义控制序列，存下来的 LaTeX 根本渲染不出来（线上真实踩到：ŝ 被写成
+#: ``\hats``）。数字或其它非字母参数没这个问题（``\sqrt2``、``\frac12`` 都合法）。
+_ACCENT_MACROS = frozenset({
+    "hat", "vec", "bar", "tilde", "dot", "ddot", "widehat", "widetilde",
+    "overrightarrow", "overline", "underline", "breve", "check",
+})
+_MACRO_TAIL = re.compile(r"\\([A-Za-z]+)$")
+_SINGLE_BRACE = re.compile(r"(?<![\^_])\{([^{}])\}")
+_ACCENT_BARE_ARG = re.compile(
+    r"\\("
+    + "|".join(sorted(_ACCENT_MACROS, key=len, reverse=True))
+    + r")[\s]?([A-Za-z])(?![A-Za-z])"
+)
+
+
 def _strip_single_char_braces(text: str) -> str:
     """去掉只包一个字符的花括号（``\\sqrt{2}``→``\\sqrt2``）。
 
-    ``^`` 与 ``_`` 后面的花括号是语义（``e^{2}`` 不能写成 ``e^2`` 之后再被误解），
-    所以那里不动。
+    两处**不能**剥：``^``/``_`` 后面（上下标的括号是语义），以及重音类宏后面的字母
+    参数（剥了就粘成未定义宏）。
     """
-    return re.sub(r"(?<![\^_]){([^{}])}", r"\1", text)
+    def keep(match: re.Match) -> str:
+        inner = match.group(1)
+        if inner.isalpha():
+            macro = _MACRO_TAIL.search(text[: match.start()])
+            if macro is not None and macro.group(1) in _ACCENT_MACROS:
+                return match.group(0)
+        return inner
+
+    return _SINGLE_BRACE.sub(keep, text)
+
+
+def _brace_accent_args(text: str) -> str:
+    """把 ``\\hat s``、``\\hats`` 这类写法统一成 ``\\hat{s}``。
+
+    模型对课件上的 ŝ 三种写法都给过（``\\hat s`` / ``\\hat{s}`` / 直接粘成
+    ``\\hats``）。不统一就是同一公式多个指纹；而且必须**带括号**，否则存下来的
+    LaTeX 是坏的。
+    """
+    return _ACCENT_BARE_ARG.sub(r"\\\1{\2}", text)
 
 
 def _repair_sqrt(text: str) -> str:

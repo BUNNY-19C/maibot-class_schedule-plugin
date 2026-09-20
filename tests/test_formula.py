@@ -94,6 +94,19 @@ class TestNormalizeLatex(unittest.TestCase):
         self.assertEqual(normalize_latex("√2"), normalize_latex(r"\sqrt{2}"))
         self.assertEqual(normalize_latex("√2"), r"\sqrt2")
 
+    def test_accent_macros_keep_their_braces(self):
+        """回归（真实 A/B）：``\\hat{s}`` 被剥成 ``\\hats`` 是未定义宏，渲染不出来。
+
+        三种写法（``\\hat{s}`` / ``\\hat s`` / 模型粘出来的 ``\\hats``）必须收敛成
+        同一个**带括号**的形式；数字参数不受影响（``\\sqrt2`` 是合法写法）。
+        """
+        self.assertEqual(normalize_latex(r"\hat s"), r"\hat{s}")
+        self.assertEqual(normalize_latex(r"\hats"), r"\hat{s}")
+        self.assertEqual(normalize_latex(r"\hat{s}"), r"\hat{s}")
+        self.assertEqual(normalize_latex(r"\widehat s"), r"\widehat{s}")
+        self.assertEqual(normalize_latex(r"\vec a+\bar b"), r"\vec{a}+\bar{b}")
+        self.assertEqual(normalize_latex(r"\sqrt{2}"), r"\sqrt2")  # 数字照旧可剥
+
     def test_sqrt_with_braces_converges_too(self):
         """回归（构造审查）：``√{2}`` 与 ``√2`` 必须同一个指纹。
 

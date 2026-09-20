@@ -134,7 +134,7 @@ vlm_fallback_model = "Qwen/Qwen3-VL-8B-Instruct" # 识别失败时降级重试�
 
 ## 开发
 
-691 项单元测试,只用标准库,不需要额外依赖:
+693 项单元测试,只用标准库,不需要额外依赖:
 
 ```bash
 python -m unittest discover -s tests -v
