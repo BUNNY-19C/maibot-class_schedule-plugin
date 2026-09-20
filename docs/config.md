@@ -222,6 +222,6 @@
 | `struct_model` | `deepseek-ai/DeepSeek-V3.2` | 结构化整理与打标的文本模型 |
 | `embedding_model` | `Qwen/Qwen3-Embedding-8B` | 语义检索的向量模型 |
 | `rerank_model` | `Qwen3-Reranker-8B` | 检索精排模型;留空则不做精排 |
-| `cloud_timeout_seconds` | `30` | 单次云端调用超时 |
+| `cloud_timeout_seconds` | `30` | 单次云端调用超时；**公式识别这条链路有 90 秒下限**（多公式的返回不是流式的，模型算完之前没有字节，30 秒会整条打死） |
 | `image_cache_enabled` | `true` | 图片 hash 命中缓存就直接复用,不重复识别与计费 |
 | `queue_size` | `200` | 识别队列长度;满了丢弃识别任务(笔记照收)并计数,`/笔记库` 可查 |

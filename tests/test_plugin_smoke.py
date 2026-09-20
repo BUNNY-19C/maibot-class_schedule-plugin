@@ -4442,6 +4442,37 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await plugin.on_unload()
 
+    async def test_recognition_timeout_has_a_floor(self):
+        """识别这条链路的超时有 90 秒下限：真实 A/B 里收 7 条公式要了 285 秒。
+
+        多公式的返回不是流式的，模型算完之前 socket 上一个字节都没有，所以配置的
+        30 秒会变成"整次调用的上限"并把识别整条打死。
+        """
+        with TemporaryDirectory() as tmp:
+            plugin = self.make_plugin(
+                Path(tmp),
+                build_config(study={"api_key": "sk-test-key", "cloud_timeout_seconds": 30}),
+            )
+            await plugin.on_load()
+            try:
+                self.assertIsNotNone(plugin._cloud_client)
+                # 客户端私有字段：测试里直接读，避免为一个下限再开一层公开 API
+                self.assertGreaterEqual(plugin._cloud_client._timeout, 90)
+            finally:
+                await plugin.on_unload()
+
+            # 用户配得更长时要尊重他的值
+            with TemporaryDirectory() as tmp2:
+                plugin2 = self.make_plugin(
+                    Path(tmp2),
+                    build_config(study={"api_key": "sk-test-key", "cloud_timeout_seconds": 240}),
+                )
+                await plugin2.on_load()
+                try:
+                    self.assertEqual(plugin2._cloud_client._timeout, 240)
+                finally:
+                    await plugin2.on_unload()
+
     async def test_notes_db_reports_dropped_jobs(self):
         """队列满丢弃必须有出口：/笔记库 里要能看到丢弃数。"""
         with TemporaryDirectory() as tmp:

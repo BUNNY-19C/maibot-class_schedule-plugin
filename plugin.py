@@ -3171,7 +3171,10 @@ class ClassSchedulePlugin(MaiBotPlugin):
         client = SiliconFlowClient(
             key,
             base_url=str(study.api_base_url or "").strip(),
-            timeout_seconds=int(study.cloud_timeout_seconds),
+            # 一条多公式的 JSON 是不流式的：模型没算完，socket 上就没有任何字节，
+            # 读超时因此是"整次调用的上限"。实测收 7 条公式要 285 秒，配置默认的
+            # 30 秒会把识别整条打死（HTTP 408/读超时），所以识别这条链路有下限。
+            timeout_seconds=max(90, int(study.cloud_timeout_seconds)),
         )
         if not client.configured:
             return None  # 缺 Key 或不是 https：装配期就能判定，不必等到调用

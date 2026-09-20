@@ -582,8 +582,11 @@ class StudySettingsConfig(PluginConfigBase):
     cloud_timeout_seconds: int = Field(
         default=30,
         ge=5,
-        le=180,
-        description="云端 API 单次调用超时（秒）",
+        le=300,
+        description=(
+            "云端 API 单次调用超时（秒）。注意：公式识别这条链路另有 90 秒下限——"
+            "多公式的返回不是流式的，模型算完之前一个字节都没有，30 秒会把识别整条打死"
+        ),
         json_schema_extra={"label": "云端超时（秒）", "order": 17, "step": 5},
     )
     image_cache_enabled: bool = Field(

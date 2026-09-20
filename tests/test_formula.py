@@ -278,6 +278,10 @@ class TestParseFormulaResponse(unittest.TestCase):
             self.assertIn(key, FORMULA_PROMPT)
         self.assertIn(UNKNOWN_FORMULA_NAME, FORMULA_PROMPT)
         self.assertIn("不要只挑", FORMULA_PROMPT)  # 覆盖率的关键一句
+        # 质量护栏：真实 A/B 里模型会把"令 x=y"、推导中间步骤也当公式收回来
+        self.assertIn("只收独立成行的式子", FORMULA_PROMPT)
+        self.assertIn("变量代换", FORMULA_PROMPT)
+        self.assertIn("完整式子", FORMULA_PROMPT)  # "左式/右式"要展开写
 
 
 class FakeVision:
