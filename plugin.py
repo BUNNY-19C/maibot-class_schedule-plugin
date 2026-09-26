@@ -54,7 +54,12 @@ from .course_query import (
     looks_like_schedule_question,
 )
 from .course_source import CourseRepository, import_filename
-from .course_resolver import CourseResolver, MatchKind, normalize_course_name
+from .course_resolver import (
+    PendingCourseChoice,
+    CourseResolver,
+    MatchKind,
+    normalize_course_name,
+)
 from .file_intake import (
     FileIntakeError,
     chat_import_filename,
@@ -100,6 +105,8 @@ _USER_ID_RE = re.compile(r"^\d{5,}$")
 MAX_IMPORT_FINGERPRINTS = 50
 #: 提醒类内容用的 reason 标识（决定走哪个发送方式）
 REMINDER_REASON = "class_reminder"
+#: /归到 歧义候选的确认有效期（分钟）。超时未选就作废，防止误归档到旧上下文
+PENDING_COURSE_TTL_MINUTES = 5
 #: proactive 兜底前查询"bot 是否已发言"的超时（秒）。
 #: 这个查询在提醒循环里同步等待，卡住会拖慢整轮检查，所以必须有上限。
 PROACTIVE_QUERY_TIMEOUT_SECONDS = 10.0
@@ -209,6 +216,8 @@ class ClassSchedulePlugin(MaiBotPlugin):
         self._inbox_dedup = InboxDeduper()
         # 课程名解析器（/归到 的简称与错字归一），无状态可安全复用
         self._course_resolver = CourseResolver()
+        # /归到 的歧义待选状态：会话 ID → 绑定了具体笔记的候选（内存态，TTL 5 分钟）
+        self._pending_course_choices: dict[str, PendingCourseChoice] = {}
         #: 待重试的总结任务：key -> {course, window}（每轮 tick 重新排入，见
         #: _maybe_course_summaries——失败后不能靠"下课窗口"重试，窗口会移走）
         self._summary_retries: dict[str, dict[str, Any]] = {}
@@ -2166,7 +2175,7 @@ class ClassSchedulePlugin(MaiBotPlugin):
 
     @Command(
         "schedule_note_move",
-        description="把最近一条「未分类」笔记归到指定课程",
+        description="把最近一条「未分类」笔记归到指定课程（支持简称；多候选时回复编号）",
         pattern=r"^/归到\s+(?P<course>\S+)\s*$",
     )
     @_requires_access
@@ -2174,19 +2183,45 @@ class ClassSchedulePlugin(MaiBotPlugin):
         notes = self._notes
         stream_id = str(kwargs.get("stream_id", "")).strip()
         course = str((kwargs.get("matched_groups") or {}).get("course") or "").strip()
+        now = datetime.now()
         if notes is None:
             message = "⏳ 插件尚未初始化完成，请稍后再试"
             await self._reply(stream_id, message)
             return False, message, 0
         if not course:
-            message = "用法：/归到 课程名"
+            message = "用法：/归到 课程名（或 /归到 编号 选择候选）"
             await self._reply(stream_id, message)
             return False, message, 0
 
-        # 课程名解析：简称/错字也能落到标准课程名，归档永远用标准名。
-        # 解析逻辑全部在 CourseResolver，这里只决定"归档还是让用户挑"。
+        pending = self._pop_expired_pending(stream_id, now)
+
+        # ⓪ 没有待选的数字输入（/归到 1）没有可消费的候选：直接说明，
+        #    绝不能落到"按原样建课程"里去建一个叫「1」的文件夹
+        if pending is None and re.fullmatch(r"[0-9]{1,2}", course):
+            message = "当前没有待选择的课程候选；请用 /归到 课程名"
+            await self._reply(stream_id, message)
+            return True, message, 1
+
+        # ① 数字输入：优先消费本会话的歧义待选。候选绑定的是**那一条**笔记，
+        #    就算期间未分类又进了新笔记也不会归错对象（评估清单第十一节）。
+        if pending is not None and re.fullmatch(r"[0-9]{1,2}", course):
+            index = int(course) - 1
+            if not 0 <= index < len(pending.candidates):
+                message = (
+                    f"⚠️ 请输入 1 到 {len(pending.candidates)} 之间的编号"
+                    f"（或直接发 /归到 完整课程名）"
+                )
+                await self._reply(stream_id, message)
+                return True, message, 1
+            return await self._archive_note_choice(
+                stream_id, pending.note_id, pending.candidates[index]
+            )
+
+        # ② 课程名解析：简称/错字也能落到标准课程名，归档永远用标准名。
+        #    解析逻辑全部在 CourseResolver，这里只决定"归档还是让用户挑"。
         resolution = self._course_resolver.resolve(course, self._known_course_names())
         if resolution.resolved:
+            self._pending_course_choices.pop(stream_id, None)  # 旧候选作废
             moved = notes.move_latest("未分类", resolution.selected)
             if moved is None:
                 message = "ℹ️ 「未分类」里没有可归类的笔记。"
@@ -2207,15 +2242,36 @@ class ClassSchedulePlugin(MaiBotPlugin):
             return True, message, 1
 
         if resolution.kind is MatchKind.AMBIGUOUS:
-            names = "、".join(item.name for item in resolution.candidates)
+            note = notes.last_of("未分类")
+            if note is None:
+                message = "ℹ️ 「未分类」里没有可归类的笔记。"
+                await self._reply(stream_id, message)
+                return True, message, 1
+            names = tuple(item.name for item in resolution.candidates)
+            self._pending_course_choices[stream_id] = PendingCourseChoice(
+                note_id=note.id,
+                original_query=course,
+                candidates=names,
+                expires_at=now + timedelta(minutes=PENDING_COURSE_TTL_MINUTES),
+            )
+            listed = "\n".join(
+                f"{index}. {name}" for index, name in enumerate(names, start=1)
+            )
             message = (
-                f"⚠️ 「{course}」可能对应多门课：{names}。"
-                "请输入更完整的课程名再归档。"
+                f"「{course}」可能对应：\n{listed}\n\n"
+                f"回复 /归到 1～{len(names)} 进行选择"
+                f"（{PENDING_COURSE_TTL_MINUTES} 分钟内有效；"
+                "这条选择只作用于刚才那条笔记）"
+            )
+            self.ctx.logger.info(
+                f"{LOG_PREFIX} 课程名歧义待确认：{course} → {len(names)} 个候选，"
+                f"绑定笔记 {note.id}"
             )
             await self._reply(stream_id, message)
             return True, message, 1
 
-        # NOT_FOUND：没有任何已知课程与输入相近——按输入原样创建新课程（旧行为）
+        # ③ NOT_FOUND：没有任何已知课程与输入相近——按输入原样创建新课程（旧行为）
+        self._pending_course_choices.pop(stream_id, None)
         moved = notes.move_latest("未分类", course)
         if moved is None:
             message = "ℹ️ 「未分类」里没有可归类的笔记。"
@@ -2227,6 +2283,39 @@ class ClassSchedulePlugin(MaiBotPlugin):
             self.ctx.logger.info(
                 f"{LOG_PREFIX} 笔记 {moved.id} 已由未分类归入新课程「{course}」"
             )
+        await self._reply(stream_id, message)
+        return True, message, 1
+
+    def _pop_expired_pending(
+        self, stream_id: str, now: datetime
+    ) -> PendingCourseChoice | None:
+        """取本会话的待选候选，过期就作废（返回 None 并清掉）。"""
+        pending = self._pending_course_choices.get(stream_id)
+        if pending is None:
+            return None
+        if pending.expired(now):
+            del self._pending_course_choices[stream_id]
+            return None
+        return pending
+
+    async def _archive_note_choice(
+        self, stream_id: str, note_id: str, course: str
+    ) -> CommandResult:
+        """把候选确认绑定的那条笔记归到选定课程（确认即消费掉待选状态）。"""
+        notes = self._notes
+        moved = notes.move_note("未分类", note_id, course) if notes is not None else None
+        self._pending_course_choices.pop(stream_id, None)
+        if moved is None:
+            message = "ℹ️ 那条笔记已经不在「未分类」里了（可能被移动或删除）。"
+            await self._reply(stream_id, message)
+            return True, message, 1
+        message = (
+            f"✅ 已把 [{moved.kind}] 归到「{notes.course_dir(course).name}」"
+            f"（该课现共 {notes.count(course)} 条）"
+        )
+        self.ctx.logger.info(
+            f"{LOG_PREFIX} 笔记 {moved.id} 已按候选确认归入「{course}」"
+        )
         await self._reply(stream_id, message)
         return True, message, 1
 
