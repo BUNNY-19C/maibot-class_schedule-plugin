@@ -21,6 +21,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import dataclass
+from datetime import datetime
 from difflib import SequenceMatcher
 from enum import Enum
 
@@ -80,6 +81,24 @@ class CourseResolution:
     @property
     def resolved(self) -> bool:
         return self.selected is not None
+
+
+@dataclass(frozen=True)
+class PendingCourseChoice:
+    """一次歧义候选的待确认状态：**绑定到具体那条笔记**。
+
+    为什么必须绑定：候选列出到用户回复 /归到 1 之间，未分类里可能又进了新笔记；
+    执行时若重取"最近一条未分类"就会归错对象（评估清单第十一节的场景）。
+    note_id 是 markdown 层的笔记 id（字符串，见 StudyNote.id）。
+    """
+
+    note_id: str
+    original_query: str
+    candidates: tuple[str, ...]
+    expires_at: datetime
+
+    def expired(self, now: datetime) -> bool:
+        return now >= self.expires_at
 
 
 def normalize_course_name(text: str) -> str:

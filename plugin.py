@@ -54,6 +54,7 @@ from .course_query import (
     looks_like_schedule_question,
 )
 from .course_source import CourseRepository, import_filename
+from .course_resolver import CourseResolver, MatchKind, normalize_course_name
 from .file_intake import (
     FileIntakeError,
     chat_import_filename,
@@ -206,6 +207,8 @@ class ClassSchedulePlugin(MaiBotPlugin):
         self._backfill_task: asyncio.Task[None] | None = None
         self._backfill_queued = 0
         self._inbox_dedup = InboxDeduper()
+        # 课程名解析器（/归到 的简称与错字归一），无状态可安全复用
+        self._course_resolver = CourseResolver()
         #: 待重试的总结任务：key -> {course, window}（每轮 tick 重新排入，见
         #: _maybe_course_summaries——失败后不能靠"下课窗口"重试，窗口会移走）
         self._summary_retries: dict[str, dict[str, Any]] = {}
@@ -2180,16 +2183,49 @@ class ClassSchedulePlugin(MaiBotPlugin):
             await self._reply(stream_id, message)
             return False, message, 0
 
+        # 课程名解析：简称/错字也能落到标准课程名，归档永远用标准名。
+        # 解析逻辑全部在 CourseResolver，这里只决定"归档还是让用户挑"。
+        resolution = self._course_resolver.resolve(course, self._known_course_names())
+        if resolution.resolved:
+            moved = notes.move_latest("未分类", resolution.selected)
+            if moved is None:
+                message = "ℹ️ 「未分类」里没有可归类的笔记。"
+            else:
+                matched = ""
+                if resolution.kind is not MatchKind.EXACT:
+                    matched = f"（由「{course}」解析）"
+                message = (
+                    f"✅ 已把 [{moved.kind}] 归到"
+                    f"「{notes.course_dir(resolution.selected).name}」{matched}"
+                    f"（该课现共 {notes.count(resolution.selected)} 条）"
+                )
+                self.ctx.logger.info(
+                    f"{LOG_PREFIX} 笔记 {moved.id} 已由未分类归入"
+                    f"「{resolution.selected}」（{resolution.kind.value}）"
+                )
+            await self._reply(stream_id, message)
+            return True, message, 1
+
+        if resolution.kind is MatchKind.AMBIGUOUS:
+            names = "、".join(item.name for item in resolution.candidates)
+            message = (
+                f"⚠️ 「{course}」可能对应多门课：{names}。"
+                "请输入更完整的课程名再归档。"
+            )
+            await self._reply(stream_id, message)
+            return True, message, 1
+
+        # NOT_FOUND：没有任何已知课程与输入相近——按输入原样创建新课程（旧行为）
         moved = notes.move_latest("未分类", course)
         if moved is None:
             message = "ℹ️ 「未分类」里没有可归类的笔记。"
         else:
             message = (
                 f"✅ 已把 [{moved.kind}] 归到「{notes.course_dir(course).name}」"
-                f"（该课现共 {notes.count(course)} 条）"
+                f"（新课程名，按输入原样创建；该课现共 {notes.count(course)} 条）"
             )
             self.ctx.logger.info(
-                f"{LOG_PREFIX} 笔记 {moved.id} 已由未分类归入「{course}」"
+                f"{LOG_PREFIX} 笔记 {moved.id} 已由未分类归入新课程「{course}」"
             )
         await self._reply(stream_id, message)
         return True, message, 1
@@ -2370,6 +2406,28 @@ class ClassSchedulePlugin(MaiBotPlugin):
         if 0 <= minutes <= MAX_LEAD_MINUTES:
             return minutes
         return None
+
+    def _known_course_names(self) -> list[str]:
+        """当前所有标准课程名：笔记目录里出现过的 + 课表里的课程。
+
+        「未分类」不算一门课，从解析范围里去掉。名称给 CourseResolver 做匹配，
+        顺序无关。
+        """
+        names: list[str] = []
+        seen: set[str] = set()
+        if self._notes is not None:
+            for name in self._notes.courses():
+                if name not in seen:
+                    seen.add(name)
+                    names.append(name)
+        repo = self._repo
+        if repo is not None:
+            for event in repo.events:
+                name = str(event.display_name or "").strip()
+                if name and name not in seen:
+                    seen.add(name)
+                    names.append(name)
+        return [name for name in names if name != "未分类"]
 
     # ── 法定节假日 ────────────────────────────────────────
 

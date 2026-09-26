@@ -297,13 +297,28 @@ class StudyNoteStore:
 
     def move_latest(self, from_course: str, to_course: str) -> StudyNote | None:
         """把 from 课目录里**最近一条**笔记挪到 to 课目录（人工纠正归属）。"""
-        src_dir = self.course_dir(from_course)
+        with self._lock:
+            index = self._load_index(self.course_dir(from_course))
+            if not index.notes:
+                return None
+            return self.move_note(from_course, index.notes[-1].id, to_course)
+
+    def move_note(
+        self, course: str, note_id: str, to_course: str
+    ) -> StudyNote | None:
+        """把**指定 id** 的笔记从 course 挪到 to_course；找不到返回 ``None``。
+
+        按 id 而不是"最近一条"：候选确认（/归到 1）从发起到执行中间可能隔着
+        新笔记，重取"最近一条"就会归错对象。
+        """
+        src_dir = self.course_dir(course)
         dst_dir = self.course_dir(to_course)
         with self._lock:
             index = self._load_index(src_dir)
-            if not index.notes:
+            note = next((item for item in index.notes if item.id == note_id), None)
+            if note is None:
                 return None
-            note = index.notes.pop()
+            index.notes.remove(note)
             self._write_index(src_dir, index)
             note.course = course_folder_name(to_course)
             dst_dir.mkdir(parents=True, exist_ok=True)
