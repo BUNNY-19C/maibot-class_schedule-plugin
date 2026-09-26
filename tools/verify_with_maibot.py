@@ -617,6 +617,9 @@ def check_runtime(workdir: Path, module_name: str, report: Check) -> None:
             }
             plugin.set_plugin_config(proactive_config)
             plugin._state.fired.clear()
+            # 送达记录按会话记在 fired_sessions 里（部分失败只补发失败会话），
+            # 强制重发两处都要清，否则已送达过的会话不会再来一遍
+            plugin._state.fired_sessions.clear()
             calls.clear()
             await plugin._tick()
             trigger_calls = [
@@ -651,6 +654,7 @@ def check_runtime(workdir: Path, module_name: str, report: Check) -> None:
             fixed_config["reply"] = {**fixed_config.get("reply", {}), "style": "fixed"}
             plugin.set_plugin_config(fixed_config)
             plugin._state.fired.clear()
+            plugin._state.fired_sessions.clear()
             calls.clear()
             await plugin._tick()
             send_calls = [c for c in calls if c[2].get("capability") == "send.text"]
