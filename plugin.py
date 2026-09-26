@@ -2221,8 +2221,17 @@ class ClassSchedulePlugin(MaiBotPlugin):
         #    解析逻辑全部在 CourseResolver，这里只决定"归档还是让用户挑"。
         resolution = self._course_resolver.resolve(course, self._known_course_names())
         if resolution.resolved:
+            selected = resolution.selected
+            # 待确认状态下，输入候选的**完整名称**与输入编号作用于同一条绑定笔记：
+            # 候选列出到确认之间未分类又进了新笔记，走 move_latest 就会归错对象
+            # （线上复现：A 触发歧义 → B 插队 → /归到 完整名 → B 被归档，A 滞留）。
+            if pending is not None and selected in pending.candidates:
+                self._pending_course_choices.pop(stream_id, None)
+                return await self._archive_note_choice(
+                    stream_id, pending.note_id, selected
+                )
             self._pending_course_choices.pop(stream_id, None)  # 旧候选作废
-            moved = notes.move_latest("未分类", resolution.selected)
+            moved = notes.move_latest("未分类", selected)
             if moved is None:
                 message = "ℹ️ 「未分类」里没有可归类的笔记。"
             else:
@@ -2231,12 +2240,12 @@ class ClassSchedulePlugin(MaiBotPlugin):
                     matched = f"（由「{course}」解析）"
                 message = (
                     f"✅ 已把 [{moved.kind}] 归到"
-                    f"「{notes.course_dir(resolution.selected).name}」{matched}"
-                    f"（该课现共 {notes.count(resolution.selected)} 条）"
+                    f"「{notes.course_dir(selected).name}」{matched}"
+                    f"（该课现共 {notes.count(selected)} 条）"
                 )
                 self.ctx.logger.info(
                     f"{LOG_PREFIX} 笔记 {moved.id} 已由未分类归入"
-                    f"「{resolution.selected}」（{resolution.kind.value}）"
+                    f"「{selected}」（{resolution.kind.value}）"
                 )
             await self._reply(stream_id, message)
             return True, message, 1
