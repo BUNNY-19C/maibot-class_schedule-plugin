@@ -303,6 +303,19 @@ class StudyNoteStore:
                 return None
             return self.move_note(from_course, index.notes[-1].id, to_course)
 
+    def locate_note(self, note_id: str) -> tuple[str, StudyNote] | None:
+        """按 id 在所有课程目录里找一条笔记，返回 ``(课程名, 笔记)``。
+
+        异步识别的回填用它定位笔记的**当前位置**：识别排队几秒到几分钟，
+        期间用户可能已经 /归到 把笔记挪去了别的课程，任务创建时的课程名会过期。
+        """
+        with self._lock:
+            for course in self.courses():
+                for note in self._load_index(self.course_dir(course)).notes:
+                    if note.id == note_id:
+                        return course, note
+        return None
+
     def move_note(
         self, course: str, note_id: str, to_course: str
     ) -> StudyNote | None:
@@ -331,6 +344,14 @@ class StudyNoteStore:
                 except OSError:
                     # 文件挪不动（被手动删了等）也保留索引记录，文本仍在
                     note.file = ""
+            # 配套的可读 md（识别回填给图片笔记生成的公式文档）一起带走：
+            # 留在原课程就成了孤儿文件，/笔记 与 /找 读的是新位置的索引
+            companion = src_dir / f"{note.id}_{note.kind}.md"
+            if companion.is_file():
+                try:
+                    os.replace(companion, dst_dir / companion.name)
+                except OSError:
+                    pass
             self._append(dst_dir, note)
             return note
 

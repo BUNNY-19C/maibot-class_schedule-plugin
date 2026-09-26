@@ -3636,6 +3636,10 @@ class ClassSchedulePlugin(MaiBotPlugin):
 
         一张图认出的多条公式合成一段文本（每条一行）写进同一条笔记——用户翻笔记
         时要看到的是式子本身，不是一句"这是一张课件幻灯片"的图说。
+
+        课程按笔记 **id 定位当前位置**，不用任务创建时的课程名：识别排队几秒到
+        几分钟，期间用户可能已经 /归到 把笔记挪走，写旧课程就会找不到笔记、
+        新课程下没公式（线上复现过）。笔记被删除时记日志后跳过。
         """
         notes = self._notes
         note_ref = str(job.get("note_ref") or "").strip()
@@ -3647,9 +3651,22 @@ class ClassSchedulePlugin(MaiBotPlugin):
         if notes is None or not note_ref or not lines:
             return
         try:
+            located = await asyncio.to_thread(notes.locate_note, note_ref)
+        except Exception as exc:
+            self.ctx.logger.warning(
+                f"{LOG_PREFIX} 公式回填定位笔记失败（已忽略）: {exc}"
+            )
+            return
+        if located is None:
+            self.ctx.logger.info(
+                f"{LOG_PREFIX} 公式回填跳过：笔记 {note_ref} 已不在笔记库里"
+            )
+            return
+        located_course = located[0]
+        try:
             await asyncio.to_thread(
                 notes.attach_formula,
-                str(job.get("course") or "未分类"),
+                located_course,
                 note_ref,
                 "\n".join(lines),
             )

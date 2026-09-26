@@ -130,6 +130,56 @@ class TestPendingCourseChoice(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(notes.recent("未分类", limit=1)[0].id, note_b.id)
             self.assertNotIn("ps", plugin._pending_course_choices)
 
+    async def test_full_name_in_pending_binds_the_same_note(self):
+        """回归：待确认状态下输入候选的完整名称，也作用于绑定的那条笔记。
+
+        旧实现只有编号分支绑定笔记，完整名称走 move_latest——确认期间 B 插队
+        时就会把 B 归档，A 滞留在未分类。
+        """
+        with TemporaryDirectory() as tmp:
+            plugin = _make(Path(tmp))
+            notes = plugin._notes
+            notes.add_text_note("航空自动控制基础", "笔记", "已有笔记一")
+            notes.add_text_note("自动控制原理", "笔记", "已有笔记二")
+            note_a = notes.add_text_note("未分类", "公式", "我是笔记A")
+
+            await _move(plugin, "自动控制")  # 歧义，候选绑定 A
+            note_b = notes.add_text_note("未分类", "公式", "我是笔记B")
+
+            message = await _move(plugin, "航空自动控制基础")  # 完整名称确认
+            self.assertIn("已把", message)
+            moved = notes.recent("航空自动控制基础", limit=1)[0]
+            self.assertEqual(moved.id, note_a.id, "归档的必须是 A，不是 B")
+            self.assertIn("我是笔记A", moved.text)
+            self.assertEqual(notes.count("未分类"), 1)
+            self.assertEqual(notes.recent("未分类", limit=1)[0].id, note_b.id)
+            self.assertNotIn("ps", plugin._pending_course_choices)
+
+    async def test_move_carries_companion_formula_md(self):
+        """回归：图片笔记带公式 md 移动课程时，文档必须一起走。
+
+        旧实现只挪 note.file（原图），attach_formula 生成的公式 md 留在原课程
+        成孤儿——新课程下翻笔记没有公式内容。
+        """
+        with TemporaryDirectory() as tmp:
+            plugin = _make(Path(tmp))
+            notes = plugin._notes
+            image = b"\x89PNG-slide-with-formula"
+            note = notes.add_image_note("未分类", "笔记", image, text="课件图说")
+            notes.attach_formula("未分类", note.id, "欧拉公式：e^{i\\pi}+1=0")
+            md_name = f"{note.id}_{note.kind}.md"
+
+            await _move(plugin, "航空自动控制基础")
+
+            new_dir = notes.course_dir("航空自动控制基础")
+            old_dir = notes.course_dir("未分类")
+            self.assertTrue((new_dir / md_name).is_file())
+            self.assertTrue((new_dir / note.file).is_file())
+            self.assertFalse((old_dir / md_name).exists())
+            self.assertFalse((old_dir / note.file).exists())
+            body = (new_dir / md_name).read_text(encoding="utf-8")
+            self.assertIn("欧拉公式", body)
+
     async def test_out_of_range_number_gets_range_hint(self):
         with TemporaryDirectory() as tmp:
             plugin = _make(Path(tmp))
