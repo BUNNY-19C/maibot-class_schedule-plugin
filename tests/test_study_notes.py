@@ -213,6 +213,50 @@ class TestAttachFormula(unittest.TestCase):
 class TestConcurrentWrites(unittest.TestCase):
     """识别回填与收纳会并发写同一份索引（后台线程 + 事件循环），不能互相覆盖。"""
 
+    def test_move_cannot_interrupt_formula_location_and_update(self):
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+        from unittest.mock import patch
+
+        with TemporaryDirectory() as tmp:
+            store = StudyNoteStore(Path(tmp) / "notes")
+            note = store.add_image_note("未分类", "笔记", b"image", text="原文")
+            located, allow_write, move_started = (
+                threading.Event(), threading.Event(), threading.Event()
+            )
+            original_locate = store.locate_note
+
+            def locate(note_id):
+                result = original_locate(note_id)
+                located.set()
+                if not allow_write.wait(5):
+                    raise TimeoutError("test did not release writer")
+                return result
+
+            def move():
+                move_started.set()
+                return store.move_note("未分类", note.id, "高等数学")
+
+            with ThreadPoolExecutor(max_workers=2) as executor, patch.object(
+                store, "locate_note", side_effect=locate
+            ):
+                writer = executor.submit(store.update_formula, note.id, "公式：x=1")
+                try:
+                    self.assertTrue(located.wait(5))
+                    mover = executor.submit(move)
+                    self.assertTrue(move_started.wait(5))
+                finally:
+                    allow_write.set()
+                self.assertIsNotNone(writer.result(timeout=5))
+                self.assertIsNotNone(mover.result(timeout=5))
+
+            current = store.last_of("高等数学")
+            self.assertEqual(current.formula, "公式：x=1")
+            self.assertEqual(current.text, "原文")
+            store.update_formula(note.id, "")
+            self.assertEqual(store.last_of("高等数学").formula, "")
+            self.assertIsNone(store.update_formula("missing", "x"))
+
     def test_threads_do_not_lose_notes_or_formulas(self):
         import threading
 

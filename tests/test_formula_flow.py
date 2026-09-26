@@ -15,6 +15,7 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import _bootstrap  # noqa: F401  —— 注册插件包
 
@@ -166,6 +167,145 @@ class TestFirstSendResendAndRestart(_Case):
             self.assertIn("微分定理", note.formula)
 
 
+class TestBackfillConsistency(_Case):
+    async def test_note_moved_after_scan_is_still_recognized(self):
+        plugin, db, store, pipeline, make_recognizer, _root = self.setup_case()
+        fake = ScriptedVision(_REPLY_NEW)
+        plugin._recognizer = make_recognizer(fake)
+        pipeline.set_recognizer(plugin._recognizer)
+        note = store.add_image_note("未分类", "笔记", _IMAGE)
+        original_lookup = db.image_recognition
+
+        def move_after_scan(digest):
+            store.move_note("未分类", note.id, "高等数学")
+            return original_lookup(digest)
+
+        with patch.object(db, "image_recognition", side_effect=move_after_scan):
+            await plugin._run_formula_backfill()
+
+        self.assertEqual(fake.calls, 1)
+        self.assertIn("新公式一", store.last_of("高等数学").formula)
+
+    async def test_transient_failure_is_attempted_once_for_duplicate_notes(self):
+        from class_schedule.llm_client import CloudError
+
+        plugin, db, store, pipeline, make_recognizer, _root = self.setup_case()
+
+        class BusyVision(ScriptedVision):
+            async def vision(self, **kwargs):
+                self.calls += 1
+                raise CloudError("HTTP 503 模型繁忙")
+
+        fake = BusyVision("")
+        plugin._recognizer = make_recognizer(fake)
+        pipeline.set_recognizer(plugin._recognizer)
+        for course in ("高等数学", "机械设计"):
+            note = store.add_image_note(course, "笔记", _IMAGE)
+            store.attach_formula(course, note.id, "保留上次结果")
+
+        await asyncio.wait_for(plugin._run_formula_backfill(), 5)
+
+        self.assertEqual(fake.calls, 1)
+        self.assertIsNone(db.formula_failure(image_hash(_IMAGE)))
+        for course in ("高等数学", "机械设计"):
+            self.assertEqual(store.last_of(course).formula, "保留上次结果")
+
+    async def test_duplicate_images_fill_every_note_with_one_model_call(self):
+        plugin, db, store, pipeline, make_recognizer, _root = self.setup_case()
+        fake = ScriptedVision(_REPLY_NEW)
+        plugin._recognizer = make_recognizer(fake)
+        pipeline.set_recognizer(plugin._recognizer)
+        for course in ("高等数学", "机械设计"):
+            store.add_image_note(course, "笔记", _IMAGE)
+
+        await plugin._run_formula_backfill()
+
+        self.assertEqual(fake.calls, 1)
+        for course in ("高等数学", "机械设计"):
+            self.assertIn("新公式一", store.last_of(course).formula)
+
+    async def test_cached_empty_result_clears_every_stale_note(self):
+        plugin, db, store, pipeline, make_recognizer, _root = self.setup_case()
+        fake = ScriptedVision(_REPLY_NEW)
+        plugin._recognizer = make_recognizer(fake)
+        pipeline.set_recognizer(plugin._recognizer)
+        for course in ("高等数学", "机械设计"):
+            note = store.add_image_note(course, "笔记", _IMAGE, text="保留图说")
+            store.attach_formula(course, note.id, "过期公式：x=1")
+        db.record_image_recognition(image_hash(_IMAGE), "no_formula", [], "test")
+
+        await plugin._run_formula_backfill()
+
+        self.assertEqual(fake.calls, 0)
+        for course in ("高等数学", "机械设计"):
+            self.assertEqual(store.last_of(course).formula, "")
+            self.assertEqual(store.last_of(course).text, "保留图说")
+
+    async def test_smaller_successful_result_replaces_previous_formulas(self):
+        plugin, db, store, pipeline, make_recognizer, _root = self.setup_case()
+        note = store.add_image_note("高等数学", "笔记", _IMAGE, text="保留图说")
+        store.attach_formula("高等数学", note.id, "公式一：x=1\n公式二：y=2")
+
+        await plugin._on_formula_recognized(
+            {"note_ref": note.id, "course": "高等数学", "stream_id": ""},
+            {"status": "recognized", "formulas": [{"name": "公式一", "latex": "x=1"}]},
+        )
+
+        self.assertEqual(store.last_of("高等数学").formula, "公式一：x=1")
+        body = (store.course_dir("高等数学") / f"{note.id}_{note.kind}.md").read_text(encoding="utf-8")
+        self.assertNotIn("公式二", body)
+        self.assertIn("保留图说", body)
+
+    async def test_full_queue_does_not_abandon_historical_images(self):
+        plugin, db, store, old_pipeline, make_recognizer, _root = self.setup_case()
+        await old_pipeline.stop()
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        class SlowVision(ScriptedVision):
+            async def vision(self, **kwargs):
+                entered.set()
+                await release.wait()
+                return await super().vision(**kwargs)
+
+        fake = SlowVision(_REPLY_NEW)
+        plugin._recognizer = make_recognizer(fake)
+        pipeline = StudyPipeline(
+            db=db, queue_size=1, recognizer=plugin._recognizer,
+            on_recognized=plugin._on_formula_recognized,
+        )
+        plugin._pipeline = pipeline
+        pipeline.start()
+        self.addAsyncCleanup(pipeline.stop)
+        pipeline.enqueue({"image": b"busy"})
+        await entered.wait()
+        pipeline.enqueue({"image": b"waiting"})
+        note = store.add_image_note("高等数学", "笔记", _IMAGE)
+        scan_done = asyncio.Event()
+        original_scan = plugin._note_image_files
+
+        def scan():
+            result = original_scan()
+            loop.call_soon_threadsafe(scan_done.set)
+            return result
+
+        loop = asyncio.get_running_loop()
+        plugin._note_image_files = scan
+        task = asyncio.create_task(plugin._run_formula_backfill())
+        try:
+            await scan_done.wait()
+            # Let the producer reach the full queue while the worker is held.
+            await asyncio.sleep(0.05)
+            release.set()
+            await asyncio.wait_for(task, 5)
+            await pipeline.drain()
+        finally:
+            release.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self.assertIn("新公式一", store.last_of("高等数学").formula)
+        self.assertEqual(pipeline.dropped, 0)
+
+
 class TestRerecognizeCommand(_Case):
     """/重识图片：主动重识入口（评估项 3）。"""
 
@@ -247,12 +387,11 @@ class TestBackfillContinuation(_Case):
         # 造 5 张待识别图，单批上限压到 2：必须跑 3 批才能全部覆盖
         for index in range(5):
             store.add_image_note("高等数学", "笔记", b"\x89PNG-backfill-%d" % index)
-        original = plugin_module.MAX_BACKFILL_PER_RUN
-        plugin_module.MAX_BACKFILL_PER_RUN = 2
-        try:
+        with patch.object(plugin_module, "MAX_BACKFILL_PER_RUN", 2), patch.object(
+            plugin, "_note_image_files", wraps=plugin._note_image_files
+        ) as scan:
             await plugin._run_formula_backfill()
-        finally:
-            plugin_module.MAX_BACKFILL_PER_RUN = original
+        self.assertEqual(scan.call_count, 1, "分批消费不应反复扫描历史目录")
 
         self.assertEqual(fake.calls, 5, "续跑没有覆盖到全部待识别图片")
         # 5 张图用同一段回复：指纹去重后库里只有 2 条不同的公式

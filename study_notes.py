@@ -242,7 +242,7 @@ class StudyNoteStore:
             target = next((item for item in index.notes if item.id == note_id), None)
             if target is None:
                 return None
-            if text in (target.formula or ""):
+            if text == (target.formula or ""):
                 return target  # 已经回填过，别重复写盘
             target.formula = text
             self._write_index(course_dir, index)
@@ -340,6 +340,33 @@ class StudyNoteStore:
                     if note.id == note_id:
                         return course, note
         return None
+
+    def update_formula(self, note_id: str, formula: str) -> StudyNote | None:
+        """按笔记 id 替换自动识别结果；定位与写入共用归档锁。
+
+        空结果清除自动公式。整个操作不可被 move_note 插入，避免定位后
+        笔记又被移走；用户原文与图片保持原样。
+        """
+        with self._lock:
+            located = self.locate_note(note_id)
+            if located is None:
+                return None
+            course, _note = located
+            if str(formula or "").strip():
+                return self.attach_formula(course, note_id, formula)
+            return self.clear_formula(course, note_id)
+
+    def read_note_image(self, note_id: str) -> tuple[bytes, str] | None:
+        """在归档锁内读取笔记当前位置的原图，供等待中的补识别任务使用。"""
+        with self._lock:
+            located = self.locate_note(note_id)
+            if located is None:
+                return None
+            course, note = located
+            if not note.file or not note.file.startswith("img/"):
+                return None
+            path = self.course_dir(course) / note.file
+            return path.read_bytes(), path.suffix
 
     def move_note(
         self, course: str, note_id: str, to_course: str

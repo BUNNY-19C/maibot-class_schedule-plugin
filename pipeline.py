@@ -196,6 +196,18 @@ class StudyPipeline:
         if self._queue is not None:
             await self._queue.join()
 
+    async def enqueue_wait(self, job: dict[str, Any]) -> bool:
+        """后台补识别等待队列空位；聊天入口仍使用非阻塞 enqueue。
+
+        调用者须在停机时取消等待任务，插件的补识别任务由卸载流程负责取消。
+        """
+        queue = self._queue
+        if not self._started or queue is None or self._recognizer is None:
+            return False
+        await queue.put(job)
+        self.enqueued += 1
+        return True
+
     async def _worker(self, index: int) -> None:
         """worker 主循环：一条任务失败不能带走整个 worker。"""
         queue = self._queue

@@ -3441,111 +3441,81 @@ class ClassSchedulePlugin(MaiBotPlugin):
         )
 
     async def _run_formula_backfill(self) -> None:
-        """补识别：把"有图但还没识别结果"的图片按批排队识别，**批间自动续跑**。
+        """单次扫描、按图片分组、分批补识别，并回填每一条引用笔记。
 
-        每批最多 ``MAX_BACKFILL_PER_RUN`` 张（避免一次压几十张给模型），批次入队后
-        等队列消费完再扫下一批，直到没有新图片为止——旧版只跑一批，第 31 张起
-        永远轮不到，/重识图片 清了全部缓存也可能只重跑前 30 张。
-
-        ``attempted`` 记录本轮已尝试的图：瞬时失败（超时/拥塞）不写失败计数，
-        如果没有这个集合，续跑会把同一张刚超时的图立刻再排一次，烧钱且无意义；
-        它们等下一次装载自然重试。
+        每张不同的图片每轮最多排队一次，失败不会在本轮反复计费。
+        分组只保留路径和笔记引用，不在内存中保留全部原图字节。
         """
         db = self._notes_db
-        if db is None or self._pipeline is None or self._recognizer is None:
+        pipeline = self._pipeline
+        if db is None or pipeline is None or self._recognizer is None:
             return
-        attempted: set[str] = set()
-        totals = {"queued": 0, "skipped": 0}
-        baseline_ok = (
-            self._recognizer.recognized_count + self._recognizer.cached_count
-        )
-        baseline_fail = self._recognizer.failed_count
-        batch = 0
-        while True:
-            batch += 1
+        try:
+            files = await asyncio.to_thread(self._note_image_files)
+        except OSError as exc:
+            self.ctx.logger.warning(f"{LOG_PREFIX} 补识别扫描图片失败: {exc}")
+            return
+        groups: dict[str, dict[str, Any]] = {}
+        for course, path, note_ref in files:
             try:
-                files = await asyncio.to_thread(self._note_image_files)
-            except OSError as exc:
-                self.ctx.logger.warning(f"{LOG_PREFIX} 补识别扫描图片失败: {exc}")
+                digest = image_hash(await asyncio.to_thread(path.read_bytes))
+            except OSError:
+                continue
+            if digest:
+                group = groups.setdefault(digest, {"path": path, "targets": []})
+                group["targets"].append({"course": course, "note_ref": note_ref})
+
+        queued = skipped = 0
+        for digest, group in groups.items():
+            if self._recognizer is None or not pipeline.running:
                 return
-            queued = skipped = 0
-            for course, path, note_ref in files:
-                try:
-                    data = await asyncio.to_thread(path.read_bytes)
-                except OSError:
-                    continue  # 单张读不到就跳过，不影响其它图
-                digest = image_hash(data)
-                if not digest or digest in attempted:
-                    continue
-                try:
-                    record = await asyncio.to_thread(db.image_recognition, digest)
-                except Exception:
-                    record = None  # 查不出就当没认过，大不了多认一次（有指纹去重兜底）
-                if record is not None:
-                    attempted.add(digest)
-                    skipped += 1
-                    # 认过的图也要把公式补写进笔记：本功能上线前认的图，公式只在库里，
-                    # /笔记 与 /找 看不到（用户正是因此说"不是完整的公式"）
-                    if str(record["status"] or "") == "recognized":
-                        entries = await self._recognition_entries(db, record)
-                        if entries:
-                            await self._attach_formula_to_note(
-                                {"course": course, "note_ref": note_ref}, entries
-                            )
-                    continue
-                if await asyncio.to_thread(self._recognizer.has_given_up, digest):
-                    attempted.add(digest)
-                    skipped += 1  # 自动试满次数，别再来一遍
-                    continue
-                if self._pipeline.enqueue({
-                    "note_id": 0,
-                    "note_ref": note_ref,
-                    "image": data,
-                    "suffix": path.suffix or ".png",
-                    "course": course,
-                    "week": None,
-                    "period": "",
-                    "message_id": "",
-                    "stream_id": "",  # 补识别不回执到会话：它是补历史，不该刷屏
-                    "kind": "",
-                }):
-                    attempted.add(digest)
-                    queued += 1
-                    self._backfill_queued += 1
-                    totals["queued"] += 1
-                if queued >= MAX_BACKFILL_PER_RUN:
-                    break
-            totals["skipped"] += skipped
-            if queued == 0:
-                # 本批没有任何可排队的新图：剩下的都已识别/已放弃/本轮试过，收工
-                if batch == 1 and skipped:
-                    self.ctx.logger.info(
-                        f"{LOG_PREFIX} 补识别扫描：无待识别图片"
-                        f"（跳过已识别/已放弃 {skipped} 张）"
+            job = {
+                **group["targets"][0],
+                "note_targets": group["targets"],
+                "note_id": 0,
+                "stream_id": "",  # 历史补识别只回填，不刷屏
+            }
+            record = await asyncio.to_thread(db.image_recognition, digest)
+            if record is not None:
+                entries = await self._recognition_entries(db, record)
+                await self._on_formula_recognized(job, {
+                    "status": "cached",
+                    "formulas": entries,
+                    "cached_no_formula": str(record["status"]) == "no_formula",
+                })
+                skipped += 1
+                continue
+            if await asyncio.to_thread(self._recognizer.has_given_up, digest):
+                skipped += 1
+                continue
+            path = group["path"]
+            try:
+                current_image = None
+                if self._notes is not None:
+                    current_image = await asyncio.to_thread(
+                        self._notes.read_note_image, job["note_ref"]
                     )
-                break
-            # 等这一批被 worker 消费完再扫下一批：识别记录写回后，
-            # 下一轮扫描自然会跳过它们
-            await self._pipeline.drain()
-            ok_now = (
-                self._recognizer.recognized_count
-                + self._recognizer.cached_count
-                - baseline_ok
-            )
-            fail_now = self._recognizer.failed_count - baseline_fail
-            self.ctx.logger.info(
-                f"{LOG_PREFIX} 补识别第 {batch} 批完成：排队 {queued} 张，"
-                f"成功 {ok_now} 张，失败 {fail_now} 张"
-                + (
-                    f"；失败原因（最近）：{self._recognizer.last_error[:80]}"
-                    if fail_now and self._recognizer.last_error
-                    else ""
+                if current_image is None:
+                    current_image = (await asyncio.to_thread(path.read_bytes), path.suffix)
+                job["image"], job["suffix"] = current_image
+            except OSError:
+                continue
+            job["suffix"] = job["suffix"] or ".png"
+            if not await pipeline.enqueue_wait(job):
+                return
+            queued += 1
+            self._backfill_queued += 1
+            if queued % MAX_BACKFILL_PER_RUN == 0:
+                await pipeline.drain()
+                self.ctx.logger.info(
+                    f"{LOG_PREFIX} 补识别批次处理完成：累计处理 {queued} 张不同图片"
                 )
-            )
-        if totals["queued"] or totals["skipped"]:
+        if queued % MAX_BACKFILL_PER_RUN:
+            await pipeline.drain()
+        if queued or skipped:
             self.ctx.logger.info(
-                f"{LOG_PREFIX} 补识别结束：共排队 {totals['queued']} 张，"
-                f"跳过（认过/已放弃）{totals['skipped']} 张"
+                f"{LOG_PREFIX} 补识别结束：共排队 {queued} 张不同图片，"
+                f"缓存/已放弃 {skipped} 张，扫描笔记图片 {len(files)} 条"
             )
 
     async def _recognition_entries(
@@ -3626,10 +3596,11 @@ class ClassSchedulePlugin(MaiBotPlugin):
         # 那一层。这一步必须在 stream_id 判断之前，否则补识别的结果进不了笔记。
         # 注意 no_formula（重识别判定"图里没公式"）要**清掉**旧自动公式——否则
         # 识别缓存说"没公式"、用户看到的还是旧公式（评估项 4）。失败保留旧内容。
-        if status == "no_formula":
-            await self._clear_note_formula(job)
-        elif formulas:
-            await self._attach_formula_to_note(job, formulas)
+        for target in job.get("note_targets") or [job]:
+            if status == "no_formula" or result.get("cached_no_formula"):
+                await self._clear_note_formula(target)
+            elif status in ("recognized", "cached") and formulas:
+                await self._attach_formula_to_note(target, formulas)
 
         if not stream_id:
             return  # 补识别不回执：它是补历史，不是用户这次的操作
@@ -3694,14 +3665,7 @@ class ClassSchedulePlugin(MaiBotPlugin):
         if notes is None or not note_ref:
             return
         try:
-            located = await asyncio.to_thread(notes.locate_note, note_ref)
-        except Exception as exc:
-            self.ctx.logger.warning(f"{LOG_PREFIX} 公式清除定位笔记失败（已忽略）: {exc}")
-            return
-        if located is None:
-            return
-        try:
-            await asyncio.to_thread(notes.clear_formula, located[0], note_ref)
+            await asyncio.to_thread(notes.update_formula, note_ref, "")
         except Exception as exc:
             self.ctx.logger.warning(f"{LOG_PREFIX} 公式清除失败（已忽略）: {exc}")
 
@@ -3727,25 +3691,11 @@ class ClassSchedulePlugin(MaiBotPlugin):
         if notes is None or not note_ref or not lines:
             return
         try:
-            located = await asyncio.to_thread(notes.locate_note, note_ref)
-        except Exception as exc:
-            self.ctx.logger.warning(
-                f"{LOG_PREFIX} 公式回填定位笔记失败（已忽略）: {exc}"
-            )
-            return
-        if located is None:
-            self.ctx.logger.info(
-                f"{LOG_PREFIX} 公式回填跳过：笔记 {note_ref} 已不在笔记库里"
-            )
-            return
-        located_course = located[0]
-        try:
-            await asyncio.to_thread(
-                notes.attach_formula,
-                located_course,
-                note_ref,
-                "\n".join(lines),
-            )
+            updated = await asyncio.to_thread(notes.update_formula, note_ref, "\n".join(lines))
+            if updated is None:
+                self.ctx.logger.info(
+                    f"{LOG_PREFIX} 公式回填跳过：笔记 {note_ref} 已不在笔记库里"
+                )
         except Exception as exc:
             # 写笔记失败不影响识别结果本身（公式已在库里，回执照发）
             self.ctx.logger.warning(f"{LOG_PREFIX} 公式写入笔记失败（已忽略）: {exc}")
