@@ -153,6 +153,10 @@ class PluginState:
 
     subscriptions: list[Subscription] = field(default_factory=list)
     fired: dict[str, str] = field(default_factory=dict)
+    #: 按会话记录的送达：提醒键 → {会话ID → 送达时间}。
+    #: 一节课发给多个会话时，部分失败不能再整节标记"已提醒"——那会让失败的
+    #: 会话永远等不到补发（线上取舍过，用户指出这是漏提醒）。
+    fired_sessions: dict[str, dict[str, str]] = field(default_factory=dict)
     #: 已生成的课后总结："<课次key>" -> "<ISO时间>"（key 形如 202609170800:uid）
     summaries: dict[str, str] = field(default_factory=dict)
 
@@ -176,8 +180,14 @@ class PluginState:
 
         subscriptions = cls._load_subscriptions(raw)
         fired = cls._load_fired(raw.get("fired"))
+        fired_sessions = cls._load_fired_sessions(raw.get("fired_sessions"))
         summaries = cls._load_summaries(raw.get("summaries"))
-        return cls(subscriptions=subscriptions, fired=fired, summaries=summaries)
+        return cls(
+            subscriptions=subscriptions,
+            fired=fired,
+            fired_sessions=fired_sessions,
+            summaries=summaries,
+        )
 
     @staticmethod
     def _load_fired(raw: Any) -> dict[str, str]:
@@ -188,6 +198,23 @@ class PluginState:
                 if isinstance(key, str) and isinstance(value, str):
                     fired[key] = value
         return fired
+
+    @staticmethod
+    def _load_fired_sessions(raw: Any) -> dict[str, dict[str, str]]:
+        """读取按会话记录的送达；结构异常的条目整条跳过。"""
+        result: dict[str, dict[str, str]] = {}
+        if not isinstance(raw, dict):
+            return result
+        for key, sessions in raw.items():
+            if not isinstance(key, str) or not isinstance(sessions, dict):
+                continue
+            per: dict[str, str] = {}
+            for stream_id, moment in sessions.items():
+                if isinstance(stream_id, str) and stream_id and isinstance(moment, str):
+                    per[stream_id] = moment
+            if per:
+                result[key] = per
+        return result
 
     @staticmethod
     def _load_summaries(raw: Any) -> dict[str, str]:
@@ -256,6 +283,7 @@ class PluginState:
             "version": STATE_VERSION,
             "subscriptions": [item.to_dict() for item in self.subscriptions],
             "fired": self.fired,
+            "fired_sessions": self.fired_sessions,
             "summaries": self.summaries,
         }
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -344,8 +372,17 @@ class PluginState:
         return key in self.summaries
 
     def mark_fired(self, key: str, moment: datetime) -> None:
-        """记录一次已提醒。"""
+        """记录一次已提醒（全部目标会话都送达后调用）。"""
         self.fired[key] = moment.isoformat()
+
+    def mark_session_delivered(self, key: str, stream_id: str, moment: datetime) -> None:
+        """记录"这节课的提醒已送到这个会话"（部分送达时逐会话记录）。"""
+        per = self.fired_sessions.setdefault(str(key), {})
+        per[str(stream_id)] = moment.isoformat()
+
+    def delivered_sessions(self, key: str) -> dict[str, str]:
+        """这节课已经成功送达过的会话 → 送达时间；没记录过返回空表。"""
+        return self.fired_sessions.get(str(key), {})
 
     def prune_fired(self, now: datetime, keep_days: int = FIRED_KEEP_DAYS) -> int:
         """清理过期记录，返回清理条数。
@@ -363,6 +400,21 @@ class PluginState:
                 continue
             if moment < cutoff:
                 del self.fired[key]
+                removed += 1
+
+        for key, sessions in list(self.fired_sessions.items()):
+            if not sessions:
+                del self.fired_sessions[key]
+                removed += 1
+                continue
+            try:
+                latest = max(datetime.fromisoformat(v) for v in sessions.values())
+            except (ValueError, TypeError):
+                del self.fired_sessions[key]
+                removed += 1
+                continue
+            if latest < cutoff:
+                del self.fired_sessions[key]
                 removed += 1
 
         if len(self.fired) > FIRED_MAX_ENTRIES:

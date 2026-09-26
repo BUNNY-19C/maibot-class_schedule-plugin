@@ -154,11 +154,11 @@ class AccessSettingsConfig(PluginConfigBase):
         json_schema_extra={"label": "限制提醒投递", "order": 3},
     )
     tool_query_enabled: bool = Field(
-        default=True,
+        default=False,
         description=(
-            "是否允许麦麦用 LLM 工具查询课表。注意：工具调用拿不到会话信息"
-            "（麦麦只把模型给的参数传下来，见 README「七」），所以名单管不住它。"
-            "如果机器人也在你不放心的群里，请关掉这一项"
+            "是否允许麦麦用 LLM 工具查询课表。默认关闭：工具调用拿不到会话信息"
+            "（麦麦只把模型给的参数传下来），名单和\"只走私聊\"都管不住它。"
+            "需要这个能力时再打开，并接受它绕过上述限制"
         ),
         json_schema_extra={"label": "允许 LLM 查询课表", "order": 4},
     )
@@ -571,13 +571,18 @@ class StudySettingsConfig(PluginConfigBase):
     )
     embedding_model: str = Field(
         default="Qwen/Qwen3-Embedding-8B",
-        description="语义检索的向量模型",
-        json_schema_extra={"label": "Embedding 模型", "order": 15},
+        description=(
+            "语义检索的向量模型。**注意：语义检索尚未接线**——当前 /找 只做关键词"
+            "全文检索（含公式库），这个字段暂时不生效；接线前配置它不会产生任何调用"
+        ),
+        json_schema_extra={"label": "Embedding 模型（暂未生效）", "order": 15},
     )
     rerank_model: str = Field(
         default="Qwen3-Reranker-8B",
-        description="语义检索精排模型；留空则不做精排",
-        json_schema_extra={"label": "Rerank 模型", "order": 16},
+        description=(
+            "语义检索精排模型。**注意：语义检索尚未接线**，这个字段暂时不生效"
+        ),
+        json_schema_extra={"label": "Rerank 模型（暂未生效）", "order": 16},
     )
     cloud_timeout_seconds: int = Field(
         default=30,

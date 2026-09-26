@@ -587,6 +587,61 @@ class TestFormulaRecognizer(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(time.perf_counter() - start, 0)  # 只是别卡死
 
 
+class TestImageRecognitionCache(unittest.TestCase):
+    """图 → 识别结果 的缓存（评估项 1+3 的落点）。"""
+
+    def test_roundtrip_keeps_every_formula(self):
+        """回归（评估复现）：一张图认出 2 条，缓存命中也必须回 2 条。
+
+        旧实现把关联塞在公式行的 image_hash 列里、查询 LIMIT 1——首识 2 条、
+        重发同一张图只剩 1 条。
+        """
+        db = _db_case(self)
+        id_a, _ = db.upsert_formula({"fingerprint": "fa", "name": "公式A", "image_hash": "img-1"})
+        id_b, _ = db.upsert_formula({"fingerprint": "fb", "name": "公式B", "image_hash": "img-1"})
+        db.record_image_recognition("img-1", "recognized", [id_a, id_b], "vlm")
+        record = db.image_recognition("img-1")
+        self.assertEqual(record["status"], "recognized")
+        self.assertEqual(json.loads(record["formula_ids"]), [id_a, id_b])
+        # 另一张图也可以关联同一条公式（多对多）
+        db.record_image_recognition("img-2", "recognized", [id_a], "vlm")
+        self.assertEqual(json.loads(db.image_recognition("img-2")["formula_ids"]), [id_a])
+
+    def test_no_formula_is_cached_too(self):
+        """评估项 3：成功的空结果也要缓存，补识别才不会把它当"没处理过"。"""
+        db = _db_case(self)
+        db.record_image_recognition("img-9", "no_formula", [], "vlm")
+        self.assertEqual(db.image_recognition("img-9")["status"], "no_formula")
+        db.forget_image_recognitions(["img-9"])
+        self.assertIsNone(db.image_recognition("img-9"))
+
+    def test_migration_seeds_from_legacy_image_hash(self):
+        """旧库迁移：formulas.image_hash 里的关联按图分组搬进新表，只跑一次。"""
+        import sqlite3
+
+        db = _db_case(self)
+        id_a, _ = db.upsert_formula({"fingerprint": "ma", "name": "A", "image_hash": "img-m"})
+        id_b, _ = db.upsert_formula({"fingerprint": "mb", "name": "B", "image_hash": "img-m"})
+        # 模拟"旧版本留下的库"：抹掉迁移标记与迁移产物，下次 initialize 重迁
+        conn = db._connection()  # noqa: SLF001  —— 构造旧库状态必须直接动库
+        conn.execute("DELETE FROM image_recognitions")
+        conn.execute("DELETE FROM meta WHERE key = 'image_recognitions_migrated'")
+        conn.commit()
+        db.close()
+
+        reopened = NotesDatabase(db.path)
+        reopened.initialize()
+        self.addCleanup(reopened.close)
+        record = reopened.image_recognition("img-m")
+        self.assertIsNotNone(record)
+        self.assertEqual(json.loads(record["formula_ids"]), [id_a, id_b])
+        # 幂等：再来一次 initialize 不重复搬运
+        reopened.initialize()
+        self.assertEqual(
+            json.loads(reopened.image_recognition("img-m")["formula_ids"]), [id_a, id_b]
+        )
+
+
 class TestPipelineQueue(unittest.IsolatedAsyncioTestCase):
     """worker 队列：消费、满则丢、停机取消——都很容易写成死锁，逐条钉住。"""
 

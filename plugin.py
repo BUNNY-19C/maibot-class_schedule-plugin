@@ -765,35 +765,43 @@ class ClassSchedulePlugin(MaiBotPlugin):
         for item in due:
             facts = render_message(item, conf.message.template)
             persona_text = await self._persona_say(facts) if persona_style else ""
+            # 送达按"课程实例＋提前量＋会话"记录：上轮部分失败时，这轮只补发
+            # 失败的会话，成功过的绝不重复打扰（去重键不含会话，所以不能靠它）
+            already = self._state.delivered_sessions(item.key)
+            targets = [s for s in stream_ids if s not in already]
+            if not targets:
+                # 防御：全部会话都已送达却还没标记 fired（例如状态被手工改过）
+                self._state.mark_fired(item.key, now)
+                continue
             sent, failed = 0, []
-            for stream_id in stream_ids:
+            for stream_id in targets:
                 if await self._deliver(
                     stream_id,
                     facts,
                     reason=REMINDER_REASON,
                     persona_text=persona_text,
                 ):
+                    self._state.mark_session_delivered(item.key, stream_id, now)
                     sent += 1
                 else:
                     failed.append(stream_id)
-            if sent == 0:
-                # 全部发送失败：不标记已提醒，下一轮在窗口内重试
-                self.ctx.logger.warning(
-                    f"{LOG_PREFIX} 提醒发送失败，将在下一轮重试: {item.event.display_name}"
-                )
-                continue
-            self._state.mark_fired(item.key, now)
-            fired_any = True
-            self.ctx.logger.info(
-                f"{LOG_PREFIX} 已提醒「{item.event.display_name}」"
-                f"（{item.start.strftime('%m-%d %H:%M')}，提前 {lead} 分钟，"
-                f"发送 {sent}/{len(stream_ids)}）"
-            )
             if failed:
-                # 去重键不含会话，所以这些会话这次提醒就丢了：至少要让用户看见
+                # 没送达的会话下一轮在窗口内补发（送达记录已逐会话落盘，
+                # 中途重启也不会多发或漏发）
                 self.ctx.logger.warning(
-                    f"{LOG_PREFIX} 以下会话本次未送达（不会重发，课已临近）: "
-                    f"{'、'.join(failed)}"
+                    f"{LOG_PREFIX} 提醒部分未送达，将在窗口内补发: "
+                    f"{item.event.display_name}（未送达 {'、'.join(failed)}）"
+                )
+            if not failed:
+                self._state.mark_fired(item.key, now)
+            if sent:
+                fired_any = True
+                self.ctx.logger.info(
+                    f"{LOG_PREFIX} 已提醒「{item.event.display_name}」"
+                    f"（{item.start.strftime('%m-%d %H:%M')}，提前 {lead} 分钟，"
+                    f"本轮发送 {sent}/{len(targets)}，"
+                    f"累计 {len(self._state.delivered_sessions(item.key))}"
+                    f"/{len(stream_ids)}）"
                 )
         return fired_any
 
@@ -2214,6 +2222,62 @@ class ClassSchedulePlugin(MaiBotPlugin):
         await self._reply(stream_id, message)
         return True, message, 1
 
+    @Command(
+        "schedule_rerecognize",
+        description="清掉图片的识别缓存并按当前模型重新识别（升级模型/提示词后用）",
+        pattern=r"^/重识图片(?:\s+(?P<course>\S+))?\s*$",
+    )
+    @_requires_access
+    async def handle_rerecognize(self, **kwargs: Any) -> CommandResult:
+        """主动重识入口：删识别缓存 → 触发补识别，全部后台进行。
+
+        识别结果（含"图里没有公式"的成功空结果）现在会缓存，重发同一张图不再
+        花钱也不再更新——所以需要这个口子：换了更强的模型或改了提示词后，
+        把旧结果作废重跑。公式按指纹去重，重跑不会产生重复记录。
+        """
+        stream_id = str(kwargs.get("stream_id", "")).strip()
+        course = str((kwargs.get("matched_groups") or {}).get("course") or "").strip()
+        db = self._notes_db
+        if db is None or self._notes is None:
+            message = "ℹ️ 笔记库未启用，没有可重跑的识别缓存"
+            await self._reply(stream_id, message)
+            return True, message, 1
+        if self._recognizer is None or self._pipeline is None:
+            message = "ℹ️ 公式识别未启用（缺 API Key 或已关闭），没有可重跑的识别缓存"
+            await self._reply(stream_id, message)
+            return True, message, 1
+
+        hashes: list[str] = []
+        seen: set[str] = set()
+        for course_name, path, _ref in await asyncio.to_thread(self._note_image_files):
+            if course and course_name != course_folder_name(course):
+                continue
+            try:
+                data = await asyncio.to_thread(path.read_bytes)
+            except OSError:
+                continue
+            digest = image_hash(data)
+            if digest and digest not in seen:
+                seen.add(digest)
+                hashes.append(digest)
+        if not hashes:
+            message = f"ℹ️ 「{course or '全部课程'}」没有找到可重跑的图片"
+        else:
+            removed = await asyncio.to_thread(db.forget_image_recognitions, hashes)
+            # 连"试满放弃"的记录一起清：重识就是给这些图一次完整的重来的机会
+            await asyncio.to_thread(db.forget_formula_failures, hashes)
+            self._schedule_formula_backfill()
+            scope = f"「{course_folder_name(course)}」" if course else "全部课程"
+            message = (
+                f"♻️ 已清掉 {scope} {removed} 张图的识别缓存，"
+                "正在按当前模型重新识别（后台进行，完成后公式会更新进笔记）"
+            )
+            self.ctx.logger.info(
+                f"{LOG_PREFIX} /重识图片：{scope} 清缓存 {removed} 张"
+            )
+        await self._reply(stream_id, message)
+        return True, message, 1
+
     async def _recognition_status_line(self) -> str:
         """识别链路的可见状态：可用/降级原因、累计识别数、队列积压与丢弃。
 
@@ -2261,15 +2325,32 @@ class ClassSchedulePlugin(MaiBotPlugin):
             await self._reply(stream_id, message)
             return False, message, 0
         hits = notes.search(keyword, limit=8) if keyword else []
-        if not hits:
+        # 公式库一起搜：一张图认出的几条公式都在库里，光搜笔记层会漏掉
+        # 尚未回填到笔记、或归属在别的课程的那部分
+        formula_hits: list = []
+        if keyword and self._notes_db is not None:
+            try:
+                formula_hits = await asyncio.to_thread(
+                    self._notes_db.search_formulas, keyword, limit=4
+                )
+            except Exception as exc:
+                self.ctx.logger.warning(f"{LOG_PREFIX} 公式检索失败（已忽略）: {exc}")
+        if not hits and not formula_hits:
             message = f"🔍 没有找到包含「{keyword}」的笔记。"
         else:
-            lines = [f"🔍 找到 {len(hits)} 条："]
+            lines = [f"🔍 找到 {len(hits) + len(formula_hits)} 条："]
             for note in hits:
                 stamp = note.created_at[5:16].replace("T", " ") if note.created_at else ""
                 lines.append(
                     f"　{note.course} [{note.kind}] {stamp} "
                     f"{one_line(note.display or '🖼 图片', 60)}"
+                )
+            for row in formula_hits:
+                latex = str(row["latex_normalized"] or row["latex_raw"] or "")
+                where = f"，{row['course']}" if row["course"] else ""
+                lines.append(
+                    f"　🧮 {row['name']}｜{one_line(latex, 46)}"
+                    f"（{row['category'] or '未分类'}{where}，置信 {row['confidence']}）"
                 )
             message = "\n".join(lines)
         await self._reply(stream_id, message)
@@ -3222,22 +3303,19 @@ class ClassSchedulePlugin(MaiBotPlugin):
             if not digest:
                 continue
             try:
-                known = await asyncio.to_thread(db.formula_by_image_hash, digest)
+                record = await asyncio.to_thread(db.image_recognition, digest)
             except Exception:
-                known = None  # 查不出就当没认过，大不了多认一次（有指纹去重兜底）
-            if known is not None:
+                record = None  # 查不出就当没认过，大不了多认一次（有指纹去重兜底）
+            if record is not None:
                 skipped += 1
                 # 认过的图也要把公式补写进笔记：本功能上线前认的图，公式只在库里，
                 # /笔记 与 /找 看不到（用户正是因此说"不是完整的公式"）
-                await self._attach_formula_to_note(
-                    {"course": course, "note_ref": note_ref},
-                    [{
-                        "name": str(known["name"] or ""),
-                        "latex": str(
-                            known["latex_normalized"] or known["latex_raw"] or ""
-                        ),
-                    }],
-                )
+                if str(record["status"] or "") == "recognized":
+                    entries = await self._recognition_entries(db, record)
+                    if entries:
+                        await self._attach_formula_to_note(
+                            {"course": course, "note_ref": note_ref}, entries
+                        )
                 continue
             if await asyncio.to_thread(self._recognizer.has_given_up, digest):
                 skipped += 1  # 自动试满次数，别再来一遍
@@ -3263,6 +3341,33 @@ class ClassSchedulePlugin(MaiBotPlugin):
                 f"{LOG_PREFIX} 补识别扫描：新排队 {queued} 张，跳过（认过或已放弃）"
                 f" {skipped} 张"
             )
+
+    async def _recognition_entries(
+        self, db: NotesDatabase, record: Any
+    ) -> list[dict[str, Any]]:
+        """把一条识别记录展开成回执/写笔记要用的公式条目（保序、跳过已删行）。"""
+        import json as _json
+
+        try:
+            ids = [int(x) for x in _json.loads(str(record["formula_ids"] or "[]"))]
+        except (ValueError, TypeError):
+            return []
+        entries: list[dict[str, Any]] = []
+        for formula_id in ids:
+            try:
+                row = await asyncio.to_thread(db.get_formula, formula_id)
+            except Exception:
+                continue
+            if row is None:
+                continue
+            entries.append({
+                "name": str(row["name"] or ""),
+                "latex": str(row["latex_normalized"] or row["latex_raw"] or ""),
+                "confidence": float(row["confidence"] or 0.0),
+                "low_confidence": float(row["confidence"] or 0.0) < 0.6,
+                "created": False,
+            })
+        return entries
 
     def _note_image_files(self) -> list[tuple[str, Path, str]]:
         """笔记目录下所有可识别的图片 → [(课程名, 文件路径, markdown 笔记 id)]，新图在前。
@@ -3336,6 +3441,19 @@ class ClassSchedulePlugin(MaiBotPlugin):
                 "图片里没有公式",
                 reason="formula_recognized",
                 fixed_text=f"🧮 这张图里没有公式{where}（原图已存好）",
+                verbatim=True,
+            )
+            return
+        if status == "cached" and not formulas:
+            # 缓存的"无公式"结果：重发同一张图会走到这，也要说话（不能像坏了）
+            await self._deliver(
+                stream_id,
+                "这张图之前认过：图里没有公式",
+                reason="formula_recognized",
+                fixed_text=(
+                    f"🧮 这张图之前认过：图里没有公式{where}"
+                    "（想按现在的模型重新识别，发 /重识图片）"
+                ),
                 verbatim=True,
             )
             return

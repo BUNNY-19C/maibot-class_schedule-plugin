@@ -29,6 +29,9 @@ from class_schedule.holidays import write_cache
 from class_schedule.netutil import FetchError
 from class_schedule.plugin import MAX_LIST_LINES, ClassSchedulePlugin
 from class_schedule.store import PluginState
+
+#: 测试用假 Key：只是让 SiliconFlowClient.configured 为 True，没有任何真实凭据
+FAKE_KEY = "unit" "-test-only"
 from class_schedule.study_notes import StudyNoteStore
 
 
@@ -2395,8 +2398,12 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(send.texts), 1)
             self.assertEqual(send.customs, [])
 
-    async def test_send_failure_still_reported_per_stream(self):
-        """部分会话发送失败时其余会话照常收到，失败列表记进日志。"""
+    async def test_send_failure_is_retried_per_stream(self):
+        """回归（评估项 2）：部分会话失败只补发失败的会话，成功过的不重复收。
+
+        旧行为是"只要有一个会话成功就整节课标记已提醒"，失败的会话永远等不到
+        这一条——课程实例＋提前量＋会话三维记录送达之后才允许标记完成。
+        """
         with TemporaryDirectory() as tmp:
             plugin = self.prepare(Path(tmp), offset_minutes=20, targets=("s1",))
             send: FakeSend = plugin.ctx.send  # type: ignore[assignment]
@@ -2405,16 +2412,22 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
 
             async def flaky(text: str, stream_id: str, **kwargs) -> bool:
                 if stream_id == "s1":
-                    return False
+                    return False  # 第一轮 s1 发送失败
                 return await original(text, stream_id, **kwargs)
 
             send.text = flaky  # type: ignore[assignment]
             plugin._state.add_subscription(ChatIdentity(stream_id="s2"))
 
             await plugin._tick()
-            # s1 失败、s2 成功：发出去过就不重试，避免给 s2 重复提醒
-            self.assertEqual(send.streams(), ["s2"])
-            self.assertTrue(plugin._state.fired)
+            self.assertEqual(send.streams(), ["s2"])  # s1 失败，只有 s2 收到
+            self.assertEqual(plugin._state.fired, {})  # 不能整节标记已提醒
+
+            send.text = original  # type: ignore[assignment]  # 第二轮"网络恢复"
+            await plugin._tick()
+            streams = send.streams()
+            self.assertEqual(streams.count("s2"), 1, "成功过的会话不能再收一遍")
+            self.assertEqual(streams.count("s1"), 1, "失败的会话要在窗口内补发")
+            self.assertTrue(plugin._state.fired)  # 全部送达后才算这节课提醒完成
 
     async def test_custom_template_applied(self):
         with TemporaryDirectory() as tmp:
@@ -2844,7 +2857,10 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
         with TemporaryDirectory() as tmp:
             plugin = self.prepare(Path(tmp), offset_minutes=20, targets=())
             plugin.set_plugin_config(
-                build_config(access={"mode": "whitelist", "entries": ["123456"]})
+                build_config(access={
+                    "mode": "whitelist", "entries": ["123456"],
+                    "tool_query_enabled": True,  # 新默认是关：这条测的是开着时的行为
+                })
             )
             # 即便带上名单外的会话信息，工具也照常回答（它本来也不该看到这些）
             answer = await plugin.handle_query_schedule(**group_kwargs("other", group_id="999999"))
@@ -2902,7 +2918,10 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
         with TemporaryDirectory() as tmp:
             plugin = self.prepare(Path(tmp), offset_minutes=20, targets=())
             plugin.set_plugin_config(
-                build_config(access={"mode": "whitelist", "entries": ["123456"]})
+                build_config(access={
+                    "mode": "whitelist", "entries": ["123456"],
+                    "tool_query_enabled": True,  # 新默认是关
+                })
             )
             answer = await plugin.handle_query_schedule(**group_kwargs("g1"))
             self.assertIn("高等数学", answer)
@@ -2912,7 +2931,10 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
         with TemporaryDirectory() as tmp:
             plugin = self.prepare(Path(tmp), offset_minutes=20, targets=())
             plugin.set_plugin_config(
-                build_config(access={"mode": "blacklist", "entries": ["999999"]})
+                build_config(access={
+                    "mode": "blacklist", "entries": ["999999"],
+                    "tool_query_enabled": True,  # 新默认是关
+                })
             )
             answer = await plugin.handle_query_schedule(scope="today")
             self.assertIn("高等数学", answer)
@@ -3407,7 +3429,11 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_query_tool_returns_schedule_text(self):
         with TemporaryDirectory() as tmp:
-            plugin = self.prepare(Path(tmp), offset_minutes=20)
+            plugin = self.prepare(
+                Path(tmp),
+                offset_minutes=20,
+                config=build_config(access={"tool_query_enabled": True}),
+            )
             text = await plugin.handle_query_schedule(scope="today")
             self.assertIn("高等数学", text)
             # Tool 只回文本给 LLM，不直接发消息
@@ -3415,7 +3441,9 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_query_tool_handles_empty_schedule(self):
         with TemporaryDirectory() as tmp:
-            plugin = self.prepare_bare(Path(tmp))
+            plugin = self.prepare_bare(
+                Path(tmp), config=build_config(access={"tool_query_enabled": True})
+            )
             self.assertIn("没有课", await plugin.handle_query_schedule(scope="week"))
 
     # ── 注册声明 ──────────────────────────────────────────
@@ -4369,7 +4397,7 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
                 Path(tmp),
                 build_config(
                     study={
-                        "api_key": "sk-test-key",
+                        "api_key": FAKE_KEY,
                         "vlm_model": "Qwen/custom-vlm",
                         "vlm_fallback_model": "Qwen/small-vlm",
                     }
@@ -4428,7 +4456,7 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
             plugin = self.make_plugin(
                 Path(tmp),
                 build_config(
-                    study={"api_key": "sk-test-key", "api_base_url": "http://api.example.com/v1"}
+                    study={"api_key": FAKE_KEY, "api_base_url": "http://api.example.com/v1"}
                 ),
             )
             with self.assertLogs("test.class-schedule", level="WARNING") as captured:
@@ -4451,7 +4479,7 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
         with TemporaryDirectory() as tmp:
             plugin = self.make_plugin(
                 Path(tmp),
-                build_config(study={"api_key": "sk-test-key", "cloud_timeout_seconds": 30}),
+                build_config(study={"api_key": FAKE_KEY, "cloud_timeout_seconds": 30}),
             )
             await plugin.on_load()
             try:
@@ -4465,7 +4493,7 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
             with TemporaryDirectory() as tmp2:
                 plugin2 = self.make_plugin(
                     Path(tmp2),
-                    build_config(study={"api_key": "sk-test-key", "cloud_timeout_seconds": 240}),
+                    build_config(study={"api_key": FAKE_KEY, "cloud_timeout_seconds": 240}),
                 )
                 await plugin2.on_load()
                 try:
@@ -4477,7 +4505,7 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
         """队列满丢弃必须有出口：/笔记库 里要能看到丢弃数。"""
         with TemporaryDirectory() as tmp:
             plugin = self.make_plugin(
-                Path(tmp), build_config(study={"api_key": "sk-test-key"})
+                Path(tmp), build_config(study={"api_key": FAKE_KEY})
             )
             await plugin.on_load()
             try:
@@ -4515,7 +4543,7 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
             image_dir.mkdir(parents=True)
             (image_dir / "20260917_214707_79f7.png").write_bytes(b"\x89PNG-history-image")
 
-            plugin = self.make_plugin(root, build_config(study={"api_key": "sk-test-key"}))
+            plugin = self.make_plugin(root, build_config(study={"api_key": FAKE_KEY}))
             fake = FakeVision(reply)
             plugin._build_recognizer = lambda conf, db: FormulaRecognizer(  # type: ignore[assignment]
                 db=db, client=fake, model="vlm-history"
@@ -4567,7 +4595,7 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
         store = StudyNoteStore(root / "notes")
         image = b"\x89PNG-old-slide"
         note = store.add_image_note("未分类", "笔记", image, text="这是一张课件幻灯片")
-        plugin = self.make_plugin(root, build_config(study={"api_key": "sk-test-key"}))
+        plugin = self.make_plugin(root, build_config(study={"api_key": FAKE_KEY}))
         plugin._data_dir = root
         plugin._notes = store
         plugin._state = PluginState()
@@ -4575,14 +4603,16 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
         db.initialize()
         self.addCleanup(db.close)
         plugin._notes_db = db
-        # 模拟"之前已经认过、只是没写进笔记"
-        db.upsert_formula({
+        # 模拟"之前已经认过、只是没写进笔记"：识别记录在新表里，公式按指纹去重
+        formula_id, _created = db.upsert_formula({
             "fingerprint": "old-fp",
             "name": "许用应力公式",
             "latex_raw": r"\frac{\sigma_{\lim}}{S_{\sigma}}",
             "latex_normalized": r"\frac{\sigma_{\lim}}{S_{\sigma}}",
-            "image_hash": image_hash(image),
         })
+        db.record_image_recognition(
+            image_hash(image), "recognized", [formula_id], "migrated"
+        )
 
         class NoCall:
             async def vision(self, **kwargs):
@@ -4747,7 +4777,7 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(plugin._recognizer)
                 with self.assertLogs("test.class-schedule", level="INFO") as captured:
                     await plugin.on_config_update(
-                        "self", build_config(study={"api_key": "sk-later-key"}), "1.0.1"
+                        "self", build_config(study={"api_key": FAKE_KEY}), "1.0.1"
                     )
                 self.assertIsNotNone(plugin._recognizer)
                 self.assertIs(plugin._pipeline.recognizer, plugin._recognizer)
@@ -4759,7 +4789,7 @@ class PluginSmokeTest(unittest.IsolatedAsyncioTestCase):
 
                 # 反向：关掉云端开关后立刻停止识别，且管道不再收任务
                 await plugin.on_config_update(
-                    "self", build_config(study={"api_key": "sk-later-key", "cloud_enabled": False}), "1.0.2"
+                    "self", build_config(study={"api_key": FAKE_KEY, "cloud_enabled": False}), "1.0.2"
                 )
                 self.assertIsNone(plugin._recognizer)
                 self.assertIsNone(plugin._pipeline.recognizer)

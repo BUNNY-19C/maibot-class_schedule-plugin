@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import sqlite3
 import threading
@@ -112,6 +113,13 @@ CREATE TABLE IF NOT EXISTS embeddings(
   dims INTEGER NOT NULL,
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS image_recognitions(
+  image_hash TEXT PRIMARY KEY,
+  status TEXT NOT NULL,
+  formula_ids TEXT NOT NULL DEFAULT '[]',
+  model TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
 """
 
 #: FTS5 虚拟表（standalone 模式，由本层手动同步插入，避免触发器的兼容性风险）
@@ -143,7 +151,7 @@ class NotesDatabase:
         return self._conn
 
     def initialize(self) -> None:
-        """建表 + FTS 探测。幂等，可在每次加载时调用。"""
+        """建表 + FTS 探测 + 存量迁移。幂等，可在每次加载时调用。"""
         with self._lock:
             conn = self._connection()
             conn.executescript(_SCHEMA)
@@ -161,7 +169,39 @@ class NotesDatabase:
                     "INSERT INTO meta(key, value) VALUES('schema_version', ?)",
                     (str(SCHEMA_VERSION),),
                 )
+            self._migrate_image_recognitions(conn)
             conn.commit()
+
+    def _migrate_image_recognitions(self, conn: sqlite3.Connection) -> None:
+        """把旧版散在 ``formulas.image_hash`` 里的"图→公式"关联搬进新表。
+
+        旧的那一列每条公式只能记"最后写入它的那张图"，而缓存查询按图反查时
+        ``LIMIT 1`` 只回一条——多公式图片命中缓存就丢公式（线上实测：首识 2 条、
+        重发同一张图只回 1 条）。迁移按图分组、公式按 id 升序；meta 键保证只跑一次。
+        """
+        done = conn.execute(
+            "SELECT value FROM meta WHERE key = 'image_recognitions_migrated'"
+        ).fetchone()
+        if done is not None:
+            return
+        rows = conn.execute(
+            "SELECT id, image_hash FROM formulas WHERE image_hash != '' ORDER BY id"
+        ).fetchall()
+        grouped: dict[str, list[int]] = {}
+        for row in rows:
+            grouped.setdefault(str(row["image_hash"]), []).append(int(row["id"]))
+        moment = datetime.now().isoformat(timespec="seconds")
+        for digest, ids in grouped.items():
+            conn.execute(
+                "INSERT OR REPLACE INTO image_recognitions"
+                "(image_hash, status, formula_ids, model, created_at) VALUES(?,?,?,?,?)",
+                (digest, "recognized", json.dumps(ids), "migrated", moment),
+            )
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value)"
+            " VALUES('image_recognitions_migrated', ?)",
+            (moment,),
+        )
 
     def close(self) -> None:
         with self._lock:
@@ -294,6 +334,82 @@ class NotesDatabase:
                 "SELECT COUNT(*) c FROM formulas"
             ).fetchone()
         return int(row["c"]) if row is not None else 0
+
+    def get_formula(self, formula_id: int) -> sqlite3.Row | None:
+        """按 id 取一条公式（识别缓存按图回放公式列表用）。"""
+        with self._lock:
+            return self._connection().execute(
+                "SELECT * FROM formulas WHERE id = ?", (int(formula_id),)
+            ).fetchone()
+
+    def record_image_recognition(
+        self, image_hash: str, status: str, formula_ids: list[int], model: str = ""
+    ) -> None:
+        """记录一张图的识别结果，status ∈ ``recognized`` / ``no_formula``。
+
+        这是"图片识别结果"与"公式去重"两个概念的分离点：一张图对应它认出的
+        **全部**公式（保序的 id 列表），同一个公式可以被多张图关联——多公式图片
+        命中缓存时才不会只剩一条。
+        """
+        digest = str(image_hash or "").strip()
+        if not digest:
+            return
+        now = datetime.now().isoformat(timespec="seconds")
+        with self._lock:
+            self._connection().execute(
+                "INSERT OR REPLACE INTO image_recognitions"
+                "(image_hash, status, formula_ids, model, created_at) VALUES(?,?,?,?,?)",
+                (
+                    digest,
+                    str(status or ""),
+                    json.dumps([int(i) for i in formula_ids]),
+                    str(model or ""),
+                    now,
+                ),
+            )
+            self._connection().commit()
+
+    def image_recognition(self, image_hash: str) -> sqlite3.Row | None:
+        """取一张图的识别记录；没有则 ``None``（= 这张图还没识别过）。"""
+        value = str(image_hash or "").strip()
+        if not value:
+            return None
+        with self._lock:
+            return self._connection().execute(
+                "SELECT * FROM image_recognitions WHERE image_hash = ?", (value,)
+            ).fetchone()
+
+    def forget_image_recognitions(self, image_hashes: list[str]) -> int:
+        """删掉一批识别记录（``/重识图片`` 用）：下次见到这些图会重新问模型。"""
+        clean = [str(digest or "").strip() for digest in image_hashes]
+        clean = [digest for digest in clean if digest]
+        if not clean:
+            return 0
+        with self._lock:
+            conn = self._connection()
+            cursor = conn.execute(
+                "DELETE FROM image_recognitions WHERE image_hash IN (%s)"
+                % ",".join("?" for _ in clean),
+                clean,
+            )
+            conn.commit()
+            return int(cursor.rowcount or 0)
+
+    def forget_formula_failures(self, image_hashes: list[str]) -> int:
+        """删掉一批失败计数（``/重识图片`` 用）：给"试满放弃"的图一次重来的机会。"""
+        clean = [str(digest or "").strip() for digest in image_hashes]
+        clean = [digest for digest in clean if digest]
+        if not clean:
+            return 0
+        with self._lock:
+            conn = self._connection()
+            cursor = conn.execute(
+                "DELETE FROM formula_failures WHERE image_hash IN (%s)"
+                % ",".join("?" for _ in clean),
+                clean,
+            )
+            conn.commit()
+            return int(cursor.rowcount or 0)
 
     def record_formula_failure(self, image_hash: str, error: str) -> None:
         """记一次识别失败（按图片 hash 累计次数与最后原因）。

@@ -138,7 +138,7 @@
 | `entries` | `[]` | 名单内容:群号、用户号或会话 ID |
 | `apply_to_commands` | `true` | 名单是否限制命令 |
 | `apply_to_reminders` | `true` | 名单是否限制提醒投递 |
-| `tool_query_enabled` | `true` | 是否允许 LLM 查课表;**名单管不到工具**,只能靠这个开关 |
+| `tool_query_enabled` | `false` | 是否允许 LLM 查课表;**名单管不到工具**,默认关(需要时再开) |
 
 ## `[holiday]` 法定节假日
 
@@ -220,8 +220,10 @@
 | `vlm_model` | `Qwen/Qwen3-VL-32B-Instruct` | 公式识别的视觉模型 |
 | `vlm_fallback_model` | `Qwen/Qwen3-VL-8B-Instruct` | 识别失败时降级重试一次用的模型 |
 | `struct_model` | `deepseek-ai/DeepSeek-V3.2` | 结构化整理与打标的文本模型 |
-| `embedding_model` | `Qwen/Qwen3-Embedding-8B` | 语义检索的向量模型 |
-| `rerank_model` | `Qwen3-Reranker-8B` | 检索精排模型;留空则不做精排 |
+| `embedding_model` | `Qwen/Qwen3-Embedding-8B` | 语义检索的向量模型;**尚未接线,暂不生效** |
+| `rerank_model` | `Qwen3-Reranker-8B` | 检索精排模型;**尚未接线,暂不生效** |
+
+> `/找` 当前做的是关键词全文检索(笔记层 + 公式库);语义检索(向量/精排)尚未接线。
 | `cloud_timeout_seconds` | `30` | 单次云端调用超时；**公式识别这条链路有 240 秒下限**（多公式的返回不是流式的，模型算完之前没有字节，30 秒会整条打死） |
 | `image_cache_enabled` | `true` | 图片 hash 命中缓存就直接复用,不重复识别与计费 |
 | `queue_size` | `200` | 识别队列长度;满了丢弃识别任务(笔记照收)并计数,`/笔记库` 可查 |

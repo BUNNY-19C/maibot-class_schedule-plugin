@@ -47,7 +47,8 @@ data/plugins/github.BUNNY-19C.class-schedule/
 │       ├── index.json
 │       ├── 20260917_1030_a1_公式.md
 │       └── img/20260917_1040_b2.png
-├── notes.db        # SQLite 笔记库:notes/note_sources/tags/formulas/embeddings/formula_failures
+├── notes.db        # SQLite 笔记库:notes/note_sources/tags/formulas/embeddings/
+                # formula_failures/image_recognitions
 └── ics/            # 所有课表文件
     └── *.ics
 ```
@@ -67,6 +68,11 @@ data/plugins/github.BUNNY-19C.class-schedule/
 ### 图片笔记的处理流水线
 
 图片笔记走三段,核心取舍是"**落库同步、识别异步**":
+
+**识别缓存是"图→公式列表"**:一张图对应它认出的**全部**公式(``image_recognitions``
+表,含"图里没有公式"的成功空结果);公式按指纹去重,同一个公式可被多张图关联。
+早期实现把关联塞在公式行的 image_hash 列里、查询 LIMIT 1——首识 2 条、重发同一张
+图只剩 1 条(评估复现后重构)。重新识别的入口是 ``/重识图片``。
 
 **一张图只存一份**:markdown 层的 ``notes/<课程>/img/`` 是唯一副本,SQLite 笔记行的
 ``image_path`` 直接记它的路径。早期实现里管道还会再 ``save_raw_image`` 存一份,
@@ -250,7 +256,8 @@ python tools/verify_with_maibot.py --maibot "<麦麦的 modules/MaiBot 目录>"
   插件靠 `message.get_recent` 验证并在超时后兜底直发。默认的 `persona` 没有这个问题。
 - **LLM 工具不受访问名单与适用范围限制**:麦麦调用工具时不传任何会话信息,
   这两层在这条路上都无法判定(已实测)。要防止课表被问出来,把
-  `access.tool_query_enabled` 关掉。
+  `access.tool_query_enabled` 关掉(这项**默认就是关的**;默认值曾经是开,后来按
+  "默认仅私聊必须覆盖所有路径"的原则改为默认关)。
 - **提醒会话默认上限 20 个**:可调 `target.max_subscriptions`。
 - **名单匹配大小写敏感**:会话 ID 若含字母,请从 `/课表状态` 原样复制。
 - **公式识别要联网,图片会上传**:仅在你配了 `study.api_key` 时发生,只走公网

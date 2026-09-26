@@ -716,8 +716,13 @@ class FormulaRecognizer:
                 await self._note_failure(digest, result["error"])
             return result
         if not parsed:
-            # 模型说"这张图确实没有公式"：不记失败（免得把重试预算吃光），
-            # 但也不留结果——所以同一条图再发还会问一次模型，这是有意的取舍
+            # 模型说"这张图确实没有公式"：成功的空结果**进缓存**（重发不再问模型、
+            # 补识别也不再把它当成"没处理过"），不算失败、不吃自动重试预算。
+            # 想重新识别用 /重识图片。
+            await asyncio.to_thread(
+                self._db.record_image_recognition,
+                digest, "no_formula", [], self._model,
+            )
             return {
                 "status": "no_formula",
                 "formulas": [],
@@ -792,15 +797,40 @@ class FormulaRecognizer:
         }
 
     async def _lookup_image(self, digest: str) -> dict[str, Any] | None:
+        """按图片 hash 回放**全部**识别结果（每条公式都在，不再 LIMIT 1）。"""
         try:
-            row = await asyncio.to_thread(self._db.formula_by_image_hash, digest)
+            record = await asyncio.to_thread(self._db.image_recognition, digest)
         except Exception:
             return None  # 缓存查询失败就当没缓存，绝不让它挡住识别
-        if row is None:
+        if record is None:
             return None
+        status = str(record["status"] or "")
+        if status == "no_formula":
+            # 成功的空结果同样进缓存：同一条图重发不再问模型
+            return {
+                "status": "cached",
+                "formulas": [],
+                "cached_no_formula": True,
+                "degraded": False,
+                "error": "",
+            }
+        if status != "recognized":
+            return None  # 未知状态当没缓存处理，宁可多问一次
+        try:
+            ids = [int(x) for x in json.loads(str(record["formula_ids"] or "[]"))]
+        except (ValueError, TypeError):
+            return None
+        formulas: list[dict[str, Any]] = []
+        for formula_id in ids:
+            try:
+                row = await asyncio.to_thread(self._db.get_formula, formula_id)
+            except Exception:
+                continue
+            if row is not None:
+                formulas.append(self._entry(row))
         return {
             "status": "cached",
-            "formulas": [self._entry(row)],
+            "formulas": formulas,
             "degraded": False,
             "error": "",
         }
@@ -856,6 +886,12 @@ class FormulaRecognizer:
                 "low_confidence": low,
                 "created": created,
             })
+        # 图→公式列表整体记一条：缓存回放时一条不少（旧版把关联塞在公式行的
+        # image_hash 列里，多公式图片命中缓存只剩最后写入的那条）
+        await asyncio.to_thread(
+            self._db.record_image_recognition,
+            digest, "recognized", [entry["formula_id"] for entry in entries], self._model,
+        )
         return {
             "status": "recognized",
             "formulas": entries,
