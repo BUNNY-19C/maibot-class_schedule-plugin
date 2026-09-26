@@ -275,5 +275,58 @@ class TestBackfillContinuation(_Case):
         self.assertEqual(db.formula_count(), 2)  # 指纹去重：还是那 2 条
 
 
+class TestNoFormulaReplacesOldContent(_Case):
+    """评估项 4：重识别判定"没有公式"时，笔记里的旧自动公式要清掉。"""
+
+    async def test_no_formula_clears_but_failure_keeps(self):
+        plugin, db, store, _pipeline, make_recognizer, _root = self.setup_case()
+        image = b"\x89PNG-recycled-slide"
+        note = store.add_image_note("高等数学", "笔记", image, text="用户的课件图说")
+        # 旧识别留下的公式
+        await plugin._on_formula_recognized(
+            {"note_ref": note.id, "course": "高等数学", "stream_id": ""},
+            {
+                "status": "recognized",
+                "degraded": False,
+                "error": "",
+                "formulas": [{
+                    "name": "旧公式", "latex": "x=1",
+                    "confidence": 0.9, "low_confidence": False, "created": True,
+                }],
+            },
+        )
+        self.assertIn("旧公式", store.recent("高等数学", limit=1)[0].formula)
+        formulas_before = db.formula_count()
+
+        # 新模型判定"这张图里没有公式"：笔记里的旧自动公式要被清掉
+        await plugin._on_formula_recognized(
+            {"note_ref": note.id, "course": "高等数学", "stream_id": ""},
+            {"status": "no_formula", "formulas": [], "degraded": False, "error": ""},
+        )
+        refreshed = store.recent("高等数学", limit=1)[0]
+        self.assertEqual(refreshed.formula, "")
+        self.assertIn("用户的课件图说", refreshed.text)  # 用户/宿主的文字保留
+        self.assertEqual(db.formula_count(), formulas_before)  # 公式库记录不删
+        body = (
+            store.course_dir("高等数学") / f"{note.id}_{note.kind}.md"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("旧公式", body)
+        self.assertIn("用户的课件图说", body)  # md 只剩图说与原图引用
+
+        # 识别失败则保留旧内容不动
+        await plugin._on_formula_recognized(
+            {"note_ref": note.id, "course": "高等数学", "stream_id": ""},
+            {"status": "failed", "error": "读超时", "transient": True, "formulas": []},
+        )
+        self.assertEqual(store.recent("高等数学", limit=1)[0].formula, "")
+
+        # 缓存的 no_formula（重发）同样不复活公式
+        await plugin._on_formula_recognized(
+            {"note_ref": note.id, "course": "高等数学", "stream_id": ""},
+            {"status": "cached", "cached_no_formula": True, "formulas": []},
+        )
+        self.assertEqual(store.recent("高等数学", limit=1)[0].formula, "")
+
+
 if __name__ == "__main__":
     unittest.main()

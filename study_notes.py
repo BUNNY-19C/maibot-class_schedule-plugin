@@ -254,6 +254,31 @@ class StudyNoteStore:
             _atomic_write(course_dir / f"{target.id}_{target.kind}.md", "\n".join(body) + "\n")
             return target
 
+    def clear_formula(self, course: str, note_id: str) -> StudyNote | None:
+        """清掉自动回填的公式（重识别判定"图里没有公式"时用）。
+
+        只动自动生成的部分：formula 字段清空，配套 md 重写为只含图说与原图引用；
+        用户的原文（text）与原图不动。公式库里那条公式记录也不删——它可能被
+        其他图片的识别记录引用。幂等：本来就空就不再写盘。
+        """
+        course_dir = self.course_dir(course)
+        with self._lock:
+            index = self._load_index(course_dir)
+            target = next((item for item in index.notes if item.id == note_id), None)
+            if target is None:
+                return None
+            if not target.formula:
+                return target
+            target.formula = ""
+            self._write_index(course_dir, index)
+            body = [f"# {course_folder_name(course)} · {target.kind}", ""]
+            if target.text:
+                body += ["", "## 图片说明", "", target.text]
+            if target.file and not target.file.endswith(".md"):
+                body += ["", f"原图：{target.file}"]
+            _atomic_write(course_dir / f"{target.id}_{target.kind}.md", "\n".join(body) + "\n")
+            return target
+
     # ── 查询 ──────────────────────────────────────────────
 
     def courses(self) -> list[str]:

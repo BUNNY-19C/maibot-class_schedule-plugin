@@ -3622,9 +3622,13 @@ class ClassSchedulePlugin(MaiBotPlugin):
         status = str(result.get("status") or "")
         formulas = list(result.get("formulas") or [])
 
-        # 先把公式写进笔记（**补识别也要写**）：/笔记、/找 与笔记文件读的是那一层。
-        # 这一步必须在 stream_id 判断之前，否则补识别认出来的公式进不了笔记。
-        if formulas:
+        # 先把识别结果应用进笔记（**补识别也要**）：/笔记、/找 与笔记文件读的是
+        # 那一层。这一步必须在 stream_id 判断之前，否则补识别的结果进不了笔记。
+        # 注意 no_formula（重识别判定"图里没公式"）要**清掉**旧自动公式——否则
+        # 识别缓存说"没公式"、用户看到的还是旧公式（评估项 4）。失败保留旧内容。
+        if status == "no_formula":
+            await self._clear_note_formula(job)
+        elif formulas:
             await self._attach_formula_to_note(job, formulas)
 
         if not stream_id:
@@ -3678,6 +3682,28 @@ class ClassSchedulePlugin(MaiBotPlugin):
             fixed_text="\n".join(lines),
             verbatim=True,  # 公式一个字都不能被模型改写或概括掉
         )
+
+    async def _clear_note_formula(self, job: dict[str, Any]) -> None:
+        """重识别判定"图里没有公式"后，清掉该笔记自动回填的旧公式。
+
+        范围只限这条笔记的自动生成内容（formula 字段与配套 md 的公式段）；
+        用户的原文与原图不动，公式库里那条记录也不删——它可能被其他图片引用。
+        """
+        notes = self._notes
+        note_ref = str(job.get("note_ref") or "").strip()
+        if notes is None or not note_ref:
+            return
+        try:
+            located = await asyncio.to_thread(notes.locate_note, note_ref)
+        except Exception as exc:
+            self.ctx.logger.warning(f"{LOG_PREFIX} 公式清除定位笔记失败（已忽略）: {exc}")
+            return
+        if located is None:
+            return
+        try:
+            await asyncio.to_thread(notes.clear_formula, located[0], note_ref)
+        except Exception as exc:
+            self.ctx.logger.warning(f"{LOG_PREFIX} 公式清除失败（已忽略）: {exc}")
 
     async def _attach_formula_to_note(
         self, job: dict[str, Any], formulas: list[dict[str, Any]]
