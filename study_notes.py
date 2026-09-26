@@ -26,6 +26,7 @@ import os
 import re
 import tempfile
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -382,13 +383,29 @@ def _safe_suffix(suffix: str) -> str:
     return cleaned if cleaned.startswith(".") and len(cleaned) <= 6 else ".bin"
 
 
+def _replace_with_retry(tmp: Path, path: Path, *, attempts: int = 5) -> None:
+    """``os.replace`` 遇到 Windows 瞬时占用（WinError 5）时短暂重试。
+
+    杀毒/索引器会短暂握住刚写出的文件，一次 replace 就可能被拒；这不是内容
+    问题，退避几十毫秒再试就能成功。重试耗尽才抛错（调用方按原语义处理）。
+    """
+    for attempt in range(attempts):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.02 * (attempt + 1))
+
+
 def _atomic_write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(text)
-        os.replace(tmp, path)
+        _replace_with_retry(Path(tmp), path)
     except BaseException:
         try:
             os.unlink(tmp)
@@ -403,7 +420,7 @@ def _atomic_bytes(path: Path, data: bytes) -> None:
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(data)
-        os.replace(tmp, path)
+        _replace_with_retry(Path(tmp), path)
     except BaseException:
         try:
             os.unlink(tmp)
