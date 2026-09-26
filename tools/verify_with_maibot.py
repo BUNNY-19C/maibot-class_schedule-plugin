@@ -42,6 +42,7 @@ EXPECTED_COMMANDS = {
     "schedule_notes_db",
     "schedule_parse",
     "schedule_reload",
+    "schedule_rerecognize",
     "schedule_status",
     "schedule_subscribe",
     "schedule_today",
@@ -213,7 +214,7 @@ def check_loader(maibot: Path, workdir: Path, report: Check) -> str:
 
     report.ok("模块名（加载器合成）", meta.module_name)
     report.ok("插件实例类", type(instance).__name__)
-    report.expect("15 个命令全部注册", commands == EXPECTED_COMMANDS, str(sorted(commands)))
+    report.expect(f"{len(EXPECTED_COMMANDS)} 个命令全部注册", commands == EXPECTED_COMMANDS, str(sorted(commands)))
     report.expect("1 个 Tool 已注册", tools == EXPECTED_TOOLS, str(sorted(tools)))
     report.expect(
         "五个 Hook 都已注册（文件导入 + 课表注入 + 类型记录 + 笔记收纳 + 原图抢存）",
