@@ -233,5 +233,47 @@ class TestRerecognizeCommand(_Case):
         self.assertIn("未启用", message)
 
 
+class TestBackfillContinuation(_Case):
+    """评估项 3：补识别超过单批上限时自动续跑，/重识图片 全量生效。"""
+
+    async def test_backfill_continues_until_everything_is_done(self):
+        from class_schedule import plugin as plugin_module
+
+        plugin, db, store, _pipeline, make_recognizer, root = self.setup_case()
+        fake = ScriptedVision(_REPLY_NEW)
+        plugin._recognizer = make_recognizer(fake)
+        plugin._pipeline.set_recognizer(plugin._recognizer)  # 管道同步换用新替身
+
+        # 造 5 张待识别图，单批上限压到 2：必须跑 3 批才能全部覆盖
+        for index in range(5):
+            store.add_image_note("高等数学", "笔记", b"\x89PNG-backfill-%d" % index)
+        original = plugin_module.MAX_BACKFILL_PER_RUN
+        plugin_module.MAX_BACKFILL_PER_RUN = 2
+        try:
+            await plugin._run_formula_backfill()
+        finally:
+            plugin_module.MAX_BACKFILL_PER_RUN = original
+
+        self.assertEqual(fake.calls, 5, "续跑没有覆盖到全部待识别图片")
+        # 5 张图用同一段回复：指纹去重后库里只有 2 条不同的公式
+        self.assertEqual(db.formula_count(), 2)
+        for note in store.recent("高等数学", limit=10):
+            self.assertIn("新公式一", note.formula)
+
+        # 已全部有记录：再跑一轮不再调模型
+        await plugin._run_formula_backfill()
+        self.assertEqual(fake.calls, 5)
+
+        # /重识图片 清掉全部缓存后，续跑同样要覆盖全部（而不是只跑前 2 张）
+        ok, message, _ = await plugin.handle_rerecognize(**smoke.private_kwargs("ps"))
+        self.assertIn("5 张图", message)
+        for _ in range(600):
+            if fake.calls == 10:
+                break
+            await asyncio.sleep(0.01)
+        self.assertEqual(fake.calls, 10, "/重识图片 只重跑了部分图片")
+        self.assertEqual(db.formula_count(), 2)  # 指纹去重：还是那 2 条
+
+
 if __name__ == "__main__":
     unittest.main()

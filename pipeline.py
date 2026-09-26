@@ -187,6 +187,15 @@ class StudyPipeline:
         self.enqueued += 1
         return True
 
+    async def drain(self) -> None:
+        """等队列里所有已入队任务被 worker 消费完（补识别分批续跑用）。
+
+        worker 每处理完一条就 ``task_done``；取消本协程即可中断等待（停机时
+        由调用方取消整个补识别任务）。
+        """
+        if self._queue is not None:
+            await self._queue.join()
+
     async def _worker(self, index: int) -> None:
         """worker 主循环：一条任务失败不能带走整个 worker。"""
         queue = self._queue
