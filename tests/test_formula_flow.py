@@ -233,6 +233,7 @@ class TestBackfillConsistency(_Case):
             note = store.add_image_note(course, "笔记", _IMAGE, text="保留图说")
             store.attach_formula(course, note.id, "过期公式：x=1")
         db.record_image_recognition(image_hash(_IMAGE), "no_formula", [], "test")
+        db.record_image_draft(image_hash(_IMAGE), {})
 
         await plugin._run_formula_backfill()
 

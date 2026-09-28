@@ -27,6 +27,7 @@ import re
 from typing import Any
 
 from .llm_client import CloudError
+from .note_draft import parse_note_draft
 
 #: 名称兜底：模型对被问倒的公式必须报这个，而不是编一个像模像样的名字
 UNKNOWN_FORMULA_NAME = "未知公式"
@@ -58,11 +59,16 @@ def looks_transient(error: str) -> bool:
     lowered = str(error or "").lower()
     return any(mark in lowered for mark in _TRANSIENT_MARKS)
 
-FORMULA_PROMPT = """你是公式识别助手。看这张图片，把里面**所有**手写或印刷的数学公式逐条识别出来，按下面的 JSON 结构回答。
+FORMULA_PROMPT = """你是板书与课件转录、公式识别助手。看这张图片，忠实转录正文，并把里面**所有**手写或印刷的数学公式逐条识别出来。
 
 要求：
 1. 只输出一个 JSON 对象。不要 Markdown 代码块，不要解释文字，不要注释。
-2. 顶层是 ``{"formulas": [ ... ]}``，数组里每个元素是一条公式。图片里有几条就写几条
+2. 顶层是 ``{"topic": "", "content_markdown": "", "uncertain_items": [], "formulas": [ ... ]}``。
+   topic 是图片中的章节或主题，找不到给空字符串。content_markdown 按图片阅读顺序
+   转录正文与板书逻辑；图片中看不清的字用 [?] 标记，不能凭常识补写。图片里没文字就给空字符串。
+   uncertain_items 中每项写 ``{"term": "原样读到的存疑文字或符号", "reason": "存疑原因"}``；
+   只记真正看不清的位置，不把所有公式都列进去。不得自行用网上的标准公式替换板书。
+   formulas 数组里每个元素是一条公式。图片里有几条就写几条
    （最多 6 条）。**不要只挑最主要的那一条**，也不要把两条公式合成一条。
 3. **只收独立成行的式子**：定理、结论、定义式、例题的最终表达式。
    不要收推导的中间步骤、"令 x=y" 这类变量代换说明、图注或编号文字。
@@ -80,11 +86,13 @@ FORMULA_PROMPT = """你是公式识别助手。看这张图片，把里面**所�
    - knowledge_points：这条公式涉及的知识点，数组，最多 8 个
    - description：一句话说明含义或用途
    - confidence：0 到 1 的小数，表示对 latex 与名称的把握；不确定就给低分
-6. 只有图片里**确实一个公式都没有**时，才返回 ``{"formulas": []}``。
+6. 只有图片里**确实一个公式都没有**时，才返回 ``"formulas": []``；
+   即使没有公式，仍要转录可读正文。
    有公式但看不清时照样给出能读出的 latex 并压低 confidence，不要返回空数组。
 
 输出示例：
-{"formulas": [
+{"topic": "欧拉公式", "content_markdown": "欧拉公式：$e^{i\\\\pi}+1=0$",
+ "uncertain_items": [], "formulas": [
   {"latex": "e^{i\\\\pi}+1=0", "name": "欧拉公式", "aliases": ["欧拉恒等式"],
    "category": "高等数学", "subcategory": "复变函数",
    "knowledge_points": ["复数指数", "三角函数"],
@@ -98,6 +106,44 @@ FORMULA_PROMPT = """你是公式识别助手。看这张图片，把里面**所�
 
 class FormulaParseError(ValueError):
     """识别结果不可用（不是 JSON、LaTeX 为空、结构对不上）。"""
+
+
+def latex_syntax_issues(raw: str) -> list[str]:
+    """只检查确定的分组错误；返回空列表不代表数学式子正确。"""
+    text = str(raw or "")
+    braces = 0
+    issues: list[str] = []
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char == "\\":
+            # \{ 与 \} 是字面花括号；其它命令由下一字符起继续扫描。
+            if index + 1 < len(text) and text[index + 1] in "{}":
+                index += 2
+                continue
+        elif char == "{":
+            braces += 1
+        elif char == "}":
+            braces -= 1
+            if braces < 0:
+                issues.append("多余的右花括号")
+                braces = 0
+        index += 1
+    if braces:
+        issues.append("花括号未闭合")
+    if len(re.findall(r"\\left\b", text)) != len(re.findall(r"\\right\b", text)):
+        issues.append("\\left 与 \\right 数量不一致")
+    environments = re.findall(r"\\(begin|end)\{([^{}]+)\}", text)
+    stack: list[str] = []
+    for kind, name in environments:
+        if kind == "begin":
+            stack.append(name)
+        elif not stack or stack.pop() != name:
+            issues.append("环境起止不匹配")
+            break
+    if stack and "环境起止不匹配" not in issues:
+        issues.append("环境未闭合")
+    return issues
 
 
 # ── LaTeX 归一化 ──────────────────────────────────────────
@@ -553,6 +599,7 @@ def _parse_item(data: dict[str, Any]) -> dict[str, Any] | None:
         ),
         "description": str(data.get("description") or "").strip(),
         "confidence": _as_confidence(data.get("confidence")),
+        "syntax_issues": latex_syntax_issues(latex_raw),
     }
 
 
@@ -613,6 +660,7 @@ def is_low_confidence(parsed: dict[str, Any]) -> bool:
     return (
         str(parsed.get("name") or "") == UNKNOWN_FORMULA_NAME
         or float(parsed.get("confidence") or 0.0) < LOW_CONFIDENCE_THRESHOLD
+        or bool(parsed.get("syntax_issues"))
     )
 
 
@@ -636,7 +684,7 @@ class FormulaRecognizer:
         image_cache_enabled: bool = True,
         low_confidence_threshold: float = LOW_CONFIDENCE_THRESHOLD,
         prompt: str = FORMULA_PROMPT,
-        max_tokens: int = 2000,
+        max_tokens: int = 4096,
         temperature: float = 0.0,
     ) -> None:
         self._db = db
@@ -688,6 +736,7 @@ class FormulaRecognizer:
                 return cached
 
         parsed: list[dict[str, Any]] | None = None
+        draft: dict[str, Any] | None = None
         errors: list[str] = []
         degraded = False
         for index, model in enumerate(self._models()):
@@ -700,7 +749,11 @@ class FormulaRecognizer:
                     max_tokens=self._max_tokens,
                     temperature=self._temperature,
                 )
-                parsed = parse_formula_response(response.get("text") or "")
+                raw_reply = response.get("text") or ""
+                candidate_draft = parse_note_draft(raw_reply)
+                if candidate_draft is not None:
+                    draft = candidate_draft
+                parsed = parse_formula_response(raw_reply)
                 degraded = index > 0
                 break
             except (CloudError, FormulaParseError) as exc:
@@ -709,6 +762,7 @@ class FormulaRecognizer:
                 errors.append(f"{model}: {exc!r}")
         if parsed is None:
             result = self._failure("；".join(errors)[:300] or "识别失败")
+            result["draft"] = draft
             if looks_transient(result["error"]):
                 # 拥塞/超时不算"这张图没救"：不写失败计数，下次装载还会试
                 result["transient"] = True
@@ -723,15 +777,17 @@ class FormulaRecognizer:
                 self._db.record_image_recognition,
                 digest, "no_formula", [], self._model,
             )
+            await self._cache_draft(digest, draft)
             return {
                 "status": "no_formula",
                 "formulas": [],
                 "degraded": degraded,
                 "error": "",
+                "draft": draft,
             }
 
         try:
-            return await self._store(
+            result = await self._store(
                 parsed,
                 digest=digest,
                 course=course,
@@ -740,9 +796,18 @@ class FormulaRecognizer:
                 message_id=message_id,
                 degraded=degraded,
             )
+            await self._cache_draft(digest, draft)
+            result["draft"] = draft
+            return result
         except Exception as exc:  # 落库失败也是"这条识别没成"，返失败而不是抛
             await self._note_failure(digest, f"公式落库失败：{exc}")
             return self._failure(f"公式落库失败：{exc}")
+
+    async def _cache_draft(self, digest: str, draft: dict[str, Any] | None) -> None:
+        try:
+            await asyncio.to_thread(self._db.record_image_draft, digest, draft or {})
+        except Exception:
+            pass  # 转录缓存失败不能抹掉已保存的公式识别结果
 
     async def _note_failure(self, digest: str, error: str) -> None:
         """把失败记进库（尽力而为）：自动补识别靠它判断"这张图别再试了"。"""
@@ -792,8 +857,10 @@ class FormulaRecognizer:
             "low_confidence": (
                 str(row["name"] or "") == UNKNOWN_FORMULA_NAME
                 or float(row["confidence"] or 0.0) < self._threshold
+                or bool(latex_syntax_issues(str(row["latex_raw"] or "")))
             ),
             "created": created,
+            "syntax_issues": latex_syntax_issues(str(row["latex_raw"] or "")),
         }
 
     async def _lookup_image(self, digest: str) -> dict[str, Any] | None:
@@ -804,6 +871,12 @@ class FormulaRecognizer:
             return None  # 缓存查询失败就当没缓存，绝不让它挡住识别
         if record is None:
             return None
+        try:
+            draft = await asyncio.to_thread(self._db.image_draft, digest)
+        except Exception:
+            return None
+        if draft is None:
+            return None  # 升级前的公式缓存：补做一次全文提取
         status = str(record["status"] or "")
         if status == "no_formula":
             # 成功的空结果同样进缓存：同一条图重发不再问模型
@@ -813,6 +886,7 @@ class FormulaRecognizer:
                 "cached_no_formula": True,
                 "degraded": False,
                 "error": "",
+                "draft": draft or None,
             }
         if status != "recognized":
             return None  # 未知状态当没缓存处理，宁可多问一次
@@ -833,6 +907,7 @@ class FormulaRecognizer:
             "formulas": formulas,
             "degraded": False,
             "error": "",
+            "draft": draft or None,
         }
 
     async def _store(
@@ -884,6 +959,7 @@ class FormulaRecognizer:
                 "latex": item["latex_normalized"],
                 "confidence": item["confidence"],
                 "low_confidence": low,
+                "syntax_issues": item["syntax_issues"],
                 "created": created,
             })
         # 图→公式列表整体记一条：缓存回放时一条不少（旧版把关联塞在公式行的

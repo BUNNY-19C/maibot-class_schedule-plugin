@@ -120,6 +120,11 @@ CREATE TABLE IF NOT EXISTS image_recognitions(
   model TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS image_drafts(
+  image_hash TEXT PRIMARY KEY,
+  draft_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL
+);
 """
 
 #: FTS5 虚拟表（standalone 模式，由本层手动同步插入，避免触发器的兼容性风险）
@@ -379,6 +384,25 @@ class NotesDatabase:
                 "SELECT * FROM image_recognitions WHERE image_hash = ?", (value,)
             ).fetchone()
 
+    def record_image_draft(self, image_hash: str, draft: dict[str, Any]) -> None:
+        """同一张图的转录草稿随识别缓存保存；空对象标识旧格式回答。"""
+        with self._lock:
+            self._connection().execute(
+                "INSERT OR REPLACE INTO image_drafts(image_hash, draft_json, created_at)"
+                " VALUES(?,?,?)",
+                (image_hash, json.dumps(draft, ensure_ascii=False),
+                 datetime.now().isoformat(timespec="seconds")),
+            )
+            self._connection().commit()
+
+    def image_draft(self, image_hash: str) -> dict[str, Any] | None:
+        """None 表示旧缓存尚未做全文提取；空对象表示已试过旧格式回答。"""
+        with self._lock:
+            row = self._connection().execute(
+                "SELECT draft_json FROM image_drafts WHERE image_hash = ?", (image_hash,)
+            ).fetchone()
+        return json.loads(row["draft_json"]) if row is not None else None
+
     def forget_image_recognitions(self, image_hashes: list[str]) -> int:
         """删掉一批识别记录（``/重识图片`` 用）：下次见到这些图会重新问模型。"""
         clean = [str(digest or "").strip() for digest in image_hashes]
@@ -389,6 +413,11 @@ class NotesDatabase:
             conn = self._connection()
             cursor = conn.execute(
                 "DELETE FROM image_recognitions WHERE image_hash IN (%s)"
+                % ",".join("?" for _ in clean),
+                clean,
+            )
+            conn.execute(
+                "DELETE FROM image_drafts WHERE image_hash IN (%s)"
                 % ",".join("?" for _ in clean),
                 clean,
             )

@@ -2164,14 +2164,98 @@ class ClassSchedulePlugin(MaiBotPlugin):
             lines.append(f"　📚 课后总结：{len(summaries)} 份（{summaries[-1]} …）")
         for note in notes.recent(target, limit=10):
             stamp = note.created_at[5:16].replace("T", " ") if note.created_at else ""
-            head = f"{stamp} [{note.kind}]"
+            head = f"{stamp} [{note.kind}] {note.id}"
             body = note.display  # 有公式就显示公式：用户要的是公式，不是图说
             lines.append(f"　{head} {one_line(body, 60)}" if body else f"　{head} 🖼 图片")
             if note.file and note.file.startswith("img/"):
                 lines[-1] += "（含图片）"
+            if note.unresolved_items:
+                lines[-1] += f"（待核对 {len(note.unresolved_items)} 处）"
         message = "\n".join(lines)
         await self._reply(stream_id, message)
         return True, "已返回笔记列表", 1
+
+    @Command(
+        "schedule_note_detail",
+        description="查看一条笔记的完整转录、公式与待核对位置",
+        pattern=r"^/笔记详情\s+(?P<note_id>\S+)\s*$",
+    )
+    @_requires_access
+    async def handle_note_detail(self, **kwargs: Any) -> CommandResult:
+        stream_id = str(kwargs.get("stream_id") or "")
+        note_id = str((kwargs.get("matched_groups") or {}).get("note_id") or "")
+        located = await asyncio.to_thread(self._notes.locate_note, note_id) if self._notes else None
+        if located is None:
+            message = "ℹ️ 没找到这条笔记"
+        else:
+            course, note = located
+            lines = [f"📒 {course} · {note.kind} · {note.id}"]
+            if note.topic:
+                lines.append(f"主题：{note.topic}")
+            if note.content:
+                lines.append(f"板书转录：\n{note.content[:2500]}")
+            if note.formula:
+                lines.append(f"公式：\n{note.formula[:1000]}")
+            if note.unresolved_items:
+                lines.append("待核对：" + "；".join(
+                    f"{item.get('term', '')}（{item.get('reason', '')}）"
+                    for item in note.unresolved_items
+                ))
+            if not note.content and not note.formula:
+                lines.append(note.text or "🖼 原图已保存，暂无转录")
+            if note.revisions:
+                lines.append("人工修订已记录，可发 /撤销修订 笔记ID")
+            message = "\n".join(lines)
+        await self._reply(stream_id, message)
+        return True, message, 1
+
+    @Command(
+        "schedule_note_revise",
+        description="修订一条图片笔记的识别文字或公式",
+        pattern=r"^/修订笔记\s+(?P<note_id>\S+)\s+(?P<original>.+?)\s*=>\s*(?P<replacement>.+?)\s*$",
+    )
+    @_requires_access
+    async def handle_note_revise(self, **kwargs: Any) -> CommandResult:
+        stream_id = str(kwargs.get("stream_id") or "")
+        groups = kwargs.get("matched_groups") or {}
+        notes = self._notes
+        if notes is None:
+            message = "⏳ 笔记尚未初始化"
+        else:
+            try:
+                note = await asyncio.to_thread(
+                    notes.revise_image_note,
+                    str(groups.get("note_id") or ""),
+                    str(groups.get("original") or ""),
+                    str(groups.get("replacement") or ""),
+                )
+                message = (f"✅ 已修订笔记 {note.id}；发 /撤销修订 {note.id} 可撤销"
+                           if note else "ℹ️ 没找到这条笔记")
+            except ValueError as exc:
+                message = f"ℹ️ 无法修订：{exc}"
+        await self._reply(stream_id, message)
+        return True, message, 1
+
+    @Command(
+        "schedule_note_undo",
+        description="撤销一条图片笔记最近的一次人工修订",
+        pattern=r"^/撤销修订\s+(?P<note_id>\S+)\s*$",
+    )
+    @_requires_access
+    async def handle_note_undo(self, **kwargs: Any) -> CommandResult:
+        stream_id = str(kwargs.get("stream_id") or "")
+        note_id = str((kwargs.get("matched_groups") or {}).get("note_id") or "")
+        notes = self._notes
+        if notes is None:
+            message = "⏳ 笔记尚未初始化"
+        else:
+            try:
+                note = await asyncio.to_thread(notes.undo_image_revision, note_id)
+                message = f"↩️ 已撤销笔记 {note.id} 最近一次修订" if note else "ℹ️ 没找到这条笔记"
+            except ValueError as exc:
+                message = f"ℹ️ 无法撤销：{exc}"
+        await self._reply(stream_id, message)
+        return True, message, 1
 
     @Command(
         "schedule_note_move",
@@ -2476,7 +2560,7 @@ class ClassSchedulePlugin(MaiBotPlugin):
             for note in hits:
                 stamp = note.created_at[5:16].replace("T", " ") if note.created_at else ""
                 lines.append(
-                    f"　{note.course} [{note.kind}] {stamp} "
+                    f"　{note.course} [{note.kind}] {stamp} {note.id} "
                     f"{one_line(note.display or '🖼 图片', 60)}"
                 )
             for row in formula_hits:
@@ -3477,14 +3561,16 @@ class ClassSchedulePlugin(MaiBotPlugin):
             }
             record = await asyncio.to_thread(db.image_recognition, digest)
             if record is not None:
+                draft = await asyncio.to_thread(db.image_draft, digest)
                 entries = await self._recognition_entries(db, record)
                 await self._on_formula_recognized(job, {
                     "status": "cached",
                     "formulas": entries,
                     "cached_no_formula": str(record["status"]) == "no_formula",
+                    "draft": draft or None,
                 })
                 skipped += 1
-                continue
+                continue  # 历史公式缓存不自动批量重算；主动重发会补做全文提取
             if await asyncio.to_thread(self._recognizer.has_given_up, digest):
                 skipped += 1
                 continue
@@ -3597,6 +3683,8 @@ class ClassSchedulePlugin(MaiBotPlugin):
         # 注意 no_formula（重识别判定"图里没公式"）要**清掉**旧自动公式——否则
         # 识别缓存说"没公式"、用户看到的还是旧公式（评估项 4）。失败保留旧内容。
         for target in job.get("note_targets") or [job]:
+            if isinstance(result.get("draft"), dict):
+                await self._attach_draft_to_note(target, result["draft"])
             if status == "no_formula" or result.get("cached_no_formula"):
                 await self._clear_note_formula(target)
             elif status in ("recognized", "cached") and formulas:
@@ -3608,11 +3696,12 @@ class ClassSchedulePlugin(MaiBotPlugin):
         if status == "failed":
             reason = one_line(str(result.get("error") or "模型没给出可用结果"), 60)
             again = "（云端拥塞，稍后会自动再试）" if result.get("transient") else ""
+            transcript = "；文字已转录进笔记" if result.get("draft") else ""
             await self._deliver(
                 stream_id,
                 f"图片识别失败：{reason}",
                 reason="formula_recognized",
-                fixed_text=f"🧮 这张图没认出公式{where}\n　{reason}{again}",
+                fixed_text=f"🧮 这张图没认出公式{where}{transcript}\n　{reason}{again}",
                 verbatim=True,
             )
             return
@@ -3621,7 +3710,8 @@ class ClassSchedulePlugin(MaiBotPlugin):
                 stream_id,
                 "图片里没有公式",
                 reason="formula_recognized",
-                fixed_text=f"🧮 这张图里没有公式{where}（原图已存好）",
+                fixed_text=f"🧮 这张图里没有公式{where}（原图已存好"
+                           + ("，文字已转录进笔记" if result.get("draft") else "") + "）",
                 verbatim=True,
             )
             return
@@ -3633,7 +3723,8 @@ class ClassSchedulePlugin(MaiBotPlugin):
                 reason="formula_recognized",
                 fixed_text=(
                     f"🧮 这张图之前认过：图里没有公式{where}"
-                    "（想按现在的模型重新识别，发 /重识图片）"
+                    + ("（文字转录已存进笔记）" if result.get("draft") else
+                       "（想按现在的模型重新识别，发 /重识图片）")
                 ),
                 verbatim=True,
             )
@@ -3642,10 +3733,17 @@ class ClassSchedulePlugin(MaiBotPlugin):
         headline = "认出公式" if any(item.get("created") for item in formulas) else "这张图之前认过，公式是"
         lines = [f"🧮 {headline}{where}（{len(formulas)} 条）"]
         for item in formulas:
-            mark = "　⚠️没把握，已标 #待确认" if item.get("low_confidence") else ""
+            issues = item.get("syntax_issues") or []
+            mark = (f"　⚠️{issues[0]}，已标 #待确认" if issues else
+                    "　⚠️没把握，已标 #待确认" if item.get("low_confidence") else "")
             lines.append(f"　{item.get('name') or '未知公式'}｜{item.get('latex')}{mark}")
         if result.get("degraded"):
             lines.append("　（主模型没认出来，这条是降级模型的结果）")
+        draft = result.get("draft")
+        if isinstance(draft, dict) and draft.get("content_markdown"):
+            lines.append("　板书文字已转录进笔记")
+        if isinstance(draft, dict) and draft.get("uncertain_items"):
+            lines.append(f"　⚠️ {len(draft['uncertain_items'])} 处存疑，见笔记原图核对")
         await self._deliver(
             stream_id,
             f"识别到 {len(formulas)} 条公式",
@@ -3653,6 +3751,16 @@ class ClassSchedulePlugin(MaiBotPlugin):
             fixed_text="\n".join(lines),
             verbatim=True,  # 公式一个字都不能被模型改写或概括掉
         )
+
+    async def _attach_draft_to_note(self, job: dict[str, Any], draft: dict) -> None:
+        notes = self._notes
+        note_ref = str(job.get("note_ref") or "").strip()
+        if notes is None or not note_ref:
+            return
+        try:
+            await asyncio.to_thread(notes.update_extraction, note_ref, draft)
+        except Exception as exc:
+            self.ctx.logger.warning(f"{LOG_PREFIX} 板书转录回填失败（已忽略）: {exc}")
 
     async def _clear_note_formula(self, job: dict[str, Any]) -> None:
         """重识别判定"图里没有公式"后，清掉该笔记自动回填的旧公式。

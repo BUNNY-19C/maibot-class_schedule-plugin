@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -30,6 +31,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 __all__ = [
     "NoteKind",
@@ -69,6 +71,13 @@ class StudyNote:
     #: 识别到的公式（"名称：LaTeX"），图片笔记在识别完成后回填。
     #: 写在索引里而不是只留在 SQLite：/笔记、/找 与笔记文件读的都是这一层。
     formula: str = ""
+    topic: str = ""
+    content_raw: str = ""  # 视觉模型首次转录；人工修订不会覆盖它
+    content: str = ""  # 当前展示的转录
+    uncertain_items: list[dict[str, Any]] = field(default_factory=list)
+    revisions: list[dict[str, Any]] = field(default_factory=list)
+    content_manual: bool = False
+    formula_manual: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -79,12 +88,27 @@ class StudyNote:
             "created_at": self.created_at,
             "source": self.source,
             "formula": self.formula,
+            "topic": self.topic,
+            "content_raw": self.content_raw,
+            "content": self.content,
+            "uncertain_items": self.uncertain_items,
+            "revisions": self.revisions,
+            "content_manual": self.content_manual,
+            "formula_manual": self.formula_manual,
         }
 
     @property
     def display(self) -> str:
         """列表里给这一条显示什么：有公式就显示公式，其次才是说明文字。"""
-        return self.formula or self.text
+        return self.content or self.formula or self.text
+
+    @property
+    def unresolved_items(self) -> list[dict[str, Any]]:
+        """手工改掉原疑点后不再提示待核对，原疑点仍留在索引里。"""
+        return [
+            item for item in self.uncertain_items
+            if isinstance(item, dict) and not item.get("resolved")
+        ]
 
 
 @dataclass
@@ -142,6 +166,15 @@ class StudyNoteStore:
                     created_at=str(item.get("created_at") or ""),
                     source=str(item.get("source") or ""),
                     formula=str(item.get("formula") or ""),
+                    topic=str(item.get("topic") or ""),
+                    content_raw=str(item.get("content_raw") or ""),
+                    content=str(item.get("content") or ""),
+                    uncertain_items=(item.get("uncertain_items")
+                                     if isinstance(item.get("uncertain_items"), list) else []),
+                    revisions=(item.get("revisions")
+                               if isinstance(item.get("revisions"), list) else []),
+                    content_manual=bool(item.get("content_manual", False)),
+                    formula_manual=bool(item.get("formula_manual", False)),
                 )
             )
         return _CourseIndex(notes=notes)
@@ -222,6 +255,136 @@ class StudyNoteStore:
             index.notes.append(note)
             self._write_index(course_dir, index)
 
+    def _write_image_companion(self, course_dir: Path, note: StudyNote) -> None:
+        """图片笔记的可读版本；原图及原始转录留在索引中。"""
+        if not note.file.startswith("img/"):
+            return
+        body = [f"# {course_dir.name} · {note.kind}"]
+        if note.topic:
+            body += ["", f"主题：{note.topic}"]
+        if note.content:
+            body += ["", "## 板书转录", "", note.content]
+        if note.formula:
+            body += ["", "## 公式", "", note.formula]
+        if note.unresolved_items:
+            body += ["", "## 待核对", ""]
+            body += [
+                f"- {item.get('term', '')}：{item.get('reason', '')}"
+                for item in note.unresolved_items
+            ]
+        if note.text:
+            body += ["", "## 图片说明", "", note.text]
+        body += ["", f"原图：{note.file}"]
+        _atomic_write(course_dir / f"{note.id}_{note.kind}.md", "\n".join(body) + "\n")
+
+    def update_extraction(self, note_id: str, draft: dict) -> StudyNote | None:
+        """保存一次图片转录；用户手工改过的正文不会被重识别覆盖。"""
+        with self._lock:
+            located = self.locate_note(note_id)
+            if located is None:
+                return None
+            course, note = located
+            if not note.file.startswith("img/"):
+                return None
+            incoming = str(draft.get("content_markdown") or "")[:8000]
+            if not note.content_raw:
+                note.content_raw = incoming
+            if not note.content_manual:
+                note.content = incoming
+            note.topic = str(draft.get("topic") or "")[:120]
+            resolved_terms = {
+                str(item.get("term") or "") for item in note.uncertain_items
+                if isinstance(item, dict) and item.get("resolved")
+            }
+            note.uncertain_items = [
+                {**item, "resolved": str(item.get("term") or "") in resolved_terms}
+                for item in list(draft.get("uncertain_items") or [])[:8]
+                if isinstance(item, dict)
+            ]
+            course_dir = self.course_dir(course)
+            self._save_changed_note(course_dir, note)
+            return note
+
+    def revise_image_note(self, note_id: str, original: str, replacement: str) -> StudyNote | None:
+        """仅替换这张图片笔记的一段转录或公式，保留原稿和操作记录。"""
+        original, replacement = original.strip(), replacement.strip()
+        if not original or not replacement:
+            raise ValueError("原文和修订内容均不能为空")
+        if len(replacement) > MAX_NOTE_CHARS:
+            raise ValueError("修订内容过长")
+        with self._lock:
+            located = self.locate_note(note_id)
+            if located is None:
+                return None
+            course, note = located
+            if not note.file.startswith("img/"):
+                raise ValueError("只支持修订图片识别内容")
+            fields = [
+                name for name in ("content", "formula") if original in getattr(note, name)
+            ]
+            if not fields:
+                raise ValueError("原文未出现在这条笔记的识别内容中")
+            changes = []
+            for field_name in fields:
+                before = getattr(note, field_name)
+                after = before.replace(original, replacement, 1)
+                if len(after) > 8000:
+                    raise ValueError("修订后的笔记过长")
+                setattr(note, field_name, after)
+                setattr(note, f"{field_name}_manual", True)
+                changes.append({"field": field_name, "before": before, "after": after})
+            uncertain_before = copy.deepcopy(note.uncertain_items)
+            for item in note.uncertain_items:
+                if isinstance(item, dict) and item.get("term") == original:
+                    item["resolved"] = True
+            note.revisions.append({
+                "action": "edit", "changes": changes,
+                "uncertain_before": uncertain_before,
+                "at": datetime.now().isoformat(timespec="seconds"), "undone": False,
+            })
+            course_dir = self.course_dir(course)
+            self._save_changed_note(course_dir, note)
+            return note
+
+    def undo_image_revision(self, note_id: str) -> StudyNote | None:
+        """撤销最近一次尚未撤销的人工修订，不删除历史记录。"""
+        with self._lock:
+            located = self.locate_note(note_id)
+            if located is None:
+                return None
+            course, note = located
+            for index in range(len(note.revisions) - 1, -1, -1):
+                edit = note.revisions[index]
+                if edit.get("action") != "edit" or edit.get("undone"):
+                    continue
+                for change in edit["changes"]:
+                    setattr(note, change["field"], change["before"])
+                note.uncertain_items = edit.get("uncertain_before", note.uncertain_items)
+                edit["undone"] = True
+                note.revisions.append({
+                    "action": "undo", "edit_index": index,
+                    "at": datetime.now().isoformat(timespec="seconds"),
+                })
+                for change in edit["changes"]:
+                    field_name = change["field"]
+                    setattr(note, f"{field_name}_manual", any(
+                        item.get("action") == "edit" and not item.get("undone")
+                        and any(part.get("field") == field_name for part in item.get("changes", []))
+                        for item in note.revisions
+                    ))
+                self._save_changed_note(self.course_dir(course), note)
+                return note
+            raise ValueError("这条笔记没有可撤销的人工修订")
+
+    def _save_changed_note(self, course_dir: Path, note: StudyNote) -> None:
+        index = self._load_index(course_dir)
+        for index_note in index.notes:
+            if index_note.id == note.id:
+                index_note.__dict__.update(note.__dict__)
+                break
+        self._write_index(course_dir, index)
+        self._write_image_companion(course_dir, note)
+
     def attach_formula(
         self, course: str, note_id: str, formula: str
     ) -> StudyNote | None:
@@ -242,16 +405,13 @@ class StudyNoteStore:
             target = next((item for item in index.notes if item.id == note_id), None)
             if target is None:
                 return None
+            if target.formula_manual:
+                return target
             if text == (target.formula or ""):
                 return target  # 已经回填过，别重复写盘
             target.formula = text
             self._write_index(course_dir, index)
-            body = [f"# {course_folder_name(course)} · {target.kind}", "", text]
-            if target.text:
-                body += ["", "## 图片说明", "", target.text]
-            if target.file and not target.file.endswith(".md"):
-                body += ["", f"原图：{target.file}"]
-            _atomic_write(course_dir / f"{target.id}_{target.kind}.md", "\n".join(body) + "\n")
+            self._write_image_companion(course_dir, target)
             return target
 
     def clear_formula(self, course: str, note_id: str) -> StudyNote | None:
@@ -267,16 +427,13 @@ class StudyNoteStore:
             target = next((item for item in index.notes if item.id == note_id), None)
             if target is None:
                 return None
+            if target.formula_manual:
+                return target
             if not target.formula:
                 return target
             target.formula = ""
             self._write_index(course_dir, index)
-            body = [f"# {course_folder_name(course)} · {target.kind}", ""]
-            if target.text:
-                body += ["", "## 图片说明", "", target.text]
-            if target.file and not target.file.endswith(".md"):
-                body += ["", f"原图：{target.file}"]
-            _atomic_write(course_dir / f"{target.id}_{target.kind}.md", "\n".join(body) + "\n")
+            self._write_image_companion(course_dir, target)
             return target
 
     # ── 查询 ──────────────────────────────────────────────
@@ -311,7 +468,10 @@ class StudyNoteStore:
         hits: list[StudyNote] = []
         for course in self.courses():
             for note in reversed(self._load_index(self.course_dir(course)).notes):
-                haystack = f"{note.text}\n{note.formula}\n{note.course}".lower()
+                haystack = (
+                    f"{note.text}\n{note.formula}\n{note.content}\n"
+                    f"{note.topic}\n{note.course}"
+                ).lower()
                 if needle in haystack:
                     hits.append(note)
                     if len(hits) >= limit:
@@ -405,6 +565,8 @@ class StudyNoteStore:
                 except OSError:
                     pass
             self._append(dst_dir, note)
+            if note.file.startswith("img/") and (note.content or note.formula or companion.is_file()):
+                self._write_image_companion(dst_dir, note)
             return note
 
     def last_of(self, course: str) -> StudyNote | None:
