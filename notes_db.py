@@ -403,6 +403,29 @@ class NotesDatabase:
             ).fetchone()
         return json.loads(row["draft_json"]) if row is not None else None
 
+    def image_hashes_for_formula(self, formula_id: int) -> list[str]:
+        """反查认出过这条公式的**所有**图。
+
+        image_recognitions 才是权威的图↔公式关系（同一个公式可以被多张图
+        关联）；公式行自己的 image_hash 只是其中一张。/找 靠这里把公式命中
+        连回全部来源笔记，做同源去重和"笔记已人工修订"的来源标识。
+        """
+        want = int(formula_id)
+        with self._lock:
+            rows = self._connection().execute(
+                "SELECT image_hash, formula_ids FROM image_recognitions"
+                " WHERE status = 'recognized'"
+            ).fetchall()
+        hits: list[str] = []
+        for row in rows:
+            try:
+                ids = json.loads(row["formula_ids"] or "[]")
+            except (TypeError, ValueError):
+                continue
+            if want in ids:
+                hits.append(str(row["image_hash"]))
+        return hits
+
     def forget_image_recognitions(self, image_hashes: list[str]) -> int:
         """删掉一批识别记录（``/重识图片`` 用）：下次见到这些图会重新问模型。"""
         clean = [str(digest or "").strip() for digest in image_hashes]

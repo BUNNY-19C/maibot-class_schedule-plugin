@@ -78,6 +78,9 @@ class StudyNote:
     revisions: list[dict[str, Any]] = field(default_factory=list)
     content_manual: bool = False
     formula_manual: bool = False
+    #: 这条笔记的原图内容 hash（识别时回填）。`/找` 用它把公式库的原始识别
+    #: 记录与笔记关联起来：同源命中去重、人工修订后标注"原始识别"。
+    image_hash: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -95,6 +98,7 @@ class StudyNote:
             "revisions": self.revisions,
             "content_manual": self.content_manual,
             "formula_manual": self.formula_manual,
+            "image_hash": self.image_hash,
         }
 
     @property
@@ -175,6 +179,7 @@ class StudyNoteStore:
                                if isinstance(item.get("revisions"), list) else []),
                     content_manual=bool(item.get("content_manual", False)),
                     formula_manual=bool(item.get("formula_manual", False)),
+                    image_hash=str(item.get("image_hash") or ""),
                 )
             )
         return _CourseIndex(notes=notes)
@@ -277,7 +282,9 @@ class StudyNoteStore:
         body += ["", f"原图：{note.file}"]
         _atomic_write(course_dir / f"{note.id}_{note.kind}.md", "\n".join(body) + "\n")
 
-    def update_extraction(self, note_id: str, draft: dict) -> StudyNote | None:
+    def update_extraction(
+        self, note_id: str, draft: dict, image_hash: str = ""
+    ) -> StudyNote | None:
         """保存一次图片转录；用户手工改过的正文不会被重识别覆盖。"""
         with self._lock:
             located = self.locate_note(note_id)
@@ -286,6 +293,8 @@ class StudyNoteStore:
             course, note = located
             if not note.file.startswith("img/"):
                 return None
+            if image_hash:
+                note.image_hash = image_hash  # 供 /找 做同源去重与来源标识
             incoming = str(draft.get("content_markdown") or "")[:8000]
             if not note.content_raw:
                 note.content_raw = incoming
@@ -386,7 +395,7 @@ class StudyNoteStore:
         self._write_image_companion(course_dir, note)
 
     def attach_formula(
-        self, course: str, note_id: str, formula: str
+        self, course: str, note_id: str, formula: str, image_hash: str = ""
     ) -> StudyNote | None:
         """把识别到的公式回填到某条笔记：索引 + 一个可读的 .md。
 
@@ -395,6 +404,7 @@ class StudyNoteStore:
         ``<id>_<kind>.md``，让公式本身成为这条笔记的内容。
 
         同一公式重复回填不重复追加（幂等）；笔记已被删掉则返回 ``None``。
+        ``image_hash`` 回填后供 /找 做同源去重与来源标识。
         """
         text = str(formula or "").strip()[:MAX_NOTE_CHARS]
         if not text:
@@ -405,21 +415,29 @@ class StudyNoteStore:
             target = next((item for item in index.notes if item.id == note_id), None)
             if target is None:
                 return None
+            if image_hash:
+                target.image_hash = image_hash
             if target.formula_manual:
                 return target
             if text == (target.formula or ""):
+                if image_hash:
+                    self._write_index(course_dir, index)
                 return target  # 已经回填过，别重复写盘
             target.formula = text
             self._write_index(course_dir, index)
             self._write_image_companion(course_dir, target)
             return target
 
-    def clear_formula(self, course: str, note_id: str) -> StudyNote | None:
+    def clear_formula(
+        self, course: str, note_id: str, image_hash: str = ""
+    ) -> StudyNote | None:
         """清掉自动回填的公式（重识别判定"图里没有公式"时用）。
 
         只动自动生成的部分：formula 字段清空，配套 md 重写为只含图说与原图引用；
         用户的原文（text）与原图不动。公式库里那条公式记录也不删——它可能被
         其他图片的识别记录引用。幂等：本来就空就不再写盘。
+
+        人工修订过的公式（formula_manual）不清——重识别仍保护有效人工修订。
         """
         course_dir = self.course_dir(course)
         with self._lock:
@@ -427,9 +445,13 @@ class StudyNoteStore:
             target = next((item for item in index.notes if item.id == note_id), None)
             if target is None:
                 return None
+            if image_hash:
+                target.image_hash = image_hash
             if target.formula_manual:
+                self._write_index(course_dir, index)
                 return target
             if not target.formula:
+                self._write_index(course_dir, index)
                 return target
             target.formula = ""
             self._write_index(course_dir, index)
@@ -501,11 +523,27 @@ class StudyNoteStore:
                         return course, note
         return None
 
-    def update_formula(self, note_id: str, formula: str) -> StudyNote | None:
+    def notes_by_image_hash(self, digest: str) -> list[tuple[str, StudyNote]]:
+        """按图片内容 hash 找引用它的全部笔记（/找 的同源去重与来源标识用）。"""
+        digest = str(digest or "").strip()
+        if not digest:
+            return []
+        with self._lock:
+            result: list[tuple[str, StudyNote]] = []
+            for course in self.courses():
+                for note in self._load_index(self.course_dir(course)).notes:
+                    if note.image_hash == digest:
+                        result.append((course, note))
+            return result
+
+    def update_formula(
+        self, note_id: str, formula: str, image_hash: str = ""
+    ) -> StudyNote | None:
         """按笔记 id 替换自动识别结果；定位与写入共用归档锁。
 
         空结果清除自动公式。整个操作不可被 move_note 插入，避免定位后
-        笔记又被移走；用户原文与图片保持原样。
+        笔记又被移走；用户原文与图片保持原样。``image_hash`` 回填后供 /找
+        做同源去重与来源标识。
         """
         with self._lock:
             located = self.locate_note(note_id)
@@ -513,8 +551,11 @@ class StudyNoteStore:
                 return None
             course, _note = located
             if str(formula or "").strip():
-                return self.attach_formula(course, note_id, formula)
-            return self.clear_formula(course, note_id)
+                return self.attach_formula(course, note_id, formula, image_hash)
+            # clear_formula 自己会把 image_hash 连同索引一起写盘；
+            # 这里曾把返回的 StudyNote 当索引进 _write_index，异常被调用方
+            # 吞掉后 hash 就悄悄丢了
+            return self.clear_formula(course, note_id, image_hash)
 
     def read_note_image(self, note_id: str) -> tuple[bytes, str] | None:
         """在归档锁内读取笔记当前位置的原图，供等待中的补识别任务使用。"""

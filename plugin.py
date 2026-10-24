@@ -2553,22 +2553,51 @@ class ClassSchedulePlugin(MaiBotPlugin):
                 )
             except Exception as exc:
                 self.ctx.logger.warning(f"{LOG_PREFIX} 公式检索失败（已忽略）: {exc}")
-        if not hits and not formula_hits:
+        # 同源合并：公式库命中先连回来源笔记，再分两种情况——
+        # 来源笔记已在上面展示：同一条来源不出两遍，直接去重；
+        # 来源笔记被人工修订改掉了公式：库里这条成了旧识别，仍展示但必须
+        # 标明"笔记中已人工修订"，否则用户会把旧式子当成笔记的现状。
+        # 来源不只看公式行的 image_hash（同公式可被多张图关联，那一列只指向
+        # 其中一张），image_recognitions 反查补全其余来源。
+        shown_ids = {note.id for note in hits}
+        merged: list[tuple[Any, bool]] = []
+        if formula_hits:
+            try:
+                extra_lists = await asyncio.to_thread(
+                    lambda: [
+                        self._notes_db.image_hashes_for_formula(int(row["id"]))
+                        for row in formula_hits
+                    ]
+                )
+            except Exception as exc:
+                self.ctx.logger.warning(f"{LOG_PREFIX} 公式来源反查失败（已忽略）: {exc}")
+                extra_lists = [[] for _ in formula_hits]
+            for row, extra in zip(formula_hits, extra_lists):
+                digests = {str(row["image_hash"] or ""), *extra}
+                digests.discard("")
+                linked = [
+                    pair for digest in digests for pair in notes.notes_by_image_hash(digest)
+                ]
+                if any(note.id in shown_ids for _, note in linked):
+                    continue
+                merged.append((row, any(note.formula_manual for _, note in linked)))
+        if not hits and not merged:
             message = f"🔍 没有找到包含「{keyword}」的笔记。"
         else:
-            lines = [f"🔍 找到 {len(hits) + len(formula_hits)} 条："]
+            lines = [f"🔍 找到 {len(hits) + len(merged)} 条："]
             for note in hits:
                 stamp = note.created_at[5:16].replace("T", " ") if note.created_at else ""
                 lines.append(
                     f"　{note.course} [{note.kind}] {stamp} {note.id} "
                     f"{one_line(note.display or '🖼 图片', 60)}"
                 )
-            for row in formula_hits:
+            for row, revised in merged:
                 latex = str(row["latex_normalized"] or row["latex_raw"] or "")
                 where = f"，{row['course']}" if row["course"] else ""
+                mark = "；笔记中已人工修订" if revised else ""
                 lines.append(
                     f"　🧮 {row['name']}｜{one_line(latex, 46)}"
-                    f"（{row['category'] or '未分类'}{where}，置信 {row['confidence']}）"
+                    f"（{row['category'] or '未分类'}{where}，置信 {row['confidence']}{mark}）"
                 )
             message = "\n".join(lines)
         await self._reply(stream_id, message)
@@ -3556,6 +3585,7 @@ class ClassSchedulePlugin(MaiBotPlugin):
             job = {
                 **group["targets"][0],
                 "note_targets": group["targets"],
+                "image_hash": digest,
                 "note_id": 0,
                 "stream_id": "",  # 历史补识别只回填，不刷屏
             }
@@ -3677,6 +3707,10 @@ class ClassSchedulePlugin(MaiBotPlugin):
         where = f"（归入「{course}」）" if course and course != "未分类" else ""
         status = str(result.get("status") or "")
         formulas = list(result.get("formulas") or [])
+        # 图片内容 hash：笔记与公式库的关联键（/找 的同源去重与来源标识用）
+        digest = str(job.get("image_hash") or "") or (
+            image_hash(job["image"]) if job.get("image") else ""
+        )
 
         # 先把识别结果应用进笔记（**补识别也要**）：/笔记、/找 与笔记文件读的是
         # 那一层。这一步必须在 stream_id 判断之前，否则补识别的结果进不了笔记。
@@ -3684,11 +3718,11 @@ class ClassSchedulePlugin(MaiBotPlugin):
         # 识别缓存说"没公式"、用户看到的还是旧公式（评估项 4）。失败保留旧内容。
         for target in job.get("note_targets") or [job]:
             if isinstance(result.get("draft"), dict):
-                await self._attach_draft_to_note(target, result["draft"])
+                await self._attach_draft_to_note(target, result["draft"], digest)
             if status == "no_formula" or result.get("cached_no_formula"):
-                await self._clear_note_formula(target)
+                await self._clear_note_formula(target, digest)
             elif status in ("recognized", "cached") and formulas:
-                await self._attach_formula_to_note(target, formulas)
+                await self._attach_formula_to_note(target, formulas, digest)
 
         if not stream_id:
             return  # 补识别不回执：它是补历史，不是用户这次的操作
@@ -3752,17 +3786,19 @@ class ClassSchedulePlugin(MaiBotPlugin):
             verbatim=True,  # 公式一个字都不能被模型改写或概括掉
         )
 
-    async def _attach_draft_to_note(self, job: dict[str, Any], draft: dict) -> None:
+    async def _attach_draft_to_note(
+        self, job: dict[str, Any], draft: dict, digest: str = ""
+    ) -> None:
         notes = self._notes
         note_ref = str(job.get("note_ref") or "").strip()
         if notes is None or not note_ref:
             return
         try:
-            await asyncio.to_thread(notes.update_extraction, note_ref, draft)
+            await asyncio.to_thread(notes.update_extraction, note_ref, draft, digest)
         except Exception as exc:
             self.ctx.logger.warning(f"{LOG_PREFIX} 板书转录回填失败（已忽略）: {exc}")
 
-    async def _clear_note_formula(self, job: dict[str, Any]) -> None:
+    async def _clear_note_formula(self, job: dict[str, Any], digest: str = "") -> None:
         """重识别判定"图里没有公式"后，清掉该笔记自动回填的旧公式。
 
         范围只限这条笔记的自动生成内容（formula 字段与配套 md 的公式段）；
@@ -3773,12 +3809,12 @@ class ClassSchedulePlugin(MaiBotPlugin):
         if notes is None or not note_ref:
             return
         try:
-            await asyncio.to_thread(notes.update_formula, note_ref, "")
+            await asyncio.to_thread(notes.update_formula, note_ref, "", digest)
         except Exception as exc:
             self.ctx.logger.warning(f"{LOG_PREFIX} 公式清除失败（已忽略）: {exc}")
 
     async def _attach_formula_to_note(
-        self, job: dict[str, Any], formulas: list[dict[str, Any]]
+        self, job: dict[str, Any], formulas: list[dict[str, Any]], digest: str = ""
     ) -> None:
         """把识别到的公式写进对应的 markdown 笔记（索引 + 可读文件）。
 
@@ -3799,7 +3835,9 @@ class ClassSchedulePlugin(MaiBotPlugin):
         if notes is None or not note_ref or not lines:
             return
         try:
-            updated = await asyncio.to_thread(notes.update_formula, note_ref, "\n".join(lines))
+            updated = await asyncio.to_thread(
+                notes.update_formula, note_ref, "\n".join(lines), digest
+            )
             if updated is None:
                 self.ctx.logger.info(
                     f"{LOG_PREFIX} 公式回填跳过：笔记 {note_ref} 已不在笔记库里"
