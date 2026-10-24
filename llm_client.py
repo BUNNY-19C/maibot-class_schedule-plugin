@@ -2,8 +2,11 @@
 
 设计要点（都是关键决策，注释说明原因）：
 
-- **地址校验与课表抓取同一套**：base 必须是公网 https，走 :func:`netutil.validate_url`，
-  不因为"是我们主动调的 API"就开后门；
+- **地址校验走 :func:`netutil.validate_url`，但把 base_url 的主机名放进
+  ``allow_hosts`` 白名单**：base 是管理员在配置里写的（不是聊天内容可控的），
+  而代理软件的 fake-ip DNS 会把任何域名解析成保留段（198.18.0.0/15）——
+  严格按解析结果拒绝会让代理用户的整条识别永久失败（线上实测）。
+  https 要求与端口校验仍然生效；
 - **超时 + 指数退避重试**：默认 30 秒、失败重试 2 次(1s/2s)——网络抖动不该让
   整条笔记流水线失败，但也不该无限重试；
 - **API Key 只从参数进来，绝不进日志/异常信息**：调用失败时只带响应体的摘要；
@@ -18,6 +21,7 @@ import json
 import urllib.error
 import urllib.request
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 from .netutil import UnsafeUrlError, validate_url
 
@@ -54,6 +58,8 @@ class SiliconFlowClient:
     ) -> None:
         self._api_key = str(api_key or "").strip()
         self._base_url = str(base_url or "").strip().rstrip("/")
+        # base_url 的主机名进白名单：见模块 docstring（代理 fake-ip 环境实测）
+        self._api_host = urlsplit(self._base_url).hostname or ""
         self._timeout = max(5, int(timeout_seconds))
         self._max_retries = max(0, min(MAX_RETRIES_LIMIT, int(max_retries)))
         self._transport = transport or self._transport_with_timeout
@@ -160,9 +166,10 @@ class SiliconFlowClient:
         if not self.configured:
             raise NotConfiguredError("未配置云端 API Key")
         url = self._base_url + path
-        # 每次请求前重新校验：base_url 来自用户配置，与抓取课表同一纪律
+        # 每次请求前重新校验；base_url 的主机名在白名单里（管理员配置的地址，
+        # 不是聊天内容可控的），fake-ip DNS 解析出的保留段地址因此不再误杀
         try:
-            validate_url(url)
+            validate_url(url, allow_hosts=(self._api_host,) if self._api_host else ())
         except UnsafeUrlError as exc:
             raise CloudError(f"API 地址不被允许：{exc}") from exc
         body = json.dumps(payload).encode("utf-8")

@@ -500,19 +500,21 @@ class TestFormulaRecognizer(unittest.IsolatedAsyncioTestCase):
         deep = r"\frac{" * 500 + "1" + "}" * 500
         self.assertIsInstance(normalize_latex(deep), str)
 
-    async def test_internal_api_address_fails_at_call_time(self):
-        """内网 https 地址过得了装配（装配只看协议），真正拦它的是每次调用前的校验。
+    async def test_internal_api_address_connection_failure(self):
+        """本机自建网关（如 127.0.0.1）是合法配置：连不上时按普通网络失败处理。
 
-        这条钉住降级形态：识别失败、不落公式、原因留在 error 里——笔记本身照收。
+        旧版在调用前用 SSRF 校验拒绝内网地址——但代理 fake-ip DNS 会把任何域名
+        解析成保留段，严格拒绝会让代理用户的识别整条失败，因此 base_url 的主机名
+        已加入白名单（管理员配置的地址，不是聊天内容可控的）。连不上时照常走
+        失败链路：识别失败、不落公式、原因留在 error 里——笔记本身照收。
         """
         from class_schedule.llm_client import SiliconFlowClient
 
         client = SiliconFlowClient("k", base_url="https://127.0.0.1:9/v1", max_retries=0)
-        self.assertTrue(client.configured)  # 装配期看不出来
+        self.assertTrue(client.configured)
         recognizer = FormulaRecognizer(db=self.db, client=client, model="vlm")
         result = await recognizer.recognize(b"img")
         self.assertEqual(result["status"], "failed")
-        self.assertIn("不被允许", result["error"])
         self.assertEqual(self.db.formula_count(), 0)
 
     async def test_failures_are_recorded_and_bounded(self):
