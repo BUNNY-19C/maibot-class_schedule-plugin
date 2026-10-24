@@ -140,14 +140,16 @@ vlm_fallback_model = "Qwen/Qwen3-VL-8B-Instruct" # 识别失败时降级重试�
 
 ## 开发
 
-测试使用标准库 `unittest`,不需要额外依赖;当前用例数以运行输出为准:
+测试与宿主验收放在独立的 `maibot_plugin_class_schedule-tests` 工程,与插件目录并列保存,
+不随插件安装。保留全部用例,使用标准库 `unittest`,用例数以实际输出为准:
 
 ```bash
-python -m unittest discover -s tests -v
+python ../maibot_plugin_class_schedule-tests/run_tests.py --plugin . -v
 ```
 
-`tools/verify_with_maibot.py` 会用**麦麦自己的代码**做一次集成验证(61 项检查,
-在临时目录里搭假项目根,不动你的安装)。详见
+外部工程的 `tools/verify_with_maibot.py --plugin <插件目录> --maibot <麦麦目录>`
+使用**麦麦自己的代码**做集成验证(在临时目录搭项目根,不动你的安装)。外部测试工程需单独保管,
+插件运行不依赖它。详见
 [内部实现](docs/internals.md#用真实的麦麦验证)。
 
 ## 致谢

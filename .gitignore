@@ -10,3 +10,6 @@ __pycache__/
 venv/
 # 工具链产生的本地状态
 .mimosa/
+# 测试与宿主验收由外部 maibot_plugin_class_schedule-tests 工程维护
+/tests/
+/tools/verify_with_maibot.py

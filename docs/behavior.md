@@ -349,7 +349,7 @@ tool_query_enabled = false   # 关掉 LLM 查课表能力,避免被人问出来
 
 命令这条路径是**能**判定的:麦麦的命令执行器会补上 `stream_id`、`group_id`、
 `user_id`,并把消息挂在 `message.message_info` 下——插件正是靠这些取身份。
-这两组字段契约都固定成了测试(`tests/test_access.py::TestRealMaiBotPayload`),
+这两组字段契约都固定成了外部测试工程的用例(`tests/test_access.py::TestRealMaiBotPayload`),
 上游若改动会立刻失败。
 
 自然语言问课走的注入 Hook **只拿到 `session_id`**、拿不到消息体,所以插件额外

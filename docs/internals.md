@@ -171,18 +171,21 @@ data/plugins/github.BUNNY-19C.class-schedule/
 并选 `observe` 模式 + 后台任务,避免下载文件把入站链路阻塞到适配器超时。
 
 如果哪天麦麦把事件派发接回来了,这段可以改回 `@EventHandler`;
-`tools/verify_with_maibot.py` 里有一条检查会盯着 Hook 是否仍注册在预期名字上。
+外部测试工程的 `tools/verify_with_maibot.py` 里有一条检查会盯着 Hook 是否仍注册在预期名字上。
 
 ## 开发与测试
 
-测试使用标准库 `unittest`,不需要额外安装依赖;当前用例数以运行输出为准:
+测试与宿主验收维护在独立的 `maibot_plugin_class_schedule-tests` 工程,不放进插件目录。
+插件本体不含测试代码,只保留运行代码、用户文档与维护工具。测试工程单独保存,推荐与插件并列;
+使用标准库 `unittest`,无需额外测试依赖,当前用例数以实际输出为准:
 
 ```bash
 cd maibot_plugin_class_schedule
-python -m unittest discover -s tests -v
+python ../maibot_plugin_class_schedule-tests/run_tests.py --plugin . -v
 ```
 
-(装了 pytest 也可以直接 `pytest tests/`,`tests/conftest.py` 已做兼容。)
+也可把测试工程放在任意位置,用 `--plugin` 指定待测插件的路径。原 pytest 兼容入口保留,
+设置 `CLASS_SCHEDULE_PLUGIN_DIR` 后可对外部工程的 `tests/` 收集用例。
 
 测试覆盖:ICS 解析与重复规则展开(含 VALARM 子组件、日期型 EXDATE、病态规则
 上限)、到期判定与去重、SSRF 防护、会话身份提取与名单判定、适用范围(私聊/群聊)、
@@ -198,14 +201,14 @@ LaTeX 归一化与指纹去重、识别结果解析与降级路径、队列消�
 
 ## 用真实的麦麦验证
 
-单元测试用的是替身;下面这个脚本调用**麦麦自己的代码**做集成验证:
+单元测试用的是替身;外部工程的验收脚本调用**麦麦自己的代码**做集成验证:
 
 ```bash
-python tools/verify_with_maibot.py                 # 自动查找麦麦安装
-python tools/verify_with_maibot.py --maibot "<麦麦的 modules/MaiBot 目录>"
+python ../maibot_plugin_class_schedule-tests/tools/verify_with_maibot.py --plugin .
+python ../maibot_plugin_class_schedule-tests/tools/verify_with_maibot.py --plugin . --maibot "<麦麦的 modules/MaiBot 目录>"
 ```
 
-它会在临时目录里搭一个假项目根(不动你的麦麦安装),然后:
+它会在临时目录搭一个项目根,排除生产配置、数据和测试代码,然后:
 
 | 阶段 | 验证内容 |
 | --- | --- |
